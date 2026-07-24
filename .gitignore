@@ -1,0 +1,6 @@
+# Test data
+Data to test/
+
+# Python
+__pycache__/
+*.pyc

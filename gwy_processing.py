@@ -113,6 +113,47 @@ def level_by_polynomial(data, order=1):
     return data - background
 
 
+def level_by_polynomial_xy(data, x_order=1, y_order=1):
+    """
+    Subtracts a fitted 2D polynomial background with independent orders in
+    x and y (like Gwyddion's 'Polynomial Background' horizontal/vertical
+    degrees).
+
+    The fitted surface is:
+    P(x, y) = sum_{i=0..x_order} sum_{j=0..y_order} c_{ij} * x^i * y^j
+
+    Coordinates are normalized to [-1, 1] for numerical stability at
+    higher orders.
+
+    Args:
+        data (np.ndarray): A 2D numpy array representing the image data.
+        x_order (int): Polynomial degree along the x (column) direction.
+        y_order (int): Polynomial degree along the y (row) direction.
+
+    Returns:
+        np.ndarray: The data with the fitted polynomial background subtracted.
+    """
+    ny, nx = data.shape
+    x = np.linspace(-1.0, 1.0, nx)
+    y = np.linspace(-1.0, 1.0, ny)
+    X, Y = np.meshgrid(x, y)
+
+    cols = [
+        (X**i * Y**j).ravel()
+        for i in range(x_order + 1)
+        for j in range(y_order + 1)
+    ]
+    A = np.column_stack(cols)
+
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, data.ravel(), rcond=None)
+    except np.linalg.LinAlgError:
+        return data.copy()
+
+    background = (A @ coeffs).reshape(ny, nx)
+    return data - background
+
+
 def align_rows(data, method='polynomial', order=1):
     """
     Corrects horizontal scan lines by subtracting a calculated offset from each row.
@@ -167,6 +208,41 @@ def align_rows(data, method='polynomial', order=1):
         raise ValueError("Unknown method: '{}'. Choose from 'polynomial' or 'median_diff'.".format(method))
 
     return corrected_data
+
+
+def crop(data, x0, x1, y0, y1, dx=1.0, dy=1.0, y_from_top=False):
+    """
+    Crops the data to a rectangular region given in real (spatial) units.
+
+    Args:
+        data (np.ndarray): A 2D numpy array.
+        x0, x1 (float): Horizontal crop range in spatial units.
+        y0, y1 (float): Vertical crop range in spatial units.
+        dx, dy (float): Pixel sizes.
+        y_from_top (bool): If True, y is measured from the top row down
+                           (array convention). If False (default), y is
+                           measured from the bottom up, matching plots
+                           drawn with origin='upper' and
+                           extent=(0, x_real, 0, y_real).
+
+    Returns:
+        np.ndarray: The cropped data.
+
+    Raises:
+        ValueError: If the requested region is empty.
+    """
+    ny, nx = data.shape
+    j0 = max(0, int(np.floor(x0 / dx)))
+    j1 = min(nx, int(np.ceil(x1 / dx)))
+    if y_from_top:
+        i0 = max(0, int(np.floor(y0 / dy)))
+        i1 = min(ny, int(np.ceil(y1 / dy)))
+    else:
+        i0 = max(0, ny - int(np.ceil(y1 / dy)))
+        i1 = min(ny, ny - int(np.floor(y0 / dy)))
+    if j1 <= j0 or i1 <= i0:
+        raise ValueError("Empty crop region")
+    return data[i0:i1, j0:j1].copy()
 
 
 def set_baseline_to_zero(data):
@@ -265,7 +341,55 @@ def remove_scars(data, threshold=3.0, min_length=5):
     return corrected_data
 
 
-def get_2d_fft_magnitude(data, dx=1.0, dy=1.0, window=None):
+def _tukey_1d(n, alpha):
+    """
+    1D Tukey (tapered cosine) window without scipy.
+
+    alpha is the fraction of the window inside the cosine taper:
+    alpha=0 -> rectangular (no window), alpha=1 -> Hann window.
+    """
+    if alpha <= 0:
+        return np.ones(n)
+    if alpha >= 1:
+        return np.hanning(n)
+    w = np.ones(n)
+    edge = int(np.floor(alpha * (n - 1) / 2.0))
+    if edge < 1:
+        return w
+    t = np.arange(0, edge + 1)
+    taper = 0.5 * (1 + np.cos(np.pi * (2.0 * t / (alpha * (n - 1)) - 1)))
+    w[:edge + 1] = taper
+    w[-(edge + 1):] = taper[::-1]
+    return w
+
+
+def make_fft_window(shape, window='hanning', alpha=0.5):
+    """
+    Builds a separable 2D window for FFT analysis.
+
+    Args:
+        shape (tuple): (ny, nx) shape of the image.
+        window (str or None): 'hanning', 'tukey', or None/'none'.
+        alpha (float): Taper fraction for the Tukey window (0..1).
+                       alpha=0 is no tapering, alpha=1 equals Hann.
+                       Ignored for 'hanning'.
+
+    Returns:
+        np.ndarray or None: The 2D window, or None if no windowing.
+    """
+    if window is None or window == 'none':
+        return None
+    ny, nx = shape
+    if window == 'hanning':
+        wy, wx = np.hanning(ny), np.hanning(nx)
+    elif window == 'tukey':
+        wy, wx = _tukey_1d(ny, alpha), _tukey_1d(nx, alpha)
+    else:
+        raise ValueError("Unknown window: '{}'".format(window))
+    return np.sqrt(np.outer(wy, wx))
+
+
+def get_2d_fft_magnitude(data, dx=1.0, dy=1.0, window=None, alpha=0.5):
     """
     Calculates the 2D FFT magnitude spectrum (in decibels) and frequency extents.
 
@@ -273,15 +397,13 @@ def get_2d_fft_magnitude(data, dx=1.0, dy=1.0, window=None):
         data (np.ndarray): 2D numpy array.
         dx (float): Pixel size in x.
         dy (float): Pixel size in y.
-        window (str, optional): The windowing function to apply.
-                                Currently supports 'hanning'. Defaults to None.
+        window (str, optional): Windowing function: 'hanning', 'tukey' or None.
+        alpha (float): Taper fraction for the Tukey window (0..1).
     """
     ny, nx = data.shape
-    if window == 'hanning':
-        hanning_y = np.hanning(ny)
-        hanning_x = np.hanning(nx)
-        hanning_2d = np.sqrt(np.outer(hanning_y, hanning_x))
-        data = data * hanning_2d
+    w2d = make_fft_window((ny, nx), window, alpha)
+    if w2d is not None:
+        data = data * w2d
 
     f = np.fft.fft2(data)
     fshift = np.fft.fftshift(f)
@@ -294,51 +416,49 @@ def get_2d_fft_magnitude(data, dx=1.0, dy=1.0, window=None):
     return magnitude_spectrum, extent
 
 
-def filter_by_2d_fft(data, cutoff_freq, mode='lowpass', dx=1.0, dy=1.0, window=None):
+def filter_by_2d_fft(data, cutoff_freq, mode='lowpass', dx=1.0, dy=1.0,
+                     window=None, alpha=0.5):
     """
     Applies a basic 2D FFT lowpass or highpass filter.
-    
+
     Args:
         data (np.ndarray): 2D numpy array.
         cutoff_freq (float): Cutoff frequency in the same inverse units as dx/dy.
         mode (str): 'lowpass' or 'highpass'.
         dx (float): Pixel size in x.
         dy (float): Pixel size in y.
-        window (str, optional): The windowing function to apply.
-                                Currently supports 'hanning'. Defaults to None.
-        
+        window (str, optional): Windowing function: 'hanning', 'tukey' or None.
+        alpha (float): Taper fraction for the Tukey window (0..1).
+
     Returns:
         np.ndarray: The filtered data.
     """
     ny, nx = data.shape
     original_mean = data.mean()
 
-    if window == 'hanning':
-        hanning_y = np.hanning(ny)
-        hanning_x = np.hanning(nx)
-        hanning_2d = np.sqrt(np.outer(hanning_y, hanning_x))
-        data = data * hanning_2d
+    w2d = make_fft_window((ny, nx), window, alpha)
+    if w2d is not None:
+        data = data * w2d
 
     f = np.fft.fft2(data)
     fshift = np.fft.fftshift(f)
-    
+
     freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
     freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
     FX, FY = np.meshgrid(freq_x, freq_y)
     F_dist = np.sqrt(FX**2 + FY**2)
-    
+
     mask = F_dist <= cutoff_freq if mode == 'lowpass' else F_dist > cutoff_freq
-        
+
     fshift_filtered = fshift * mask
     img_back = np.fft.ifft2(np.fft.ifftshift(fshift_filtered))
-    
+
     # Correct for amplitude loss from windowing and restore mean
     filtered_data = np.real(img_back)
-    if window == 'hanning':
-        # The Hanning window reduces the total power. We need to compensate.
-        # The correction factor for power is sum(w^2)/N. For amplitude, it's different.
-        # A simpler approach for visualization is to rescale to the original range or mean.
-        filtered_data = filtered_data * (1.0 / hanning_2d.mean())
+    if w2d is not None:
+        # The window reduces the total power. We need to compensate.
+        # A simple approach for visualization is to rescale to the original mean.
+        filtered_data = filtered_data * (1.0 / w2d.mean())
         filtered_data = filtered_data - filtered_data.mean() + original_mean
 
     return filtered_data
@@ -366,6 +486,162 @@ def filter_by_2d_fft_mask(data, mask, window=None):
     fshift_filtered = fshift * mask
     img_back = np.fft.ifft2(np.fft.ifftshift(fshift_filtered))
     return np.real(img_back)
+
+
+def build_notch_mask(shape, dx=1.0, dy=1.0, notches=(), radius=0.1):
+    """
+    Builds a boolean frequency-domain mask with circular notches removed.
+
+    For each notch position (fx, fy) the mask is set to False inside a
+    circle of the given radius around BOTH (fx, fy) and (-fx, -fy), so the
+    mask stays symmetric and the filtered image stays real.
+
+    The mask is defined on the fftshift-ed frequency grid, matching
+    `filter_by_2d_fft_mask`.
+
+    Args:
+        shape (tuple): (ny, nx) shape of the image.
+        dx (float): Pixel size in x.
+        dy (float): Pixel size in y.
+        notches (iterable): Sequence of (fx, fy) notch center frequencies.
+        radius (float): Notch radius in frequency units.
+
+    Returns:
+        np.ndarray: Boolean mask (True = keep frequency).
+    """
+    ny, nx = shape
+    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    FX, FY = np.meshgrid(freq_x, freq_y)
+
+    mask = np.ones(shape, dtype=bool)
+    for nfx, nfy in notches:
+        for sx, sy in ((nfx, nfy), (-nfx, -nfy)):
+            mask &= ((FX - sx) ** 2 + (FY - sy) ** 2) > radius**2
+    return mask
+
+
+def build_band_mask(shape, dx=1.0, dy=1.0, x_bands=(), y_bands=(), half_width=0.5):
+    """
+    Builds a boolean frequency-domain mask with straight bands removed
+    (line notches).
+
+    This targets noise that shows up as full stripes in the spectrum, e.g.
+    single-frequency interference along the fast scan axis, which appears
+    as a vertical line at some fx spanning all fy.
+
+    Args:
+        shape (tuple): (ny, nx) shape of the image.
+        dx (float): Pixel size in x.
+        dy (float): Pixel size in y.
+        x_bands (iterable): fx center frequencies. For each center c the
+                            vertical stripes |fx - c| < half_width and
+                            |fx + c| < half_width are removed (all fy).
+        y_bands (iterable): fy center frequencies, removing horizontal
+                            stripes in the same symmetric way.
+        half_width (float): Half-width of each band in frequency units.
+
+    Returns:
+        np.ndarray: Boolean mask (True = keep frequency), on the
+                    fftshift-ed grid, matching `filter_by_2d_fft_mask`.
+    """
+    ny, nx = shape
+    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    FX, FY = np.meshgrid(freq_x, freq_y)
+
+    mask = np.ones(shape, dtype=bool)
+    for c in x_bands:
+        mask &= (np.abs(FX - c) > half_width) & (np.abs(FX + c) > half_width)
+    for c in y_bands:
+        mask &= (np.abs(FY - c) > half_width) & (np.abs(FY + c) > half_width)
+    return mask
+
+
+def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
+                     threshold_db=20.0, max_peaks=50, min_separation=None,
+                     window='hanning', alpha=0.5):
+    """
+    Detects sharp peaks in the 2D FFT magnitude spectrum (periodic noise).
+
+    A pixel is considered a peak candidate when its magnitude (in dB)
+    exceeds the spectrum median by `threshold_db` AND it is a local maximum
+    in its 3x3 neighbourhood AND it lies outside the central low-frequency
+    region of radius `protect_radius`.
+
+    Candidates are then accepted strongest-first, skipping any candidate
+    closer than `min_separation` to an already accepted peak (or to its
+    mirrored counterpart, since conjugate peaks come in +/- pairs).
+
+    Args:
+        data (np.ndarray): 2D image data.
+        dx, dy (float): Pixel sizes.
+        protect_radius (float): Frequencies within this radius of the origin
+                                are never reported (protects the actual image
+                                content around DC).
+        threshold_db (float): Peak height above the spectrum median, in dB.
+        max_peaks (int): Maximum number of peaks to return.
+        min_separation (float): Minimum distance between reported peaks.
+                                Defaults to ~3 frequency pixels.
+        window (str, optional): Windowing before the FFT
+                                ('hanning', 'tukey' or None).
+        alpha (float): Taper fraction for the Tukey window (0..1).
+
+    Returns:
+        list of (fx, fy): Detected peak positions, strongest first. Only one
+                          of each conjugate +/- pair is returned.
+    """
+    ny, nx = data.shape
+    d = data
+    w2d = make_fft_window((ny, nx), window, alpha)
+    if w2d is not None:
+        d = data * w2d
+
+    fshift = np.fft.fftshift(np.fft.fft2(d))
+    mag_db = 20 * np.log10(np.abs(fshift) + 1e-12)
+
+    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    FX, FY = np.meshgrid(freq_x, freq_y)
+    F_dist = np.sqrt(FX**2 + FY**2)
+
+    background = np.median(mag_db)
+    candidates = (mag_db > background + threshold_db) & (F_dist > protect_radius)
+
+    # Local maximum in the 3x3 neighbourhood (edges wrap, which is harmless
+    # here since the spectrum decays toward Nyquist).
+    local_max = np.ones((ny, nx), dtype=bool)
+    for sy in (-1, 0, 1):
+        for sx in (-1, 0, 1):
+            if sx == 0 and sy == 0:
+                continue
+            local_max &= mag_db >= np.roll(np.roll(mag_db, sy, axis=0), sx, axis=1)
+
+    peak_mask = candidates & local_max
+    ys, xs = np.nonzero(peak_mask)
+    if len(ys) == 0:
+        return []
+
+    if min_separation is None:
+        dfx = freq_x[1] - freq_x[0] if nx > 1 else 1.0
+        dfy = freq_y[1] - freq_y[0] if ny > 1 else 1.0
+        min_separation = 3.0 * max(dfx, dfy)
+
+    order = np.argsort(mag_db[ys, xs])[::-1]
+    peaks = []
+    for idx in order:
+        fx_, fy_ = float(FX[ys[idx], xs[idx]]), float(FY[ys[idx], xs[idx]])
+        too_close = any(
+            (fx_ - px) ** 2 + (fy_ - py) ** 2 < min_separation**2
+            or (fx_ + px) ** 2 + (fy_ + py) ** 2 < min_separation**2
+            for px, py in peaks
+        )
+        if too_close:
+            continue
+        peaks.append((fx_, fy_))
+        if len(peaks) >= max_peaks:
+            break
+    return peaks
 
 
 # --- Utility and Loading Functions ---
