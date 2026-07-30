@@ -144,7 +144,7 @@ def twoway_kwargs(params, detect=False):
         poly_order=int(g("poly_order", 2)),
         n_blocks=int(g("n_blocks", 16)),
         max_lag=int(g("max_lag", 20)),
-        highpass=float(g("highpass", 8.0)),
+        match_level=g("match_level", "plane"),
         flip_backward=flip,
         crop=bool(g("crop", True)),
         detect=detect,
@@ -426,8 +426,8 @@ OPERATIONS = {
              "default": 16, "min": 1, "max": 128},
             {"name": "max_lag", "label": "Max lag (px)", "type": "int",
              "default": 20, "min": 1, "max": 200},
-            {"name": "highpass", "label": "Match high-pass (px)", "type": "float",
-             "default": 8.0, "min": 0.0, "max": 1e4},
+            {"name": "match_level", "label": "Level for match", "type": "choice",
+             "default": "plane", "values": ["plane", "none"]},
             {"name": "warp", "label": "Warp", "type": "choice",
              "default": "bwd_to_fwd",
              "values": ["bwd_to_fwd", "split", "linearize_both"]},
@@ -1410,7 +1410,7 @@ class TwoWayDialog(tk.Toplevel):
     # parameter names grouped into the panels of the dialog
     GROUPS = [
         ("Alignment (hysteresis + lag)",
-         ["mapping", "poly_order", "n_blocks", "max_lag", "highpass",
+         ["mapping", "poly_order", "n_blocks", "max_lag", "match_level",
           "warp", "flip_backward", "crop"]),
         ("Merge",
          ["combine", "weight", "slope_gain", "consensus_size", "beta"]),
@@ -1512,6 +1512,7 @@ class TwoWayDialog(tk.Toplevel):
         self.overlay_style = tk.StringVar(value="blend")
         self.overlay_alpha = tk.DoubleVar(value=0.5)
         self.curve_view = tk.StringVar(value="mapping (0-1)")
+        self.display_plane = tk.BooleanVar(value=True)
 
         ttk.Label(frame, text="Overlay:").grid(row=0, column=0, sticky=tk.W,
                                                padx=(0, 6), pady=1)
@@ -1528,7 +1529,12 @@ class TwoWayDialog(tk.Toplevel):
         ttk.Combobox(frame, textvariable=self.curve_view,
                      values=["mapping (0-1)", "shift (px)"], state="readonly",
                      width=12).grid(row=2, column=1, sticky=tk.W, pady=1)
-        for var in (self.overlay_style, self.overlay_alpha, self.curve_view):
+        ttk.Label(frame, text="Plane level:").grid(row=3, column=0, sticky=tk.W,
+                                                   padx=(0, 6), pady=1)
+        ttk.Checkbutton(frame, variable=self.display_plane).grid(
+            row=3, column=1, sticky=tk.W, pady=1)
+        for var in (self.overlay_style, self.overlay_alpha, self.curve_view,
+                    self.display_plane):
             var.trace_add("write", self._on_display_change)
 
     def _on_display_change(self, *args):
@@ -1737,6 +1743,21 @@ class TwoWayDialog(tk.Toplevel):
             title += f"  (cropped {cropped} px)"
         return title
 
+    def _display_images(self):
+        """The forward, backward, and merged images as shown in the panels.
+
+        With 'Plane level' checked (default), ONE plane - fitted to the
+        forward image - is subtracted from all three, so the surface features
+        become visible instead of the tilt gradient, while the three panels
+        stay mutually comparable. Display only: the data that gets applied or
+        saved is never leveled here."""
+        res = self.result
+        if not self.display_plane.get():
+            return res.fwd, res.bwd, res.merged, ""
+        plane = gtw.fit_plane(res.fwd)
+        return (res.fwd - plane, res.bwd - plane, res.merged - plane,
+                " (plane leveled)")
+
     def _set_info(self):
         a = self.result.alignment
         self.info_var.set(
@@ -1750,16 +1771,18 @@ class TwoWayDialog(tk.Toplevel):
 
     def _draw(self, params):
         res = self.result
+        fwd_d, bwd_d, merged_d, tag = self._display_images()
         self.figure.clf()
         axes = self.figure.subplots(2, 3)
 
-        self._image_panel(axes[0, 0], res.fwd, f"Forward ({self.fwd_title})")
-        self._image_panel(axes[0, 1], res.bwd,
-                          f"Backward ({self.bwd_title}), aligned")
-        self._overlay_panel(axes[0, 2], res.fwd, res.bwd)
+        self._image_panel(axes[0, 0], fwd_d,
+                          f"Forward ({self.fwd_title}){tag}")
+        self._image_panel(axes[0, 1], bwd_d,
+                          f"Backward ({self.bwd_title}), aligned{tag}")
+        self._overlay_panel(axes[0, 2], fwd_d, bwd_d)
 
         self._curves_panel(axes[1, 0])
-        self._image_panel(axes[1, 1], res.merged, self._merged_title())
+        self._image_panel(axes[1, 1], merged_d, self._merged_title() + tag)
         self._image_panel(axes[1, 2], res.fwd - res.merged,
                           self.spec["removed_label"], symmetric=True)
 
@@ -1832,7 +1855,15 @@ class ParachuteDialog(TwoWayDialog):
         super().__init__(app, op_key)
 
     def _build_display_controls(self, outer):
-        pass  # no overlay panel in this dialog
+        # no overlay/curves panel here - only the display plane leveling
+        frame = ttk.LabelFrame(outer, text="Display", padding=6)
+        frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=4)
+        self.display_plane = tk.BooleanVar(value=True)
+        ttk.Label(frame, text="Plane level:").grid(row=0, column=0, sticky=tk.W,
+                                                   padx=(0, 6), pady=1)
+        ttk.Checkbutton(frame, variable=self.display_plane).grid(
+            row=0, column=1, sticky=tk.W, pady=1)
+        self.display_plane.trace_add("write", self._on_display_change)
 
     def _histogram_panel(self, ax, img, direction, slope, offset, max_delta,
                          tag):
@@ -1882,8 +1913,10 @@ class ParachuteDialog(TwoWayDialog):
         ax.set_title(f"Flagged: fwd {100*res.fraction_fwd:.1f}%, "
                      f"bwd {100*res.fraction_bwd:.1f}%", fontsize=9)
 
-        self._image_panel(axes[1, 0], res.fwd, f"Forward ({self.fwd_title})")
-        self._image_panel(axes[1, 1], res.merged, self._merged_title())
+        fwd_d, _, merged_d, tag = self._display_images()
+        self._image_panel(axes[1, 0], fwd_d,
+                          f"Forward ({self.fwd_title}){tag}")
+        self._image_panel(axes[1, 1], merged_d, self._merged_title() + tag)
         self._image_panel(axes[1, 2], res.fwd - res.merged,
                           self.spec["removed_label"], symmetric=True)
 

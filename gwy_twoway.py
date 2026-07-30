@@ -190,38 +190,51 @@ def backward_needs_flip(fwd, bwd):
     return _similarity(fwd, bwd[:, ::-1]) > _similarity(fwd, bwd)
 
 
-def highpass_x(image, sigma):
-    """Remove the smooth background along the fast axis (gaussian high-pass
-    per row). Used before any column matching: the raw heights are dominated
-    by the leveling background, which swamps the feature contrast the
-    matching needs. NOT a processing step - only a matching aid."""
+def fit_plane(image):
+    """Least-squares plane z = a + b*x + c*y fitted to the image, returned as
+    an array of the same shape."""
     image = np.asarray(image, dtype=float)
-    if not sigma or sigma <= 0:
-        return image
-    return image - gaussian_filter1d(image, float(sigma), axis=1,
-                                     mode="nearest")
+    ny, nx = image.shape
+    Y, X = np.mgrid[0:ny, 0:nx]
+    A = np.column_stack([np.ones(image.size), X.ravel(), Y.ravel()])
+    coeffs, *_ = np.linalg.lstsq(A, image.ravel(), rcond=None)
+    return (A @ coeffs).reshape(image.shape)
 
 
-def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20, highpass=8.0,
-                          min_quality=0.2):
+def remove_plane(image):
+    """Subtract the fitted plane from the image."""
+    image = np.asarray(image, dtype=float)
+    return image - fit_plane(image)
+
+
+def _level_for_match(image, level):
+    """Preprocessing applied before column matching only (never to the output
+    data): the raw heights are dominated by the sample tilt, which swamps the
+    feature contrast the matching needs. ``level``: 'plane' or 'none'."""
+    if level == "plane":
+        return remove_plane(image)
+    if level in ("none", None, ""):
+        return np.asarray(image, dtype=float)
+    raise ValueError(f"unknown match level {level!r}")
+
+
+def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20,
+                          match_level="plane", min_quality=0.2):
     """Measure the forward->backward column shift directly, by block-wise
     normalized cross-correlation.
 
-    The images are high-pass filtered along the fast axis first, so the match
-    is driven by surface features rather than by the smooth background (a
-    strong background makes raw column matching nearly degenerate).
+    The fitted plane is removed from each image first (``match_level='plane'``,
+    the default), so the match is driven by surface features rather than by
+    the sample tilt. This leveling affects the matching only, never the data.
 
     Returns ``(centers, shift_px, quality)``: the column index at the centre of
     each block, the sub-pixel shift such that forward column ``j`` corresponds
     to backward column ``j + shift``, and the peak correlation of each block.
     Blocks whose peak correlation falls below ``min_quality`` (featureless
     regions) get ``quality = 0`` and should be ignored by the caller."""
-    fwd = np.asarray(fwd, dtype=float)
-    bwd = np.asarray(bwd, dtype=float)
+    fwd = _level_for_match(fwd, match_level)
+    bwd = _level_for_match(bwd, match_level)
     nx = fwd.shape[1]
-
-    fwd = highpass_x(fwd, highpass)
-    bwd = highpass_x(bwd, highpass)
 
     n_blocks = max(1, int(n_blocks))
     width = nx // n_blocks
@@ -261,20 +274,20 @@ def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20, highpass=8.0,
 
 
 def _hysteresis_model_shape(fwd, bwd, l_points, n_var, maxiter, seed,
-                            highpass=0.0, hysteresis_result=None):
+                            match_level="plane", hysteresis_result=None):
     """Run (or reuse) the power-law hysteresis fit and return
     ``(shift_shape_u, result)``: the model's forward->backward shift in
     normalized [0,1] coordinates, sampled on ``result.x_c``.
 
-    The images are high-passed along the fast axis first (``highpass`` > 0);
-    the original hysteresis pipeline matches raw columns, and on images with a
-    strong leveling background the background dominates the correlation and
-    the match degenerates."""
+    The fitted plane is removed first (``match_level='plane'``): the original
+    hysteresis pipeline matches raw columns, and on tilted samples the
+    background dominates the correlation."""
     hc = load_hysteresis_module()
     res = hysteresis_result
     if res is None:
         res = hc.hysteresis_detect(
-            highpass_x(fwd, highpass), highpass_x(bwd, highpass),
+            _level_for_match(fwd, match_level),
+            _level_for_match(bwd, match_level),
             l_points=int(l_points),
             flip_backward=False,          # orientation handled by the caller
             n_var=int(n_var),
@@ -301,7 +314,7 @@ def align_two_way(
     poly_order=2,
     n_blocks=16,
     max_lag=20,
-    highpass=8.0,
+    match_level="plane",
     min_quality=0.2,
     l_points=400,
     n_var=10,
@@ -355,11 +368,13 @@ def align_two_way(
     poly_order : int
         Degree of the polynomial fitted to the measured shift profile
         (``mapping='xcorr'``). 0 = constant lag, 2 = lag + bow.
-    n_blocks, max_lag, highpass, min_quality
-        Passed to :func:`measure_shift_profile`. ``highpass`` is also applied
-        before the power-law model fit (``mapping='model'/'model_scaled'``):
-        without it the leveling background dominates the column correlation
-        and the measured mapping is meaningless on tilted samples.
+    n_blocks, max_lag, match_level, min_quality
+        Passed to :func:`measure_shift_profile`. ``match_level`` ('plane' or
+        'none') is also applied before the power-law model fit
+        (``mapping='model'/'model_scaled'``): without leveling, the sample
+        tilt dominates the column correlation on tilted samples and the
+        measured mapping is meaningless. The leveling is a matching aid only
+        and never touches the output data.
     l_points, n_var, maxiter, seed
         Power-law model size and differential-evolution settings.
     smooth_measured : float
@@ -399,7 +414,7 @@ def align_two_way(
     if mapping in ("xcorr", "model_scaled", "measured"):
         centers, meas_shift, quality = measure_shift_profile(
             fwd, bwd_oriented, n_blocks=n_blocks, max_lag=max_lag,
-            highpass=highpass, min_quality=min_quality)
+            match_level=match_level, min_quality=min_quality)
         good = quality > 0
         if good.sum() < 2:
             raise RuntimeError(
@@ -427,7 +442,7 @@ def align_two_way(
     elif mapping in ("model", "model_scaled"):
         shape_u, res = _hysteresis_model_shape(
             fwd, bwd_oriented, l_points, n_var, maxiter, seed,
-            highpass=highpass, hysteresis_result=hysteresis_result)
+            match_level=match_level, hysteresis_result=hysteresis_result)
         shape_px = np.interp(t_grid, res.x_c, shape_u) * (nx - 1)
         if mapping == "model":
             shift = shape_px
@@ -750,7 +765,7 @@ DEFAULTS = dict(
     poly_order=2,
     n_blocks=16,
     max_lag=20,
-    highpass=8.0,
+    match_level="plane",
     min_quality=0.2,
     l_points=400,
     n_var=10,
@@ -779,7 +794,7 @@ DEFAULTS = dict(
 
 #: Alignment keys forwarded to :func:`align_two_way`.
 _ALIGN_KEYS = ("mapping", "flip_backward", "warp", "poly_order", "n_blocks",
-               "max_lag", "highpass", "min_quality", "l_points", "n_var",
+               "max_lag", "match_level", "min_quality", "l_points", "n_var",
                "maxiter", "smooth_measured", "max_shift_px", "interp")
 
 
