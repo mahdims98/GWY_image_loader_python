@@ -1410,7 +1410,8 @@ class ZoomWindow(tk.Toplevel):
     def show(self, panels, extent, subtitle, z_units):
         """panels: [(title, image), ...], all the same shape."""
         self.figure.clf()
-        axes = np.atleast_1d(self.figure.subplots(1, len(panels)))
+        axes = np.atleast_1d(self.figure.subplots(1, len(panels),
+                                                  sharex=True, sharey=True))
         allv = np.concatenate([img.ravel() for _, img in panels])
         v0, v1 = np.percentile(allv, [0.5, 99.5])
         if v1 <= v0:
@@ -1926,6 +1927,19 @@ class TwoWayDialog(tk.Toplevel):
                 (x0, y0), x1 - x0, y1 - y0, fill=False,
                 edgecolor="red", lw=1.2))
 
+    @staticmethod
+    def _link_panels(*axes):
+        """Share the x/y limits of the image panels, so toolbar zoom or pan
+        on any one of them applies to all of them at once."""
+        first = axes[0]
+        for ax in axes[1:]:
+            try:
+                ax.sharex(first)
+                ax.sharey(first)
+            except AttributeError:      # older matplotlib
+                first.get_shared_x_axes().join(first, ax)
+                first.get_shared_y_axes().join(first, ax)
+
     def destroy(self):
         if getattr(self, "_zoom_win", None) is not None \
                 and self._zoom_win.winfo_exists():
@@ -1960,6 +1974,8 @@ class TwoWayDialog(tk.Toplevel):
         self._image_panel(axes[1, 2], res.fwd - res.merged,
                           self.spec["removed_label"], symmetric=True)
 
+        self._link_panels(axes[0, 0], axes[0, 1], axes[0, 2],
+                          axes[1, 1], axes[1, 2])
         self._mark_zoom_rect(axes[0, 0], axes[0, 1], axes[1, 1])
         self._attach_zoom_selector(axes[0, 0])
         self.figure.tight_layout()
@@ -2092,6 +2108,7 @@ class ParachuteDialog(TwoWayDialog):
         self._image_panel(axes[1, 2], res.fwd - res.merged,
                           self.spec["removed_label"], symmetric=True)
 
+        self._link_panels(axes[0, 2], axes[1, 0], axes[1, 1], axes[1, 2])
         self._mark_zoom_rect(axes[1, 0], axes[1, 1])
         self._attach_zoom_selector(axes[1, 0])
         self.figure.tight_layout()
