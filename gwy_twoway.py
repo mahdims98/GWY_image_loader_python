@@ -812,14 +812,16 @@ def local_correlation(a, b, window=11):
 
 
 def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
-                       weight=0.5):
+                       weight=0.5, shared=None):
     """Correlation-gated merge of two aligned scans.
 
     The local (windowed) correlation between the scans decides, pixel by
     pixel, whether the two directions imaged the same feature:
 
-    * ``corr >= margin`` - the feature is shared: take the weighted average
-      (``weight`` * fwd + (1-``weight``) * bwd).
+    * ``corr >= margin`` - the feature is shared: take the combined value
+      ``shared`` (any :func:`combine_scans` output, e.g. a soft-min); when
+      ``shared`` is None the weighted average
+      ``weight`` * fwd + (1-``weight``) * bwd is used.
     * ``corr < margin``  - the scans disagree there. The auxiliary channels
       (phase / error) referee: each direction's height is locally correlated
       against the direction-averaged auxiliary pattern (which is much less
@@ -828,19 +830,22 @@ def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
       auxiliary channel the direction closer to the local mean wins instead.
 
     Returns ``(merged, corr_map, decision)`` where ``decision`` is 0 where the
-    scans were averaged, 1 where the forward pixel was kept and 2 where the
+    scans were combined, 1 where the forward pixel was kept and 2 where the
     backward pixel was kept.
     """
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
     corr = local_correlation(fwd, bwd, window)
-    w = float(np.clip(weight, 0.0, 1.0))
-    avg = w * fwd + (1.0 - w) * bwd
+    if shared is None:
+        w = float(np.clip(weight, 0.0, 1.0))
+        avg = w * fwd + (1.0 - w) * bwd
+    else:
+        avg = np.asarray(shared, dtype=float)
 
     disputed = corr < float(margin)
     decision = np.zeros(fwd.shape, np.uint8)
     if not disputed.any():
-        return avg, corr, decision
+        return avg.copy(), corr, decision
 
     score_f = np.zeros(fwd.shape)
     score_b = np.zeros(fwd.shape)
@@ -924,6 +929,8 @@ DEFAULTS = dict(
     both_flagged="paper",
     corr_margin=0.7,     # combine='correlation': shared-feature threshold
     corr_window=11,      # ... local correlation window (px)
+    corr_combine="average",  # ... how the shared pixels are combined
+                             # (any combine_scans mode, e.g. 'softmin')
     # -- output
     crop=True,           # trim edge columns not imaged in both directions
 )
@@ -999,9 +1006,12 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
         pairs = [(apply_alignment(alignment, af, "fwd", p["interp"]),
                   apply_alignment(alignment, ab, "bwd", p["interp"]))
                  for af, ab in (aux_pairs or [])]
+        shared = combine_scans(a_fwd, a_bwd, p["corr_combine"], p["weight"],
+                               p["beta"], p["slope_gain"],
+                               p["consensus_size"])
         merged, corr_map, corr_decision = correlation_select(
             a_fwd, a_bwd, pairs, margin=p["corr_margin"],
-            window=p["corr_window"], weight=p["weight"])
+            window=p["corr_window"], weight=p["weight"], shared=shared)
         merged = _replace_flagged(merged, a_fwd, a_bwd, mask_f, mask_b,
                                   p["both_flagged"])
     else:

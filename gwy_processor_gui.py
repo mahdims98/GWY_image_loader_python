@@ -161,7 +161,43 @@ def twoway_kwargs(params, detect=False):
         both_flagged=g("both_flagged", "paper"),
         corr_margin=float(g("corr_margin", 0.7)),
         corr_window=int(g("corr_window", 11)),
+        corr_combine=g("corr_combine", "average"),
     )
+
+
+def twoway_param_relevant(name, p):
+    """Whether a two-way / parachuting dialog parameter has any effect under
+    the currently selected dropdown choices. Used to hide the irrelevant
+    parameter rows; unknown names are always relevant."""
+    g = p.get
+    mapping = g("mapping", "xcorr")
+    combine = g("combine", "average")
+    corr = combine == "correlation"
+    corr_combine = g("corr_combine", "average") if corr else None
+    measured = mapping in ("xcorr", "model_scaled", "measured")
+    rules = {
+        # alignment
+        "poly_order": mapping == "xcorr",
+        "n_blocks": measured,
+        "max_lag": measured,
+        "match_level": mapping != "none",
+        "match_poly_order": (mapping != "none"
+                             and g("match_level", "plane") == "poly_rows"),
+        # merge
+        "weight": combine == "average" or corr_combine == "average",
+        "slope_gain": combine == "slope" or corr_combine == "slope",
+        "consensus_size": (combine == "consensus"
+                           or corr_combine == "consensus"),
+        "beta": combine == "softmin" or corr_combine == "softmin",
+        "corr_margin": corr,
+        "corr_window": corr,
+        "corr_aux": corr,
+        "corr_combine": corr,
+        # parachuting detection
+        "slope": g("slope_mode", "manual") == "manual",
+        "slope_scale": g("slope_mode", "manual") == "auto",
+    }
+    return rules.get(name, True)
 
 
 #: Auxiliary channel base names consulted by the correlation merge, keyed by
@@ -240,9 +276,13 @@ def _describe_combine(params):
     if combine == "consensus":
         return f"consensus size={params.get('consensus_size', 5)}"
     if combine == "correlation":
+        shared = params.get("corr_combine", "average")
+        if shared == "softmin":
+            shared += f" beta={params.get('beta', 0.0)}"
         return (f"correlation margin={params.get('corr_margin', 0.7)}, "
                 f"win={params.get('corr_window', 11)}px, "
-                f"referee={params.get('corr_aux', 'phase+error')}")
+                f"referee={params.get('corr_aux', 'phase+error')}, "
+                f"shared={shared}")
     return combine
 
 
@@ -499,6 +539,10 @@ OPERATIONS = {
             {"name": "corr_aux", "label": "Referee channels", "type": "choice",
              "default": "phase+error",
              "values": ["phase+error", "phase", "error", "none"]},
+            {"name": "corr_combine", "label": "Shared combine", "type": "choice",
+             "default": "average",
+             "values": ["average", "softmin", "slope", "consensus",
+                        "min", "max"]},
         ],
         "removed_label": "Difference (forward - merged)",
         "describe": _describe_two_way,
@@ -1503,7 +1547,8 @@ class TwoWayDialog(tk.Toplevel):
          ["mapping", "poly_order", "n_blocks", "max_lag", "match_level",
           "match_poly_order", "warp", "flip_backward", "crop"]),
         ("Merge",
-         ["combine", "weight", "slope_gain", "consensus_size", "beta",
+         ["combine", "corr_combine", "weight", "slope_gain",
+          "consensus_size", "beta",
           "corr_margin", "corr_window", "corr_aux"]),
     ]
 
@@ -1555,14 +1600,16 @@ class TwoWayDialog(tk.Toplevel):
         outer = ttk.Frame(self, padding=6)
         outer.pack(side=tk.TOP, fill=tk.X)
         by_name = {p["name"]: p for p in self.spec["params"]}
+        self._param_widgets = {}
 
         for title, names in self.GROUPS:
             frame = ttk.LabelFrame(outer, text=title, padding=6)
             frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
             for row, name in enumerate(names):
                 p = by_name[name]
-                ttk.Label(frame, text=p["label"] + ":").grid(
-                    row=row, column=0, sticky=tk.W, padx=(0, 6), pady=1)
+                label = ttk.Label(frame, text=p["label"] + ":")
+                label.grid(row=row, column=0, sticky=tk.W, padx=(0, 6),
+                           pady=1)
                 if p["type"] == "int":
                     var = tk.IntVar(value=p["default"])
                     widget = ttk.Spinbox(frame, from_=p.get("min", 0),
@@ -1584,7 +1631,9 @@ class TwoWayDialog(tk.Toplevel):
                 widget.grid(row=row, column=1, sticky=tk.W, pady=1)
                 var.trace_add("write", self._on_param_change)
                 self.vars[name] = var
+                self._param_widgets[name] = (label, widget)
 
+        self._update_param_visibility()
         self._build_display_controls(outer)
 
         info = ttk.Frame(self, padding=(8, 0))
@@ -1699,7 +1748,28 @@ class TwoWayDialog(tk.Toplevel):
                 return None
         return params
 
+    def _update_param_visibility(self):
+        """Show only the parameter rows that matter for the currently selected
+        dropdown choices (e.g. the soft-min beta only when a soft-min is in
+        use). Hidden parameters keep their values."""
+        if not getattr(self, "_param_widgets", None):
+            return
+        current = {}
+        for name, var in self.vars.items():
+            try:
+                current[name] = var.get()
+            except tk.TclError:
+                pass    # mid-typing; keep this row's last visibility
+        for name, (label, widget) in self._param_widgets.items():
+            if twoway_param_relevant(name, current):
+                label.grid()
+                widget.grid()
+            else:
+                label.grid_remove()
+                widget.grid_remove()
+
     def _on_param_change(self, *args):
+        self._update_param_visibility()
         if self._after_id is not None:
             self.after_cancel(self._after_id)
         self._after_id = self.after(self.PREVIEW_DEBOUNCE_MS, self.update_preview)

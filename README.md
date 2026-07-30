@@ -81,7 +81,9 @@ two-way scanning data", in three independently tunable stages:
     glitches.
   * `correlation` (`correlation_select`) — correlation-gated merge: the local
     windowed correlation between the two scans (`corr_window`) marks each
-    pixel as shared (`corr >= corr_margin` → weighted average) or disputed.
+    pixel as shared (`corr >= corr_margin` → combined with `corr_combine`,
+    which can be any of the modes above, e.g. `average` or `softmin`) or
+    disputed.
     Disputed pixels are refereed by the phase and error channels of the same
     file (warped with the same alignment as the heights): each direction's
     height is locally correlated against the direction-averaged phase/error
