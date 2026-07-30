@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.interpolate import CubicSpline
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter, gaussian_filter1d, uniform_filter
 
 # --------------------------------------------------------------------------- #
 #  Locate the hysteresis-compensation module
@@ -146,6 +146,9 @@ class Alignment:
     shift_px: np.ndarray             # fitted forward->backward shift, per column
     mapping: str = "xcorr"           # which mapping was used
     flipped_backward: bool = False   # whether the backward image was mirrored
+    crop_cols: tuple = None          # (c0, c1): columns where BOTH scans have
+                                     # real data; outside, one scan never
+                                     # imaged the area and the edge was held
     max_shift_px: float = 0.0
     lag_px: float = 0.0              # mean shift (the constant feedback lag)
     bow_px: float = 0.0              # peak-to-peak of the non-constant part
@@ -367,7 +370,7 @@ def align_two_way(
         return Alignment(
             fwd=fwd, bwd=bwd_oriented, columns_fwd=grid, columns_bwd=grid,
             shift_px=np.zeros(nx), mapping="none",
-            flipped_backward=flip_backward,
+            flipped_backward=flip_backward, crop_cols=(0, nx),
             corr_before=corr_before, corr_after=corr_before,
             rms_before=rms_before, rms_after=rms_before,
         )
@@ -449,6 +452,15 @@ def align_two_way(
         fwd, columns_fwd, interp)
     out_bwd = resample_columns(bwd_oriented, columns_bwd, interp)
 
+    # Columns where both scans sampled real data. Where the (shifted) source
+    # position falls outside the image, resample_columns held the edge value -
+    # that area was never imaged in that direction and should be cropped off.
+    eps = 1e-6
+    valid = ((columns_fwd >= -eps) & (columns_fwd <= nx - 1 + eps)
+             & (columns_bwd >= -eps) & (columns_bwd <= nx - 1 + eps))
+    idx = np.nonzero(valid)[0]
+    crop_cols = (int(idx[0]), int(idx[-1]) + 1) if len(idx) else (0, nx)
+
     non_constant = shift - shift.mean()
     return Alignment(
         fwd=out_fwd,
@@ -458,6 +470,7 @@ def align_two_way(
         shift_px=shift,
         mapping=mapping,
         flipped_backward=flip_backward,
+        crop_cols=crop_cols,
         max_shift_px=float(np.max(np.abs(shift))),
         lag_px=float(shift.mean()),
         bow_px=float(non_constant.max() - non_constant.min()),
@@ -592,24 +605,46 @@ def softmin(x, y, beta):
     return lo - np.log1p(np.exp(-bd)) / beta + (np.log(2.0) / beta) * np.exp(-bd * bd)
 
 
-def combine_scans(fwd, bwd, combine="average", weight=0.5, beta=0.0):
+def combine_scans(fwd, bwd, combine="average", weight=0.5, beta=0.0,
+                  slope_gain=2.0, consensus_size=5):
     """Combine two aligned scans pixel by pixel, ignoring any parachuting mask.
 
     ``combine``:
-      ``average``  - weighted average ``weight*fwd + (1-weight)*bwd``.
-                     ``weight=0.5`` is the plain mean (lowest noise, no bias),
-                     ``1`` keeps the forward scan, ``0`` the backward one.
-      ``softmin``  - the paper's soft-minimum with parameter ``beta``.
+      ``average``   - weighted average ``weight*fwd + (1-weight)*bwd``.
+                      ``weight=0.5`` is the plain mean (lowest noise, no bias),
+                      ``1`` keeps the forward scan, ``0`` the backward one.
+      ``slope``     - slope-directional blend. The tip tracks *rising* edges
+                      well and lags on *falling* ones, and the two scans move
+                      in opposite directions - so at every pixel the scan that
+                      was climbing there is the trustworthy one. The local
+                      x-gradient g of the mean image sets a smooth weight
+                      ``w_fwd = sigmoid(slope_gain * g / std(g))``: uphill in
+                      +x trusts the forward scan, downhill the backward one.
+                      Flat areas fall back to the plain mean. Sharpens edges
+                      compared to a plain average without a hard seam.
+      ``consensus`` - outlier rejection: at each pixel keep whichever scan is
+                      closer to the local (``consensus_size`` box) mean of the
+                      two. Rejects single-scan glitches; keeps real structure.
+      ``softmin``   - the paper's soft-minimum with parameter ``beta``.
       ``min``/``max`` - hard minimum / maximum of the two.
       ``forward``/``backward`` - take one scan unchanged (useful for
-                     comparing against the merge, or for using the alignment
-                     and parachuting stages on their own).
+                      comparing against the merge, or for using the alignment
+                      and parachuting stages on their own).
     """
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
     if combine == "average":
         w = float(np.clip(weight, 0.0, 1.0))
         return w * fwd + (1.0 - w) * bwd
+    if combine == "slope":
+        mean = 0.5 * (fwd + bwd)
+        grad = np.gradient(gaussian_filter(mean, 1.0), axis=1)
+        scale = float(np.std(grad)) or 1.0
+        w = 1.0 / (1.0 + np.exp(-float(slope_gain) * grad / scale))
+        return w * fwd + (1.0 - w) * bwd
+    if combine == "consensus":
+        ref = uniform_filter(0.5 * (fwd + bwd), size=max(1, int(consensus_size)))
+        return np.where(np.abs(fwd - ref) <= np.abs(bwd - ref), fwd, bwd)
     if combine == "softmin":
         return softmin(fwd, bwd, beta)
     if combine == "min":
@@ -624,7 +659,8 @@ def combine_scans(fwd, bwd, combine="average", weight=0.5, beta=0.0):
 
 
 def merge_two_way(fwd, bwd, mask_fwd=None, mask_bwd=None, combine="average",
-                  weight=0.5, beta=0.0, both_flagged="paper"):
+                  weight=0.5, beta=0.0, slope_gain=2.0, consensus_size=5,
+                  both_flagged="paper"):
     """Merge two aligned scans into one image.
 
     Away from any flagged pixel the two scans are combined with
@@ -640,7 +676,8 @@ def merge_two_way(fwd, bwd, mask_fwd=None, mask_bwd=None, combine="average",
     """
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
-    out = combine_scans(fwd, bwd, combine, weight, beta)
+    out = combine_scans(fwd, bwd, combine, weight, beta, slope_gain,
+                        consensus_size)
     if mask_fwd is None and mask_bwd is None:
         return out
 
@@ -713,7 +750,11 @@ DEFAULTS = dict(
     combine="average",
     weight=0.5,
     beta=0.0,
+    slope_gain=2.0,
+    consensus_size=5,
     both_flagged="paper",
+    # -- output
+    crop=True,           # trim edge columns not imaged in both directions
 )
 
 #: Alignment keys forwarded to :func:`align_two_way`.
@@ -778,7 +819,19 @@ def process_two_way(fwd, bwd, hysteresis_result=None, **params):
     # ---- 3. merge -------------------------------------------------------- #
     merged = merge_two_way(a_fwd, a_bwd, mask_f, mask_b,
                            combine=p["combine"], weight=p["weight"],
-                           beta=p["beta"], both_flagged=p["both_flagged"])
+                           beta=p["beta"], slope_gain=p["slope_gain"],
+                           consensus_size=p["consensus_size"],
+                           both_flagged=p["both_flagged"])
+
+    # ---- 4. crop to the doubly-imaged region ----------------------------- #
+    if p["crop"] and alignment.crop_cols is not None:
+        c0, c1 = alignment.crop_cols
+        if (c0, c1) != (0, merged.shape[1]):
+            merged = merged[:, c0:c1]
+            a_fwd = a_fwd[:, c0:c1]
+            a_bwd = a_bwd[:, c0:c1]
+            mask_f = mask_f[:, c0:c1]
+            mask_b = mask_b[:, c0:c1]
 
     return TwoWayResult(
         merged=merged, fwd=a_fwd, bwd=a_bwd,

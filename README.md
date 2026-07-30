@@ -69,13 +69,35 @@ two-way scanning data", in three independently tunable stages:
   * `average` (default) — weighted average `weight*fwd + (1-weight)*bwd`.
     `0.5` is the plain mean (lowest noise, no bias), `1` keeps the forward scan
     and `0` the backward one.
+  * `slope` — slope-directional blend: the tip tracks rising edges well and
+    lags on falling ones, and the two scans move in opposite directions, so at
+    each pixel the scan that was climbing there is trusted more
+    (`slope_gain` sets how sharply the weight switches). Sharpens edges
+    compared to a plain average.
+  * `consensus` — outlier rejection: keep whichever scan is closer to the
+    local (`consensus_size` box) mean of the two. Rejects single-scan
+    glitches.
   * `softmin` — the paper's corrected soft-minimum with parameter `beta`;
     `beta = 0` degenerates to the plain mean, large `beta` to a hard minimum.
   * `min`, `max`, `forward`, `backward`.
+* **Crop** (`crop=True`, default): the lag/hysteresis shift means the first or
+  last few columns were only ever imaged in one direction; those columns are
+  trimmed off, so the merged image is slightly narrower than the input and its
+  physical extent shrinks accordingly.
 
-All of this is exposed in the GUI under **Two-way merge (Fwd/Bwd)**, with the
-shift profile, the `H(delta, dz)` histogram, the flagged mask and the merged
-result previewed live. Two ways to commit the result:
+The GUI exposes this in two windows:
+
+* **Two-way merge (Fwd/Bwd)** — alignment and merging. Shows the forward and
+  backward images, an overlay of the two (opacity blend with an adjustable
+  backward opacity, or a red/cyan anaglyph in which residual misalignment
+  appears as color fringes), the hysteresis/lag curves in both directions
+  (fwd→bwd and bwd→fwd, with the cropped edge region shaded), and the final
+  merged, cropped image.
+* **Parachuting removal (Fwd/Bwd)** — detection and repair. Shows the
+  `H(delta, dz)` histograms of *both* scan directions with the decision line
+  drawn on top, the flagged-pixel map, and the repaired result.
+
+Both windows offer two ways to commit the result:
 
 * **Merge to new channel** adds the merged image as a new channel (e.g.
   `Height [Merged]`), leaves the forward and backward channels untouched, and

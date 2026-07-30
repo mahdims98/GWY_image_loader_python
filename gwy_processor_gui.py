@@ -131,28 +131,42 @@ def _op_fft_notch(data, params, dx, dy):
     return gp.filter_by_2d_fft_mask(data, mask)
 
 
-def twoway_kwargs(params):
-    """Translate the dialog's flat parameter dict into gwy_twoway keywords."""
-    flip = {"auto": "auto", "yes": True, "no": False}[params.get("flip_backward", "auto")]
-    manual = params.get("slope_mode", "auto") == "manual"
+def twoway_kwargs(params, detect=False):
+    """Translate a dialog's flat parameter dict into gwy_twoway keywords.
+    Tolerates missing keys (the merge and parachuting dialogs expose
+    different subsets), falling back to the gwy_twoway defaults."""
+    g = params.get
+    flip = {"auto": "auto", "yes": True, "no": False}[g("flip_backward", "auto")]
+    manual = g("slope_mode", "manual") == "manual"
     return dict(
-        mapping=params["mapping"],
-        warp=params["warp"],
-        poly_order=int(params["poly_order"]),
-        n_blocks=int(params["n_blocks"]),
-        max_lag=int(params["max_lag"]),
-        highpass=float(params["highpass"]),
+        mapping=g("mapping", "xcorr"),
+        warp=g("warp", "bwd_to_fwd"),
+        poly_order=int(g("poly_order", 2)),
+        n_blocks=int(g("n_blocks", 16)),
+        max_lag=int(g("max_lag", 20)),
+        highpass=float(g("highpass", 8.0)),
         flip_backward=flip,
-        detect=bool(params["detect"]),
-        slope=float(params["slope"]) if manual else None,
-        slope_scale=float(params["slope_scale"]),
-        offset=float(params["offset"]),
-        max_delta=int(params["max_delta"]),
-        combine=params["combine"],
-        weight=float(params["weight"]),
-        beta=float(params["beta"]),
-        both_flagged=params["both_flagged"],
+        crop=bool(g("crop", True)),
+        detect=detect,
+        slope=float(g("slope", 1.0)) if (detect and manual) else None,
+        slope_scale=float(g("slope_scale", 1.0)),
+        offset=float(g("offset", 0.0)),
+        max_delta=int(g("max_delta", 20)),
+        combine=g("combine", "average"),
+        weight=float(g("weight", 0.5)),
+        slope_gain=float(g("slope_gain", 2.0)),
+        consensus_size=int(g("consensus_size", 5)),
+        beta=float(g("beta", 0.0)),
+        both_flagged=g("both_flagged", "paper"),
     )
+
+
+def _require_pair(context):
+    if not context or context.get("bwd") is None:
+        raise ValueError(
+            "This operation needs a forward AND a backward channel "
+            "(e.g. 'Height [Fwd]' and 'Height [Bwd]')."
+        )
 
 
 def _op_two_way(data, params, dx, dy, context=None):
@@ -161,14 +175,34 @@ def _op_two_way(data, params, dx, dy, context=None):
     This operation ignores the incoming `data` - it always starts from the raw
     forward/backward channel pair supplied in `context` - so it belongs at the
     very start of a pipeline."""
-    if not context or context.get("bwd") is None:
-        raise ValueError(
-            "Two-way merge needs a forward AND a backward channel "
-            "(e.g. 'Height [Fwd]' and 'Height [Bwd]')."
-        )
+    _require_pair(context)
     result = gtw.process_two_way(context["fwd"], context["bwd"],
-                                 **twoway_kwargs(params))
+                                 **twoway_kwargs(params, detect=False))
     return result.merged
+
+
+def _op_parachute(data, params, dx, dy, context=None):
+    """Parachuting-artifact removal: align the forward/backward pair, flag the
+    airborne-tip pixels in each scan, replace them from the opposite scan and
+    combine the rest. Starts from the raw channel pair, like _op_two_way."""
+    _require_pair(context)
+    result = gtw.process_two_way(context["fwd"], context["bwd"],
+                                 **twoway_kwargs(params, detect=True))
+    return result.merged
+
+
+def _describe_combine(params):
+    combine = params["combine"]
+    if combine == "average":
+        w = float(params["weight"])
+        return f"average {w:.2f} fwd / {1 - w:.2f} bwd"
+    if combine == "softmin":
+        return f"softmin beta={params['beta']}"
+    if combine == "slope":
+        return f"slope-select gain={params.get('slope_gain', 2.0)}"
+    if combine == "consensus":
+        return f"consensus size={params.get('consensus_size', 5)}"
+    return combine
 
 
 def _describe_two_way(params):
@@ -176,19 +210,24 @@ def _describe_two_way(params):
     if params["mapping"] == "xcorr":
         parts.append(f"order={params['poly_order']}")
     parts.append(f"warp={params['warp']}")
-    if params["combine"] == "average":
-        w = float(params["weight"])
-        parts.append(f"average {w:.2f} fwd / {1 - w:.2f} bwd")
-    elif params["combine"] == "softmin":
-        parts.append(f"softmin beta={params['beta']}")
-    else:
-        parts.append(params["combine"])
-    if params.get("detect"):
-        slope = ("auto" if params.get("slope_mode") == "auto"
-                 else f"{params['slope']}")
-        parts.append(f"parachute slope={slope}, offset={params['offset']}")
-    else:
-        parts.append("no parachuting detection")
+    parts.append(_describe_combine(params))
+    if params.get("crop", True):
+        parts.append("cropped")
+    return ", ".join(parts)
+
+
+def _describe_parachute(params):
+    slope = ("auto x" + str(params.get("slope_scale", 1.0))
+             if params.get("slope_mode") == "auto" else str(params["slope"]))
+    parts = [
+        f"map={params['mapping']}",
+        f"slope={slope}",
+        f"offset={params['offset']}",
+        f"max delta={params['max_delta']}",
+        _describe_combine(params),
+    ]
+    if params.get("crop", True):
+        parts.append("cropped")
     return ", ".join(parts)
 
 
@@ -367,14 +406,15 @@ OPERATIONS = {
         "removed_label": "Subtracted offset",
         "instant": True,  # applied directly, no preview dialog
     },
-    # Two-way (forward/backward) merge. Not in OPERATION_ORDER: it needs a
-    # channel *pair* rather than the single current image, so it gets its own
-    # button and dialog, and `needs_pair` tells apply_pipeline to hand it the
-    # forward/backward context.
+    # Two-way (forward/backward) operations. Not in OPERATION_ORDER: they need
+    # a channel *pair* rather than the single current image, so they get their
+    # own buttons and dialogs, and `needs_pair` tells apply_pipeline to hand
+    # them the forward/backward context.
     "two_way": {
         "label": "Two-way merge (Fwd/Bwd)",
         "func": _op_two_way,
         "needs_pair": True,
+        "channel_suffix": "[Merged]",
         "params": [
             # -- hysteresis / lag alignment
             {"name": "mapping", "label": "Shift model", "type": "choice",
@@ -393,9 +433,40 @@ OPERATIONS = {
              "values": ["bwd_to_fwd", "split", "linearize_both"]},
             {"name": "flip_backward", "label": "Flip backward", "type": "choice",
              "default": "auto", "values": ["auto", "yes", "no"]},
+            {"name": "crop", "label": "Crop to imaged area", "type": "bool",
+             "default": True},
+            # -- merge
+            {"name": "combine", "label": "Combine", "type": "choice",
+             "default": "average",
+             "values": ["average", "slope", "consensus", "softmin",
+                        "min", "max", "forward", "backward"]},
+            {"name": "weight", "label": "Forward weight (0-1)", "type": "float",
+             "default": 0.5, "min": 0.0, "max": 1.0},
+            {"name": "slope_gain", "label": "Slope gain", "type": "float",
+             "default": 2.0, "min": 0.0, "max": 100.0},
+            {"name": "consensus_size", "label": "Consensus box (px)", "type": "int",
+             "default": 5, "min": 1, "max": 100},
+            {"name": "beta", "label": "Soft-min beta (1/z)", "type": "float",
+             "default": 0.0, "min": 0.0, "max": 1e6},
+        ],
+        "removed_label": "Difference (forward - merged)",
+        "describe": _describe_two_way,
+    },
+    "parachute": {
+        "label": "Parachuting removal (Fwd/Bwd)",
+        "func": _op_parachute,
+        "needs_pair": True,
+        "channel_suffix": "[Deparachuted]",
+        "params": [
+            # -- alignment (kept minimal; tune it in the two-way merge dialog)
+            {"name": "mapping", "label": "Shift model", "type": "choice",
+             "default": "xcorr",
+             "values": ["xcorr", "model_scaled", "model", "measured", "none"]},
+            {"name": "poly_order", "label": "Poly order", "type": "int",
+             "default": 2, "min": 0, "max": 6},
+            {"name": "crop", "label": "Crop to imaged area", "type": "bool",
+             "default": True},
             # -- parachuting detection
-            {"name": "detect", "label": "Detect parachuting", "type": "bool",
-             "default": False},
             {"name": "slope_mode", "label": "Fall rate", "type": "choice",
              "default": "manual", "values": ["manual", "auto"]},
             {"name": "slope", "label": "Slope (z/px)", "type": "float",
@@ -406,11 +477,11 @@ OPERATIONS = {
              "default": 0.0, "min": 0.0, "max": 1e9},
             {"name": "max_delta", "label": "Max lag delta (px)", "type": "int",
              "default": 20, "min": 1, "max": 200},
-            # -- merge
+            # -- merge of the unflagged pixels
             {"name": "combine", "label": "Combine", "type": "choice",
              "default": "average",
-             "values": ["average", "softmin", "min", "max",
-                        "forward", "backward"]},
+             "values": ["average", "slope", "consensus", "softmin",
+                        "min", "max", "forward", "backward"]},
             {"name": "weight", "label": "Forward weight (0-1)", "type": "float",
              "default": 0.5, "min": 0.0, "max": 1.0},
             {"name": "beta", "label": "Soft-min beta (1/z)", "type": "float",
@@ -418,8 +489,8 @@ OPERATIONS = {
             {"name": "both_flagged", "label": "Both flagged", "type": "choice",
              "default": "paper", "values": ["paper", "min", "softmin"]},
         ],
-        "removed_label": "Difference (forward - merged)",
-        "describe": _describe_two_way,
+        "removed_label": "Difference (forward - result)",
+        "describe": _describe_parachute,
     },
 }
 
@@ -1320,8 +1391,13 @@ DIALOG_CLASSES = {
 # ---------------------------------------------------------------------------
 
 class TwoWayDialog(tk.Toplevel):
-    """Forward/backward scan merge: hysteresis-and-lag alignment, parachuting
-    detection and soft-min merging, with every hyper-parameter exposed.
+    """Forward/backward scan merging: hysteresis-and-lag alignment and the
+    per-pixel combination of the two scans, with every hyper-parameter
+    exposed. Shows the two raw scans, their opacity/anaglyph overlay, the
+    hysteresis (shift) curves in both directions, and the final merged image
+    cropped to the doubly-imaged area.
+
+    Parachuting removal lives in its own window (ParachuteDialog).
 
     Unlike the other dialogs this one does not start from the current image -
     it always reads the raw forward and backward channels of the loaded file,
@@ -1329,16 +1405,15 @@ class TwoWayDialog(tk.Toplevel):
     """
 
     PREVIEW_DEBOUNCE_MS = 500
+    DETECT = False           # ParachuteDialog overrides this
 
-    # parameter names grouped into the three panels of the dialog
+    # parameter names grouped into the panels of the dialog
     GROUPS = [
         ("Alignment (hysteresis + lag)",
          ["mapping", "poly_order", "n_blocks", "max_lag", "highpass",
-          "warp", "flip_backward"]),
-        ("Parachuting detection",
-         ["detect", "slope_mode", "slope", "slope_scale", "offset", "max_delta"]),
+          "warp", "flip_backward", "crop"]),
         ("Merge",
-         ["combine", "weight", "beta", "both_flagged"]),
+         ["combine", "weight", "slope_gain", "consensus_size", "beta"]),
     ]
 
     def __init__(self, app, op_key="two_way"):
@@ -1353,6 +1428,7 @@ class TwoWayDialog(tk.Toplevel):
         self._busy = False
         self.vars = {}
         self.result = None
+        self._last_params = None
 
         self.fwd_title, self.bwd_title = gtw.find_pair(
             app.channels, app.channel_var.get())
@@ -1415,6 +1491,8 @@ class TwoWayDialog(tk.Toplevel):
                 var.trace_add("write", self._on_param_change)
                 self.vars[name] = var
 
+        self._build_display_controls(outer)
+
         info = ttk.Frame(self, padding=(8, 0))
         info.pack(side=tk.TOP, fill=tk.X)
         self.info_var = tk.StringVar(
@@ -1424,6 +1502,36 @@ class TwoWayDialog(tk.Toplevel):
         self.status_var = tk.StringVar(value="")
         ttk.Label(info, textvariable=self.status_var, foreground="red").pack(
             side=tk.RIGHT)
+
+    def _build_display_controls(self, outer):
+        """Display-only settings (they re-render the preview but are not part
+        of the operation parameters and are not recorded in the pipeline)."""
+        frame = ttk.LabelFrame(outer, text="Overlay display", padding=6)
+        frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=4)
+
+        self.overlay_style = tk.StringVar(value="blend")
+        self.overlay_alpha = tk.DoubleVar(value=0.5)
+
+        ttk.Label(frame, text="Style:").grid(row=0, column=0, sticky=tk.W,
+                                             padx=(0, 6), pady=1)
+        ttk.Combobox(frame, textvariable=self.overlay_style,
+                     values=["blend", "anaglyph"], state="readonly",
+                     width=10).grid(row=0, column=1, sticky=tk.W, pady=1)
+        ttk.Label(frame, text="Bwd opacity:").grid(row=1, column=0, sticky=tk.W,
+                                                   padx=(0, 6), pady=1)
+        ttk.Scale(frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL, length=110,
+                  variable=self.overlay_alpha).grid(row=1, column=1,
+                                                    sticky=tk.W, pady=1)
+        for var in (self.overlay_style, self.overlay_alpha):
+            var.trace_add("write", self._on_display_change)
+
+    def _on_display_change(self, *args):
+        """Re-render with the cached result - no recomputation."""
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        self._after_id = self.after(
+            150, lambda: (self._draw(self._last_params)
+                          if self.result is not None else None))
 
     def _build_figure(self):
         self.figure = Figure(figsize=(13, 6.6), dpi=100)
@@ -1481,8 +1589,9 @@ class TwoWayDialog(tk.Toplevel):
         self.status_var.set("computing...")
         self.update_idletasks()
         try:
-            self.result = gtw.process_two_way(self.fwd, self.bwd,
-                                              **twoway_kwargs(params))
+            self.result = gtw.process_two_way(
+                self.fwd, self.bwd,
+                **twoway_kwargs(params, detect=self.DETECT))
             self.status_var.set("")
         except Exception as e:
             self.status_var.set(str(e))
@@ -1490,36 +1599,62 @@ class TwoWayDialog(tk.Toplevel):
             return
         finally:
             self._busy = False
+        self._last_params = params
         self._draw(params)
 
-    def _draw(self, params):
+    # ---- Drawing helpers shared by both two-way dialogs ----
+
+    def _extent_of(self, img):
+        ny, nx = img.shape
+        return (0, nx * self.app.dx, 0, ny * self.app.dy)
+
+    def _image_panel(self, ax, img, title, cm=None, symmetric=False):
         app = self.app
-        res = self.result
-        a = res.alignment
-        extent = (0, app.x_real, 0, app.y_real)
-        cmap = gp.get_gwyddion_cmap()
-        self.figure.clf()
-        axes = self.figure.subplots(2, 3)
+        extent = self._extent_of(img)
+        if symmetric:
+            v = np.percentile(np.abs(img - np.mean(img)), 99.0) or 1.0
+            im = ax.imshow(img - np.mean(img), origin="upper",
+                           cmap=cm or "coolwarm", extent=extent,
+                           aspect="equal", vmin=-v, vmax=v)
+        else:
+            v0, v1 = np.percentile(img, [0.5, 99.5])
+            im = ax.imshow(img, origin="upper",
+                           cmap=cm or gp.get_gwyddion_cmap(), extent=extent,
+                           aspect="equal", vmin=v0, vmax=v1)
+        ax.set_title(title, fontsize=9)
+        self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(app.z_units)
 
-        def image_panel(ax, img, title, cm=cmap, symmetric=False):
-            if symmetric:
-                v = np.percentile(np.abs(img - np.mean(img)), 99.0) or 1.0
-                im = ax.imshow(img - np.mean(img), origin="upper", cmap=cm,
-                               extent=extent, aspect="equal", vmin=-v, vmax=v)
-            else:
-                v0, v1 = np.percentile(img, [0.5, 99.5])
-                im = ax.imshow(img, origin="upper", cmap=cm, extent=extent,
-                               aspect="equal", vmin=v0, vmax=v1)
-            ax.set_title(title, fontsize=9)
-            self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(app.z_units)
+    @staticmethod
+    def _normalized(img):
+        v0, v1 = np.percentile(img, [0.5, 99.5])
+        return np.clip((img - v0) / ((v1 - v0) or 1.0), 0.0, 1.0)
 
-        image_panel(axes[0, 0], res.fwd, f"Forward ({self.fwd_title})")
-        image_panel(axes[0, 1], res.merged, "Merged result")
-        image_panel(axes[0, 2], res.fwd - res.merged,
-                    self.spec["removed_label"], cm="coolwarm", symmetric=True)
+    def _overlay_panel(self, ax, fwd, bwd):
+        """Forward and backward on top of each other: either an opacity blend
+        (backward drawn over forward with adjustable alpha) or a red/cyan
+        anaglyph where any residual misalignment shows as color fringes."""
+        nf, nb = self._normalized(fwd), self._normalized(bwd)
+        style = self.overlay_style.get()
+        alpha = float(self.overlay_alpha.get())
+        if style == "anaglyph":
+            comp = np.dstack([nf, nb, nb])
+            title = "Overlay - anaglyph (fwd red / bwd cyan)"
+        else:
+            base = gp.get_gwyddion_cmap()(nf)
+            over = matplotlib.colormaps["gray"](nb)
+            comp = (1.0 - alpha) * base + alpha * over
+            title = f"Overlay - bwd at {alpha:.0%} opacity over fwd"
+        ax.imshow(np.clip(comp, 0, 1), origin="upper",
+                  extent=self._extent_of(fwd), aspect="equal")
+        ax.set_title(title, fontsize=9)
 
-        # -- shift profile
-        ax = axes[1, 0]
+    def _curves_panel(self, ax):
+        """The hysteresis / lag curves in both directions: the fitted
+        forward->backward column shift, its inverse (backward->forward), and
+        the raw measured matches. Vertical lines mark the crop boundary."""
+        a = self.result.alignment
+        n = len(a.shift_px)
+        grid = np.arange(n)
         if a.measured_centers is not None:
             good = a.measured_quality > 0
             ax.plot(a.measured_centers[good], a.measured_shift_px[good], "o",
@@ -1527,66 +1662,62 @@ class TwoWayDialog(tk.Toplevel):
             if (~good).any():
                 ax.plot(a.measured_centers[~good], a.measured_shift_px[~good],
                         "x", ms=4, color="lightgray", label="low contrast")
-        ax.plot(np.arange(len(a.shift_px)), a.shift_px, "-", lw=2,
-                color="tab:red", label=a.mapping)
+        ax.plot(grid, a.shift_px, "-", lw=2, color="tab:red",
+                label=f"fwd->bwd ({a.mapping})")
+        # inverse mapping: for each backward column, the matching forward one
+        order = np.argsort(a.columns_bwd)
+        inv = np.interp(grid, a.columns_bwd[order], a.columns_fwd[order]) - grid
+        ax.plot(grid, inv, "--", lw=1.6, color="tab:green", label="bwd->fwd")
+        if a.crop_cols is not None and a.crop_cols != (0, n):
+            for c in a.crop_cols:
+                ax.axvline(c, color="gray", lw=1.0, ls=":")
+            ax.axvspan(0, a.crop_cols[0], color="gray", alpha=0.15)
+            ax.axvspan(a.crop_cols[1], n, color="gray", alpha=0.15)
         ax.axhline(0, color="gray", lw=0.8, ls="--")
-        ax.set_title("Forward -> backward column shift", fontsize=9)
-        ax.set_xlabel("column")
+        ax.set_title("Hysteresis / lag curves (shaded = cropped)", fontsize=9)
+        ax.set_xlabel("column (px)")
         ax.set_ylabel("shift (px)")
+        ax.set_xlim(0, n)
         ax.legend(fontsize=7)
 
-        # -- H(delta, dz) histogram with the decision line
-        ax = axes[1, 1]
-        try:
-            hist, deltas, edges = gtw.difference_histogram(
-                res.fwd, +1, max_delta=int(params["max_delta"]),
-                detrend=True)
-            im = ax.imshow(np.log10(hist.T + 1.0), origin="lower", aspect="auto",
-                           extent=(0.5, deltas[-1] + 0.5, edges[0], edges[-1]),
-                           cmap="viridis")
-            self.figure.colorbar(im, ax=ax, fraction=0.046).set_label("log10 count")
-            if params["detect"] and np.isfinite(res.slope_fwd):
-                d = np.array([0.0, float(deltas[-1])])
-                ax.plot(d, -(res.slope_fwd * d + float(params["offset"])),
-                        color="tab:orange", lw=1.8, label="decision line")
-                ax.legend(fontsize=7)
-            ax.set_title(f"H($\\Delta$, $\\Delta z$) forward"
-                         + (f"  slope={res.slope_fwd:.3g}" if params["detect"] else ""),
-                         fontsize=9)
-            ax.set_xlabel("$\\Delta$ (pixel)")
-            ax.set_ylabel(f"$\\Delta z$ ({app.z_units})")
-        except Exception as e:
-            ax.text(0.5, 0.5, f"histogram failed:\n{e}", ha="center", va="center",
-                    transform=ax.transAxes, fontsize=8)
+    def _merged_title(self):
+        res = self.result
+        ny, nx = res.merged.shape
+        cropped = self.fwd.shape[1] - nx
+        title = f"Merged result  {nx}x{ny} px"
+        if cropped > 0:
+            title += f"  (cropped {cropped} px)"
+        return title
 
-        # -- flagged mask
-        ax = axes[1, 2]
-        if params["detect"]:
-            overlay = res.mask_fwd.astype(float) + 2.0 * res.mask_bwd
-            im = ax.imshow(overlay, origin="upper", cmap="viridis", extent=extent,
-                           aspect="equal", vmin=0, vmax=3)
-            self.figure.colorbar(im, ax=ax, fraction=0.046,
-                                 ticks=[0, 1, 2, 3]).set_label(
-                "0 none / 1 fwd / 2 bwd / 3 both")
-            ax.set_title(f"Parachuting: fwd {100*res.fraction_fwd:.1f}%, "
-                         f"bwd {100*res.fraction_bwd:.1f}%", fontsize=9)
-        else:
-            ax.text(0.5, 0.5, "parachuting detection off\n(pure aligned merge)",
-                    ha="center", va="center", transform=ax.transAxes, fontsize=10,
-                    color="gray")
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        self.figure.tight_layout()
-        self.canvas.draw()
-
+    def _set_info(self):
+        a = self.result.alignment
         self.info_var.set(
             f"{self.fwd_title} + {self.bwd_title}   |   "
             f"lag {a.lag_px:+.2f} px, bow {a.bow_px:.2f} px, "
             f"flip={a.flipped_backward}   |   "
-            f"fwd/bwd rms {a.rms_before:.3g} -> {a.rms_after:.3g} {app.z_units}, "
+            f"fwd/bwd rms {a.rms_before:.3g} -> {a.rms_after:.3g} "
+            f"{self.app.z_units}, "
             f"corr {a.corr_before:.4f} -> {a.corr_after:.4f}"
         )
+
+    def _draw(self, params):
+        res = self.result
+        self.figure.clf()
+        axes = self.figure.subplots(2, 3)
+
+        self._image_panel(axes[0, 0], res.fwd, f"Forward ({self.fwd_title})")
+        self._image_panel(axes[0, 1], res.bwd,
+                          f"Backward ({self.bwd_title}), aligned")
+        self._overlay_panel(axes[0, 2], res.fwd, res.bwd)
+
+        self._curves_panel(axes[1, 0])
+        self._image_panel(axes[1, 1], res.merged, self._merged_title())
+        self._image_panel(axes[1, 2], res.fwd - res.merged,
+                          self.spec["removed_label"], symmetric=True)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+        self._set_info()
 
     # ---- Apply ----
 
@@ -1596,8 +1727,8 @@ class TwoWayDialog(tk.Toplevel):
         if params is None:
             return
         if self.app.pipeline and not messagebox.askyesno(
-            "Two-way merge",
-            "The two-way merge restarts from the raw forward/backward channels, "
+            self.spec["label"],
+            "This operation restarts from the raw forward/backward channels, "
             "so the steps already applied to this image will be discarded.\n\n"
             "Apply anyway?",
             parent=self,
@@ -1617,8 +1748,9 @@ class TwoWayDialog(tk.Toplevel):
             if self.result is None:
                 return
         base = re.sub(r"\s*\[[^\]]*\]$", "", self.fwd_title).strip() or "Height"
+        suffix = self.spec.get("channel_suffix", "[Merged]")
         title = self.app.add_channel(
-            f"{base} [Merged]", self.result.merged,
+            f"{base} {suffix}", self.result.merged,
             template=self.app.channels[self.fwd_title],
             pipeline_step=(self.op_key, params),
         )
@@ -1626,7 +1758,94 @@ class TwoWayDialog(tk.Toplevel):
         self.destroy()
 
 
+class ParachuteDialog(TwoWayDialog):
+    """Parachuting-artifact removal in its own window.
+
+    Aligns the forward/backward pair (using the same machinery as the two-way
+    merge dialog, with the alignment kept at its defaults unless changed
+    here), then shows the H(delta, dz) height-difference histograms of BOTH
+    scan directions with the decision line drawn on top, the flagged pixels,
+    and the repaired result. Flagged pixels are replaced from the opposite
+    scan; everything else is combined according to the Merge settings.
+    """
+
+    DETECT = True
+
+    GROUPS = [
+        ("Alignment",
+         ["mapping", "poly_order", "crop"]),
+        ("Parachuting detection",
+         ["slope_mode", "slope", "slope_scale", "offset", "max_delta"]),
+        ("Merge of unflagged pixels",
+         ["combine", "weight", "beta", "both_flagged"]),
+    ]
+
+    def __init__(self, app, op_key="parachute"):
+        super().__init__(app, op_key)
+
+    def _build_display_controls(self, outer):
+        pass  # no overlay panel in this dialog
+
+    def _histogram_panel(self, ax, img, direction, slope, offset, max_delta,
+                         tag):
+        try:
+            hist, deltas, edges = gtw.difference_histogram(
+                img, direction, max_delta=max_delta, detrend=True)
+        except Exception as e:
+            ax.text(0.5, 0.5, f"histogram failed:\n{e}", ha="center",
+                    va="center", transform=ax.transAxes, fontsize=8)
+            return
+        im = ax.imshow(np.log10(hist.T + 1.0), origin="lower", aspect="auto",
+                       extent=(0.5, deltas[-1] + 0.5, edges[0], edges[-1]),
+                       cmap="viridis")
+        self.figure.colorbar(im, ax=ax, fraction=0.046).set_label("log10 count")
+        if np.isfinite(slope):
+            d = np.array([0.0, float(deltas[-1])])
+            ax.plot(d, -(slope * d + offset), color="tab:orange", lw=1.8,
+                    label=f"decision line (slope {slope:.3g})")
+            ax.legend(fontsize=7)
+        ax.set_title(f"H($\\Delta$, $\\Delta z$) {tag}", fontsize=9)
+        ax.set_xlabel("$\\Delta$ (pixel)")
+        ax.set_ylabel(f"$\\Delta z$ ({self.app.z_units})")
+
+    def _draw(self, params):
+        res = self.result
+        a = res.alignment
+        offset = float(params["offset"])
+        max_delta = int(params["max_delta"])
+        dir_bwd = +1 if a.flipped_backward else -1
+
+        self.figure.clf()
+        axes = self.figure.subplots(2, 3)
+
+        self._histogram_panel(axes[0, 0], res.fwd, +1, res.slope_fwd,
+                              offset, max_delta, "forward")
+        self._histogram_panel(axes[0, 1], res.bwd, dir_bwd, res.slope_bwd,
+                              offset, max_delta, "backward")
+
+        ax = axes[0, 2]
+        overlay = res.mask_fwd.astype(float) + 2.0 * res.mask_bwd
+        im = ax.imshow(overlay, origin="upper", cmap="viridis",
+                       extent=self._extent_of(res.merged), aspect="equal",
+                       vmin=0, vmax=3)
+        self.figure.colorbar(im, ax=ax, fraction=0.046,
+                             ticks=[0, 1, 2, 3]).set_label(
+            "0 none / 1 fwd / 2 bwd / 3 both")
+        ax.set_title(f"Flagged: fwd {100*res.fraction_fwd:.1f}%, "
+                     f"bwd {100*res.fraction_bwd:.1f}%", fontsize=9)
+
+        self._image_panel(axes[1, 0], res.fwd, f"Forward ({self.fwd_title})")
+        self._image_panel(axes[1, 1], res.merged, self._merged_title())
+        self._image_panel(axes[1, 2], res.fwd - res.merged,
+                          self.spec["removed_label"], symmetric=True)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+        self._set_info()
+
+
 DIALOG_CLASSES["two_way"] = TwoWayDialog
+DIALOG_CLASSES["parachute"] = ParachuteDialog
 
 
 class GwyProcessorGUI(tk.Tk):
@@ -1692,11 +1911,12 @@ class GwyProcessorGUI(tk.Tk):
                 command=lambda k=key: self.open_operation(k),
             ).pack(fill=tk.X, pady=1)
 
-        ttk.Button(
-            proc,
-            text=OPERATIONS["two_way"]["label"] + "...",
-            command=lambda: self.open_operation("two_way"),
-        ).pack(fill=tk.X, pady=(6, 1))
+        for i, key in enumerate(("two_way", "parachute")):
+            ttk.Button(
+                proc,
+                text=OPERATIONS[key]["label"] + "...",
+                command=lambda k=key: self.open_operation(k),
+            ).pack(fill=tk.X, pady=(6 if i == 0 else 1, 1))
 
         ttk.Button(proc, text="View FFT spectrum", command=self.show_fft).pack(
             fill=tk.X, pady=(6, 1)
