@@ -2,6 +2,7 @@ import gwy_loader
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy import ndimage
 
 
 # --- Core Processing Functions ---
@@ -521,6 +522,64 @@ def build_band_mask(shape, dx=1.0, dy=1.0, x_bands=(), y_bands=(), half_width=0.
     return mask
 
 
+def build_rect_mask(shape, dx=1.0, dy=1.0, rects=()):
+    """
+    Builds a boolean frequency-domain mask with axis-aligned rectangular
+    patches removed.
+
+    This targets noise that fills an extended rectangular region of the
+    spectrum (e.g. a horizontal or vertical streak of excess power that
+    is wider than a line but does not span the whole axis).
+
+    Each rectangle is removed at BOTH (fx, fy) and (-fx, -fy), so the
+    mask stays symmetric and the filtered image stays real.
+
+    Args:
+        shape (tuple): (ny, nx) shape of the image.
+        dx (float): Pixel size in x.
+        dy (float): Pixel size in y.
+        rects (iterable): Sequence of (fx, fy, wx, wy) rectangles - the
+                          center frequency and the FULL widths along fx
+                          and fy, in frequency units.
+
+    Returns:
+        np.ndarray: Boolean mask (True = keep frequency), on the
+                    fftshift-ed grid, matching `filter_by_2d_fft_mask`.
+    """
+    FX, FY = _fft_freq_grids(shape, dx, dy)
+
+    mask = np.ones(shape, dtype=bool)
+    for rfx, rfy, wx, wy in rects:
+        for sx, sy in ((rfx, rfy), (-rfx, -rfy)):
+            mask &= ~((np.abs(FX - sx) <= wx / 2.0) &
+                      (np.abs(FY - sy) <= wy / 2.0))
+    return mask
+
+
+def smooth_fft_mask(mask, dx=1.0, dy=1.0, width=0.0):
+    """
+    Softens the edges of a binary frequency-domain mask with a Gaussian,
+    so the filters roll off smoothly instead of cutting hard (a hard
+    edge in the frequency domain rings in the image domain).
+
+    Args:
+        mask (np.ndarray): Boolean mask on the fftshift-ed grid.
+        dx (float): Pixel size in x.
+        dy (float): Pixel size in y.
+        width (float): Gaussian sigma of the roll-off, in frequency
+                       units. 0 returns the hard mask unchanged.
+
+    Returns:
+        np.ndarray: Float mask in [0, 1] (or the input mask if width<=0).
+    """
+    if width <= 0:
+        return mask
+    ny, nx = mask.shape
+    # sigma in frequency BINS per axis: one bin is 1/(n*d) wide
+    sigma = (width * ny * dy, width * nx * dx)
+    return ndimage.gaussian_filter(mask.astype(float), sigma, mode="nearest")
+
+
 def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
                      threshold_db=20.0, max_peaks=50, min_separation=None):
     """
@@ -594,6 +653,92 @@ def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
         if len(peaks) >= max_peaks:
             break
     return peaks
+
+
+def detect_fft_regions(data, dx=1.0, dy=1.0, protect_radius=0.0,
+                       threshold_db=20.0, max_regions=50, pad=1):
+    """
+    Detects connected regions of excess power in the 2D FFT magnitude
+    spectrum and returns their bounding rectangles.
+
+    This complements `detect_fft_peaks`: a single-frequency interference
+    is one sharp bin, but periodic noise often fills an extended patch or
+    streak of the spectrum. A bin belongs to a region when its magnitude
+    exceeds the spectrum median by `threshold_db` and it lies outside the
+    protected center; 8-connected bins are grouped into one region, and
+    each region is reported as its frequency bounding box grown by `pad`
+    bins on every side.
+
+    Compact regions (a few bins) are sharp peaks; extended ones are the
+    rectangles/streaks. The caller decides how to treat each size.
+
+    Regions whose padded bounding box would cover the origin are dropped:
+    they are dominated by the central cross / low-frequency image content
+    (use straight bands for the cross), and notching them would take the
+    actual topography with them.
+
+    Args:
+        data (np.ndarray): 2D image data.
+        dx, dy (float): Pixel sizes.
+        protect_radius (float): Frequencies within this radius of the
+                                origin are never part of a region.
+        threshold_db (float): Region height above the spectrum median.
+        max_regions (int): Maximum number of regions to return.
+        pad (int): Bins added around each bounding box.
+
+    Returns:
+        list of (fx, fy, wx, wy): Center frequency and FULL widths of
+        each region, strongest first. Only one of each conjugate +/-
+        pair is returned.
+    """
+    ny, nx = data.shape
+    fshift = np.fft.fftshift(np.fft.fft2(data)) / (nx * ny)
+    mag_db = 20 * np.log10(np.abs(fshift) + 1e-12)
+
+    FX, FY = _fft_freq_grids((ny, nx), dx, dy)
+    F_dist = np.sqrt(FX**2 + FY**2)
+    dfx = 1.0 / (nx * dx)
+    dfy = 1.0 / (ny * dy)
+
+    background = np.median(mag_db)
+    candidates = (mag_db > background + threshold_db) & (F_dist > protect_radius)
+    labels, n_labels = ndimage.label(candidates, structure=np.ones((3, 3)))
+    if n_labels == 0:
+        return []
+
+    slices = ndimage.find_objects(labels)
+    strengths = ndimage.maximum(mag_db, labels, index=np.arange(1, n_labels + 1))
+
+    boxes = []
+    for sl, strength in zip(slices, strengths):
+        ys, xs = sl
+        fx0 = FX[0, xs.start] - pad * dfx
+        fx1 = FX[0, xs.stop - 1] + pad * dfx
+        fy0 = min(FY[ys.start, 0], FY[ys.stop - 1, 0]) - pad * dfy
+        fy1 = max(FY[ys.start, 0], FY[ys.stop - 1, 0]) + pad * dfy
+        boxes.append((strength,
+                      (fx0 + fx1) / 2.0, (fy0 + fy1) / 2.0,
+                      fx1 - fx0, fy1 - fy0))
+    boxes.sort(key=lambda b: -b[0])
+
+    regions = []
+    tol = max(dfx, dfy)
+    for _, cx, cy, wx, wy in boxes:
+        if abs(cx) <= wx / 2.0 and abs(cy) <= wy / 2.0:
+            continue            # box covers the origin - not removable noise
+        # skip the conjugate twin of an already accepted region: its
+        # mirror image overlaps that region's rectangle
+        dup = any(
+            abs(cx + ax) <= (wx + aw) / 2.0 + tol
+            and abs(cy + ay) <= (wy + ah) / 2.0 + tol
+            for ax, ay, aw, ah in regions
+        )
+        if dup:
+            continue
+        regions.append((cx, cy, wx, wy))
+        if len(regions) >= max_regions:
+            break
+    return regions
 
 
 # --- Utility and Loading Functions ---

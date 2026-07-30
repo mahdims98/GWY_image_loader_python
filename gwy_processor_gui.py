@@ -11,8 +11,9 @@ Provides an interactive Tkinter application to:
       * Align rows: median of differences / polynomial (align_rows)
       * Percentile range clipping (filter_by_percentile)
       * FFT filtering (filter_by_2d_fft_mask): lowpass/highpass, circular
-        notches and straight bands combined in one dialog, with the
-        spectrum shown and click-to-place cutoff/notches
+        notches, rectangles and straight bands combined in one dialog,
+        with a large interactive spectrum (click to place cutoff/notches,
+        drag to notch a rectangle) and optional smooth mask edges
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
       * Two-way merge of the forward and backward scans (gwy_twoway):
@@ -85,22 +86,40 @@ def _op_percentile(data, params, dx, dy):
     )
 
 
+def _fft_auto_items(data, params, dx, dy):
+    """Auto-detect spectral noise on `data`: connected regions of excess
+    power become circular notches when compact (a few bins) and
+    rectangles when extended. Returns (notches, rects)."""
+    regions = gp.detect_fft_regions(
+        data, dx=dx, dy=dy,
+        protect_radius=params.get("protect_radius", 3.0),
+        threshold_db=params.get("threshold_db", 15.0),
+        max_regions=50,
+    )
+    ny, nx = data.shape
+    compact = 4.0 * max(1.0 / (nx * dx), 1.0 / (ny * dy))
+    notches, rects = [], []
+    for fx, fy, wx, wy in regions:
+        if wx <= compact and wy <= compact:
+            notches.append([fx, fy])
+        else:
+            rects.append([fx, fy, wx, wy])
+    return notches, rects
+
+
 def _op_fft(data, params, dx, dy):
     """Unified FFT filter: one frequency mask combining an optional radial
-    lowpass/highpass with circular notches and straight bands."""
+    lowpass/highpass with circular notches, rectangles and straight
+    bands, optionally with smoothed (soft) edges."""
     radius = params.get("radius", 0.5)
     notches = [list(n) for n in params.get("notches", [])]
+    rects = [list(r) for r in params.get("rects", [])]
     if params.get("auto"):
-        # Re-detect peaks on THIS image (batch-friendly: every image gets
-        # its own detection instead of replaying fixed frequencies)
-        detected = gp.detect_fft_peaks(
-            data, dx=dx, dy=dy,
-            protect_radius=params.get("protect_radius", 3.0),
-            threshold_db=params.get("threshold_db", 15.0),
-            max_peaks=50,
-            min_separation=radius,
-        )
-        notches += [list(p) for p in detected]
+        # Re-detect on THIS image (batch-friendly: every image gets its
+        # own detection instead of replaying fixed frequencies)
+        a_notches, a_rects = _fft_auto_items(data, params, dx, dy)
+        notches += a_notches
+        rects += a_rects
 
     mask = np.ones(data.shape, dtype=bool)
     mode = params.get("mode", "none")
@@ -112,6 +131,8 @@ def _op_fft(data, params, dx, dy):
         mask &= gp.build_notch_mask(
             data.shape, dx=dx, dy=dy, notches=notches, radius=radius
         )
+    if rects:
+        mask &= gp.build_rect_mask(data.shape, dx=dx, dy=dy, rects=rects)
     x_bands = params.get("x_bands", [])
     y_bands = params.get("y_bands", [])
     if x_bands or y_bands:
@@ -120,6 +141,12 @@ def _op_fft(data, params, dx, dy):
             x_bands=x_bands, y_bands=y_bands,
             half_width=radius,
         )
+    mask = gp.smooth_fft_mask(mask, dx=dx, dy=dy,
+                              width=params.get("smooth", 0.0))
+    # the DC bin always survives, whatever was drawn over it: no filter
+    # here may shift the mean height of the image
+    ny, nx = data.shape
+    mask[ny // 2, nx // 2] = True
     return gp.filter_by_2d_fft_mask(data, mask)
 
 
@@ -376,6 +403,8 @@ def _validate_fft(params):
         return "Notch radius must be positive"
     if params["protect_radius"] < 0:
         return "Protect radius cannot be negative"
+    if params.get("smooth", 0.0) < 0:
+        return "Edge smoothing cannot be negative"
     return None
 
 
@@ -387,6 +416,8 @@ def _describe_fft(params):
     n_notch = len(params.get("notches", []))
     if n_notch:
         parts.append(f"{n_notch} notches")
+    if params.get("rects"):
+        parts.append(f"{len(params['rects'])} rects")
     if params.get("auto"):
         parts.append(f"auto-detect@{params.get('threshold_db')}dB")
     if params.get("x_bands"):
@@ -395,6 +426,8 @@ def _describe_fft(params):
         parts.append(f"{len(params['y_bands'])} h-bands")
     if n_notch or params.get("auto") or params.get("x_bands") or params.get("y_bands"):
         parts.append(f"radius={params['radius']}")
+    if params.get("smooth", 0.0) > 0:
+        parts.append(f"smooth={params['smooth']}")
     return ", ".join(parts) if parts else "no-op"
 
 
@@ -469,6 +502,8 @@ OPERATIONS = {
              "default": 15.0, "min": 0.0, "max": 200.0},
             {"name": "protect_radius", "label": "Protect center radius", "type": "float",
              "default": 3.0, "min": 0.0, "max": 1e9},
+            {"name": "smooth", "label": "Edge smoothing (freq)", "type": "float",
+             "default": 0.0, "min": 0.0, "max": 1e9},
             {"name": "auto", "label": "Auto re-detect (per image)", "type": "bool",
              "default": False},
         ],
@@ -1034,34 +1069,41 @@ class FFTFilterDialog(OperationDialog):
     notch filtering of specific periodic signals, all applied as ONE
     frequency-domain mask in a single inverse transform.
 
-    Three panels: the FFT magnitude spectrum (interactive), the filtered
-    result, and the removed component. What a left-click on the spectrum
-    does is chosen with the "Click sets" selector:
+    The FFT magnitude spectrum fills the left half of the window
+    (interactive); the filtered result and the removed component stack on
+    the right. What a left-click on the spectrum does is chosen with the
+    "Click sets" selector:
 
       * cutoff - set the pass-filter cutoff to the clicked radius
       * circle notch - notch a circular patch at the clicked frequency
       * vertical / horizontal band - notch a straight stripe
         (single-frequency interference along one scan axis)
 
-    Right-click removes the nearest notch/band. Every notch is applied
-    symmetrically at +/-f, so clicking one peak of a conjugate pair is
-    enough.
+    DRAGGING on the spectrum notches the dragged rectangle - for noise
+    that fills an extended patch of the spectrum rather than a point or
+    a full line. Right-click removes the nearest notch/rectangle/band.
+    Everything is applied symmetrically at +/-f, so marking one member
+    of a conjugate pair is enough.
 
-    'Auto-detect peaks' finds all sharp spectral peaks outside the
-    protected center region and notches them in one go - this removes
-    most periodic signals that are not part of the low-frequency image
-    content.
+    'Auto-detect' finds all regions of excess spectral power outside the
+    protected center: compact ones become circular notches, extended
+    ones rectangles. 'Edge smoothing' softens the whole mask with a
+    Gaussian roll-off so the filters do not ring.
     """
 
     def __init__(self, app, op_key="fft_filter"):
         self.notches = []       # list of [fx, fy] circular notches
+        self.rects = []         # list of [fx, fy, wx, wy] rectangle notches
         self.x_bands = []       # list of fx centers (vertical band notches)
         self.y_bands = []       # list of fy centers (horizontal band notches)
         self._spectrum = None
         self._spec_ax = None
+        self._spec_selector = None
+        self._press = None      # left-button press position (click vs drag)
         super().__init__(app, op_key)
-        self.geometry("1400x620")
+        self.geometry("1500x850")
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
 
     # ---- extra controls ----
 
@@ -1071,7 +1113,7 @@ class FFTFilterDialog(OperationDialog):
         self._sync_cutoff_state()
         btns = ttk.Frame(self, padding=(8, 0, 8, 4))
         btns.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(btns, text="Auto-detect peaks", command=self.auto_detect).pack(
+        ttk.Button(btns, text="Auto-detect", command=self.auto_detect).pack(
             side=tk.LEFT, padx=2
         )
         ttk.Button(btns, text="Clear notches", command=self.clear_notches).pack(
@@ -1086,7 +1128,8 @@ class FFTFilterDialog(OperationDialog):
         ).pack(side=tk.LEFT)
         ttk.Label(
             btns,
-            text="Left-click spectrum: set/add  |  Right-click: remove nearest",
+            text="Left-click: set/add  |  Drag: notch rectangle  |  "
+                 "Right-click: remove nearest",
         ).pack(side=tk.LEFT, padx=12)
 
     def _sync_cutoff_state(self):
@@ -1101,6 +1144,7 @@ class FFTFilterDialog(OperationDialog):
         params = super().get_params()
         if params is not None:
             params["notches"] = [list(n) for n in self.notches]
+            params["rects"] = [list(r) for r in self.rects]
             params["x_bands"] = list(self.x_bands)
             params["y_bands"] = list(self.y_bands)
         return params
@@ -1111,59 +1155,47 @@ class FFTFilterDialog(OperationDialog):
         params = self._validated_params()
         if params is None:
             return
-        peaks = gp.detect_fft_peaks(
-            self.app.data,
-            dx=self.app.dx,
-            dy=self.app.dy,
-            protect_radius=params["protect_radius"],
-            threshold_db=params["threshold_db"],
-            max_peaks=50,
-            min_separation=params["radius"],
+        self.notches, self.rects = _fft_auto_items(
+            self.app.data, params, self.app.dx, self.app.dy
         )
-        self.notches = [list(p) for p in peaks]
-        self.status_var.set(f"{len(peaks)} peaks detected")
+        self.status_var.set(
+            f"{len(self.notches)} peaks + {len(self.rects)} rectangles detected"
+        )
         self.update_preview()
 
     def clear_notches(self):
         self.notches = []
+        self.rects = []
         self.x_bands = []
         self.y_bands = []
         self.update_preview()
 
+    def _toolbar_busy(self):
+        toolbar = getattr(self.canvas, "toolbar", None)
+        return toolbar is not None and getattr(toolbar, "mode", "")
+
     def _on_click(self, event):
+        """Press handler: remember left presses (to tell clicks from
+        rectangle drags on release) and do right-click removal."""
         if event.inaxes is not self._spec_ax or event.xdata is None:
+            return
+        if self._toolbar_busy():
             return
         x, y = float(event.xdata), float(event.ydata)
         if event.button == 1:
-            mode = self.click_mode_var.get()
-            if mode == "cutoff":
-                try:
-                    pass_on = self.vars["mode"].get() in ("lowpass", "highpass")
-                except tk.TclError:
-                    pass_on = False
-                if not pass_on:
-                    self.status_var.set(
-                        "Pick lowpass/highpass first, then click to set the cutoff"
-                    )
-                    return
-                self.vars["cutoff"].set(round(float(np.hypot(x, y)), 3))
-                # trace on the variable triggers the debounced preview update
-                return
-            if mode == "vertical band":
-                self.x_bands.append(abs(x))
-            elif mode == "horizontal band":
-                self.y_bands.append(abs(y))
-            else:
-                self.notches.append([x, y])
-            self.update_preview()
+            self._press = (event.x, event.y, x, y)
         elif event.button == 3:
-            # find the globally nearest item (circle, v-band or h-band),
-            # considering mirrored counterparts too
+            # find the globally nearest item (circle, rectangle, v-band or
+            # h-band), considering mirrored counterparts too
             best = None  # (distance, list, index)
             for i, (fx, fy) in enumerate(self.notches):
                 d = min(np.hypot(x - fx, y - fy), np.hypot(x + fx, y + fy))
                 if best is None or d < best[0]:
                     best = (d, self.notches, i)
+            for i, (fx, fy, _, _) in enumerate(self.rects):
+                d = min(np.hypot(x - fx, y - fy), np.hypot(x + fx, y + fy))
+                if best is None or d < best[0]:
+                    best = (d, self.rects, i)
             for i, c in enumerate(self.x_bands):
                 d = min(abs(x - c), abs(x + c))
                 if best is None or d < best[0]:
@@ -1175,6 +1207,70 @@ class FFTFilterDialog(OperationDialog):
             if best is not None:
                 best[1].pop(best[2])
                 self.update_preview()
+
+    def _on_release(self, event):
+        """A left press+release that barely moved is a click; dispatch the
+        selected click action. Real drags are handled by the rectangle
+        selector instead."""
+        if event.button != 1 or self._press is None:
+            return
+        px, py, x, y = self._press
+        self._press = None
+        if event.x is None or abs(event.x - px) > 3 or abs(event.y - py) > 3:
+            return                                   # drag -> rectangle
+        mode = self.click_mode_var.get()
+        if mode == "cutoff":
+            try:
+                pass_on = self.vars["mode"].get() in ("lowpass", "highpass")
+            except tk.TclError:
+                pass_on = False
+            if not pass_on:
+                self.status_var.set(
+                    "Pick lowpass/highpass first, then click to set the cutoff"
+                )
+                return
+            self.vars["cutoff"].set(round(float(np.hypot(x, y)), 3))
+            # trace on the variable triggers the debounced preview update
+            return
+        if mode == "vertical band":
+            self.x_bands.append(abs(x))
+        elif mode == "horizontal band":
+            self.y_bands.append(abs(y))
+        else:
+            self.notches.append([x, y])
+        self.update_preview()
+
+    def _attach_spec_selector(self, ax):
+        """Drag-to-notch-a-rectangle on the spectrum. Re-created on every
+        draw (the figure was cleared)."""
+        try:
+            self._spec_selector = RectangleSelector(
+                ax, self._on_spec_select, useblit=True, button=[1],
+                props=dict(fill=False, edgecolor="red", linestyle="--"),
+            )
+        except TypeError:
+            # Older matplotlib uses `rectprops`
+            self._spec_selector = RectangleSelector(
+                ax, self._on_spec_select, useblit=True, button=[1],
+                rectprops=dict(fill=False, edgecolor="red", linestyle="--"),
+            )
+
+    def _on_spec_select(self, eclick, erelease):
+        if self._toolbar_busy():
+            return
+        coords = (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata)
+        if any(c is None for c in coords):
+            return
+        x0, x1 = sorted(coords[:2])
+        y0, y1 = sorted(coords[2:])
+        ny, nx = self.app.data.shape
+        dfx = 1.0 / (nx * self.app.dx)
+        dfy = 1.0 / (ny * self.app.dy)
+        if (x1 - x0) < 2 * dfx or (y1 - y0) < 2 * dfy:
+            return              # a click, not a drag (release handles it)
+        self.rects.append([(x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                           x1 - x0, y1 - y0])
+        self.update_preview()
 
     # ---- drawing ----
 
@@ -1193,14 +1289,20 @@ class FFTFilterDialog(OperationDialog):
         extent = (0, app.x_real, 0, app.y_real)
 
         self.figure.clf()
-        ax0, ax1, ax2 = self.figure.subplots(1, 3)
+        # Large interactive spectrum on the left, result and removed
+        # component stacked on the right.
+        gs = self.figure.add_gridspec(2, 2, width_ratios=[1.6, 1.0])
+        ax0 = self.figure.add_subplot(gs[:, 0])
+        ax1 = self.figure.add_subplot(gs[0, 1])
+        ax2 = self.figure.add_subplot(gs[1, 1])
 
         im0 = ax0.imshow(
             mag, origin="upper", cmap="viridis",
             extent=freq_extent, aspect="equal",
         )
-        n_items = len(self.notches) + len(self.x_bands) + len(self.y_bands)
-        ax0.set_title(f"FFT spectrum - {n_items} notches/bands")
+        n_items = (len(self.notches) + len(self.rects)
+                   + len(self.x_bands) + len(self.y_bands))
+        ax0.set_title(f"FFT spectrum - {n_items} notches/rects/bands")
         ax0.set_xlabel(f"fx (1/{app.spatial_units})")
         ax0.set_ylabel(f"fy (1/{app.spatial_units})")
         self.figure.colorbar(im0, ax=ax0, fraction=0.046).set_label("dB")
@@ -1219,6 +1321,12 @@ class FFTFilterDialog(OperationDialog):
         if protect:
             ax0.add_patch(Circle((0, 0), protect, fill=False, color="lime",
                                  linewidth=1.2, linestyle="--"))
+        for fx, fy, wx, wy in self.rects:
+            ax0.add_patch(Rectangle((fx - wx / 2, fy - wy / 2), wx, wy,
+                                    fill=False, color="red", linewidth=1.2))
+            ax0.add_patch(Rectangle((-fx - wx / 2, -fy - wy / 2), wx, wy,
+                                    fill=False, color="red", linewidth=1.0,
+                                    linestyle=":"))
         if radius:
             for fx, fy in self.notches:
                 ax0.add_patch(Circle((fx, fy), radius, fill=False,
@@ -1250,6 +1358,7 @@ class FFTFilterDialog(OperationDialog):
         self.figure.colorbar(im2, ax=ax2, fraction=0.046).set_label(app.z_units)
 
         self.figure.tight_layout()
+        self._attach_spec_selector(ax0)
         self.canvas.draw()
 
 
