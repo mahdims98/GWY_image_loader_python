@@ -14,6 +14,9 @@ Provides an interactive Tkinter application to:
         spectrum shown and click-to-set cutoff
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
+      * Two-way merge of the forward and backward scans (gwy_twoway):
+        scanner lag / hysteresis alignment, parachuting-artifact
+        detection and soft-min merging
   - Keep a log of every change applied to the image
   - Undo changes step by step (or reset to the original data)
   - Batch-process every .gwy file in a folder by replaying the
@@ -45,6 +48,7 @@ from matplotlib.widgets import RectangleSelector, SpanSelector
 
 import gwy_loader
 import gwy_processing as gp
+import gwy_twoway as gtw
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +128,59 @@ def _op_fft_notch(data, params, dx, dy):
             half_width=params["radius"],
         )
     return gp.filter_by_2d_fft_mask(data, mask)
+
+
+def twoway_kwargs(params):
+    """Translate the dialog's flat parameter dict into gwy_twoway keywords."""
+    flip = {"auto": "auto", "yes": True, "no": False}[params.get("flip_backward", "auto")]
+    manual = params.get("slope_mode", "auto") == "manual"
+    return dict(
+        mapping=params["mapping"],
+        warp=params["warp"],
+        poly_order=int(params["poly_order"]),
+        n_blocks=int(params["n_blocks"]),
+        max_lag=int(params["max_lag"]),
+        highpass=float(params["highpass"]),
+        flip_backward=flip,
+        detect=bool(params["detect"]),
+        slope=float(params["slope"]) if manual else None,
+        slope_scale=float(params["slope_scale"]),
+        offset=float(params["offset"]),
+        max_delta=int(params["max_delta"]),
+        beta=float(params["beta"]),
+        both_flagged=params["both_flagged"],
+    )
+
+
+def _op_two_way(data, params, dx, dy, context=None):
+    """Merge the forward and backward scans of the current file.
+
+    This operation ignores the incoming `data` - it always starts from the raw
+    forward/backward channel pair supplied in `context` - so it belongs at the
+    very start of a pipeline."""
+    if not context or context.get("bwd") is None:
+        raise ValueError(
+            "Two-way merge needs a forward AND a backward channel "
+            "(e.g. 'Height [Fwd]' and 'Height [Bwd]')."
+        )
+    result = gtw.process_two_way(context["fwd"], context["bwd"],
+                                 **twoway_kwargs(params))
+    return result.merged
+
+
+def _describe_two_way(params):
+    parts = [f"map={params['mapping']}"]
+    if params["mapping"] == "xcorr":
+        parts.append(f"order={params['poly_order']}")
+    parts.append(f"warp={params['warp']}")
+    parts.append(f"beta={params['beta']}")
+    if params.get("detect"):
+        slope = ("auto" if params.get("slope_mode") == "auto"
+                 else f"{params['slope']}")
+        parts.append(f"parachute slope={slope}, offset={params['offset']}")
+    else:
+        parts.append("no parachuting detection")
+    return ", ".join(parts)
 
 
 def _op_scars(data, params, dx, dy):
@@ -301,6 +358,54 @@ OPERATIONS = {
         "removed_label": "Subtracted offset",
         "instant": True,  # applied directly, no preview dialog
     },
+    # Two-way (forward/backward) merge. Not in OPERATION_ORDER: it needs a
+    # channel *pair* rather than the single current image, so it gets its own
+    # button and dialog, and `needs_pair` tells apply_pipeline to hand it the
+    # forward/backward context.
+    "two_way": {
+        "label": "Two-way merge (Fwd/Bwd)",
+        "func": _op_two_way,
+        "needs_pair": True,
+        "params": [
+            # -- hysteresis / lag alignment
+            {"name": "mapping", "label": "Shift model", "type": "choice",
+             "default": "xcorr",
+             "values": ["xcorr", "model_scaled", "model", "measured", "none"]},
+            {"name": "poly_order", "label": "Poly order", "type": "int",
+             "default": 2, "min": 0, "max": 6},
+            {"name": "n_blocks", "label": "Match blocks", "type": "int",
+             "default": 16, "min": 1, "max": 128},
+            {"name": "max_lag", "label": "Max lag (px)", "type": "int",
+             "default": 20, "min": 1, "max": 200},
+            {"name": "highpass", "label": "Match high-pass (px)", "type": "float",
+             "default": 8.0, "min": 0.0, "max": 1e4},
+            {"name": "warp", "label": "Warp", "type": "choice",
+             "default": "bwd_to_fwd",
+             "values": ["bwd_to_fwd", "split", "linearize_both"]},
+            {"name": "flip_backward", "label": "Flip backward", "type": "choice",
+             "default": "auto", "values": ["auto", "yes", "no"]},
+            # -- parachuting detection
+            {"name": "detect", "label": "Detect parachuting", "type": "bool",
+             "default": False},
+            {"name": "slope_mode", "label": "Fall rate", "type": "choice",
+             "default": "manual", "values": ["manual", "auto"]},
+            {"name": "slope", "label": "Slope (z/px)", "type": "float",
+             "default": 1.0, "min": 0.0, "max": 1e9},
+            {"name": "slope_scale", "label": "Auto scale", "type": "float",
+             "default": 1.0, "min": 0.01, "max": 10.0},
+            {"name": "offset", "label": "Offset (z)", "type": "float",
+             "default": 0.0, "min": 0.0, "max": 1e9},
+            {"name": "max_delta", "label": "Max lag delta (px)", "type": "int",
+             "default": 20, "min": 1, "max": 200},
+            # -- merge
+            {"name": "beta", "label": "Soft-min beta (1/z)", "type": "float",
+             "default": 0.0, "min": 0.0, "max": 1e6},
+            {"name": "both_flagged", "label": "Both flagged", "type": "choice",
+             "default": "paper", "values": ["paper", "min", "softmin"]},
+        ],
+        "removed_label": "Difference (forward - merged)",
+        "describe": _describe_two_way,
+    },
 }
 
 # Order in which operation buttons appear in the main window
@@ -329,11 +434,18 @@ def describe_step(op_key, params):
     return label
 
 
-def apply_pipeline(data, pipeline, dx, dy):
-    """Apply a list of (op_key, params) steps to `data` and return the result."""
+def apply_pipeline(data, pipeline, dx, dy, context=None):
+    """Apply a list of (op_key, params) steps to `data` and return the result.
+
+    `context` carries extra channels for operations that need more than the
+    current image (currently the two-way merge, which needs the forward and
+    backward pair); see the `needs_pair` flag in OPERATIONS."""
     for op_key, params in pipeline:
-        func = OPERATIONS[op_key]["func"]
-        data = func(data, params, dx, dy)
+        spec = OPERATIONS[op_key]
+        if spec.get("needs_pair"):
+            data = spec["func"](data, params, dx, dy, context)
+        else:
+            data = spec["func"](data, params, dx, dy)
     return data
 
 
@@ -1192,6 +1304,282 @@ DIALOG_CLASSES = {
 # Main application
 # ---------------------------------------------------------------------------
 
+class TwoWayDialog(tk.Toplevel):
+    """Forward/backward scan merge: hysteresis-and-lag alignment, parachuting
+    detection and soft-min merging, with every hyper-parameter exposed.
+
+    Unlike the other dialogs this one does not start from the current image -
+    it always reads the raw forward and backward channels of the loaded file,
+    so it belongs at the very start of a processing pipeline.
+    """
+
+    PREVIEW_DEBOUNCE_MS = 500
+
+    # parameter names grouped into the three panels of the dialog
+    GROUPS = [
+        ("Alignment (hysteresis + lag)",
+         ["mapping", "poly_order", "n_blocks", "max_lag", "highpass",
+          "warp", "flip_backward"]),
+        ("Parachuting detection",
+         ["detect", "slope_mode", "slope", "slope_scale", "offset", "max_delta"]),
+        ("Merge",
+         ["beta", "both_flagged"]),
+    ]
+
+    def __init__(self, app, op_key="two_way"):
+        super().__init__(app)
+        self.app = app
+        self.op_key = op_key
+        self.spec = OPERATIONS[op_key]
+        self.title(self.spec["label"])
+        self.geometry("1350x900")
+
+        self._after_id = None
+        self._busy = False
+        self.vars = {}
+        self.result = None
+
+        self.fwd_title, self.bwd_title = gtw.find_pair(
+            app.channels, app.channel_var.get())
+        if self.bwd_title is None:
+            messagebox.showerror(
+                "No backward channel",
+                f"No backward channel matching '{self.fwd_title}' was found in "
+                f"this file.\nAvailable channels:\n  "
+                + "\n  ".join(app.channels),
+                parent=app,
+            )
+            self.destroy()
+            return
+
+        z = app.z_factor
+        self.fwd = app.channels[self.fwd_title].data.astype(np.float64) * z
+        self.bwd = app.channels[self.bwd_title].data.astype(np.float64) * z
+
+        self._build_params()
+        self._build_figure()
+        self._build_buttons()
+        self.update_preview()
+
+    # ---- UI construction ----
+
+    def _build_params(self):
+        outer = ttk.Frame(self, padding=6)
+        outer.pack(side=tk.TOP, fill=tk.X)
+        by_name = {p["name"]: p for p in self.spec["params"]}
+
+        for title, names in self.GROUPS:
+            frame = ttk.LabelFrame(outer, text=title, padding=6)
+            frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+            for row, name in enumerate(names):
+                p = by_name[name]
+                ttk.Label(frame, text=p["label"] + ":").grid(
+                    row=row, column=0, sticky=tk.W, padx=(0, 6), pady=1)
+                if p["type"] == "int":
+                    var = tk.IntVar(value=p["default"])
+                    widget = ttk.Spinbox(frame, from_=p.get("min", 0),
+                                         to=p.get("max", 100), width=8,
+                                         textvariable=var)
+                elif p["type"] == "float":
+                    var = tk.DoubleVar(value=p["default"])
+                    widget = ttk.Entry(frame, textvariable=var, width=10)
+                elif p["type"] == "choice":
+                    var = tk.StringVar(value=p["default"])
+                    widget = ttk.Combobox(frame, textvariable=var,
+                                          values=p["values"], state="readonly",
+                                          width=max(len(v) for v in p["values"]) + 2)
+                elif p["type"] == "bool":
+                    var = tk.BooleanVar(value=p["default"])
+                    widget = ttk.Checkbutton(frame, variable=var)
+                else:
+                    raise ValueError(f"Unknown param type: {p['type']}")
+                widget.grid(row=row, column=1, sticky=tk.W, pady=1)
+                var.trace_add("write", self._on_param_change)
+                self.vars[name] = var
+
+        info = ttk.Frame(self, padding=(8, 0))
+        info.pack(side=tk.TOP, fill=tk.X)
+        self.info_var = tk.StringVar(
+            value=f"{self.fwd_title}  +  {self.bwd_title}")
+        ttk.Label(info, textvariable=self.info_var, font=("TkFixedFont", 9)).pack(
+            side=tk.LEFT)
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(info, textvariable=self.status_var, foreground="red").pack(
+            side=tk.RIGHT)
+
+    def _build_figure(self):
+        self.figure = Figure(figsize=(13, 6.6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+    def _build_buttons(self):
+        frame = ttk.Frame(self, padding=8)
+        frame.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(frame, text="Cancel", command=self.destroy).pack(
+            side=tk.RIGHT, padx=4)
+        ttk.Button(frame, text="Apply", command=self.apply).pack(
+            side=tk.RIGHT, padx=4)
+        ttk.Button(frame, text="Update preview", command=self.update_preview).pack(
+            side=tk.RIGHT, padx=4)
+
+    # ---- Parameters ----
+
+    def get_params(self):
+        params = {}
+        for p in self.spec["params"]:
+            try:
+                params[p["name"]] = self.vars[p["name"]].get()
+            except tk.TclError:
+                return None
+        return params
+
+    def _on_param_change(self, *args):
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        self._after_id = self.after(self.PREVIEW_DEBOUNCE_MS, self.update_preview)
+
+    # ---- Preview ----
+
+    def update_preview(self):
+        self._after_id = None
+        if self._busy:
+            return
+        params = self.get_params()
+        if params is None:
+            return
+        self._busy = True
+        self.status_var.set("computing...")
+        self.update_idletasks()
+        try:
+            self.result = gtw.process_two_way(self.fwd, self.bwd,
+                                              **twoway_kwargs(params))
+            self.status_var.set("")
+        except Exception as e:
+            self.status_var.set(str(e))
+            self.result = None
+            return
+        finally:
+            self._busy = False
+        self._draw(params)
+
+    def _draw(self, params):
+        app = self.app
+        res = self.result
+        a = res.alignment
+        extent = (0, app.x_real, 0, app.y_real)
+        cmap = gp.get_gwyddion_cmap()
+        self.figure.clf()
+        axes = self.figure.subplots(2, 3)
+
+        def image_panel(ax, img, title, cm=cmap, symmetric=False):
+            if symmetric:
+                v = np.percentile(np.abs(img - np.mean(img)), 99.0) or 1.0
+                im = ax.imshow(img - np.mean(img), origin="upper", cmap=cm,
+                               extent=extent, aspect="equal", vmin=-v, vmax=v)
+            else:
+                v0, v1 = np.percentile(img, [0.5, 99.5])
+                im = ax.imshow(img, origin="upper", cmap=cm, extent=extent,
+                               aspect="equal", vmin=v0, vmax=v1)
+            ax.set_title(title, fontsize=9)
+            self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(app.z_units)
+
+        image_panel(axes[0, 0], res.fwd, f"Forward ({self.fwd_title})")
+        image_panel(axes[0, 1], res.merged, "Merged result")
+        image_panel(axes[0, 2], res.fwd - res.merged,
+                    self.spec["removed_label"], cm="coolwarm", symmetric=True)
+
+        # -- shift profile
+        ax = axes[1, 0]
+        if a.measured_centers is not None:
+            good = a.measured_quality > 0
+            ax.plot(a.measured_centers[good], a.measured_shift_px[good], "o",
+                    ms=4, color="tab:blue", label="measured")
+            if (~good).any():
+                ax.plot(a.measured_centers[~good], a.measured_shift_px[~good],
+                        "x", ms=4, color="lightgray", label="low contrast")
+        ax.plot(np.arange(len(a.shift_px)), a.shift_px, "-", lw=2,
+                color="tab:red", label=a.mapping)
+        ax.axhline(0, color="gray", lw=0.8, ls="--")
+        ax.set_title("Forward -> backward column shift", fontsize=9)
+        ax.set_xlabel("column")
+        ax.set_ylabel("shift (px)")
+        ax.legend(fontsize=7)
+
+        # -- H(delta, dz) histogram with the decision line
+        ax = axes[1, 1]
+        try:
+            hist, deltas, edges = gtw.difference_histogram(
+                res.fwd, +1, max_delta=int(params["max_delta"]),
+                detrend=True)
+            im = ax.imshow(np.log10(hist.T + 1.0), origin="lower", aspect="auto",
+                           extent=(0.5, deltas[-1] + 0.5, edges[0], edges[-1]),
+                           cmap="viridis")
+            self.figure.colorbar(im, ax=ax, fraction=0.046).set_label("log10 count")
+            if params["detect"] and np.isfinite(res.slope_fwd):
+                d = np.array([0.0, float(deltas[-1])])
+                ax.plot(d, -(res.slope_fwd * d + float(params["offset"])),
+                        color="tab:orange", lw=1.8, label="decision line")
+                ax.legend(fontsize=7)
+            ax.set_title(f"H($\\Delta$, $\\Delta z$) forward"
+                         + (f"  slope={res.slope_fwd:.3g}" if params["detect"] else ""),
+                         fontsize=9)
+            ax.set_xlabel("$\\Delta$ (pixel)")
+            ax.set_ylabel(f"$\\Delta z$ ({app.z_units})")
+        except Exception as e:
+            ax.text(0.5, 0.5, f"histogram failed:\n{e}", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8)
+
+        # -- flagged mask
+        ax = axes[1, 2]
+        if params["detect"]:
+            overlay = res.mask_fwd.astype(float) + 2.0 * res.mask_bwd
+            im = ax.imshow(overlay, origin="upper", cmap="viridis", extent=extent,
+                           aspect="equal", vmin=0, vmax=3)
+            self.figure.colorbar(im, ax=ax, fraction=0.046,
+                                 ticks=[0, 1, 2, 3]).set_label(
+                "0 none / 1 fwd / 2 bwd / 3 both")
+            ax.set_title(f"Parachuting: fwd {100*res.fraction_fwd:.1f}%, "
+                         f"bwd {100*res.fraction_bwd:.1f}%", fontsize=9)
+        else:
+            ax.text(0.5, 0.5, "parachuting detection off\n(pure aligned merge)",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=10,
+                    color="gray")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+        self.info_var.set(
+            f"{self.fwd_title} + {self.bwd_title}   |   "
+            f"lag {a.lag_px:+.2f} px, bow {a.bow_px:.2f} px, "
+            f"flip={a.flipped_backward}   |   "
+            f"fwd/bwd rms {a.rms_before:.3g} -> {a.rms_after:.3g} {app.z_units}, "
+            f"corr {a.corr_before:.4f} -> {a.corr_after:.4f}"
+        )
+
+    # ---- Apply ----
+
+    def apply(self):
+        params = self.get_params()
+        if params is None:
+            return
+        if self.app.pipeline and not messagebox.askyesno(
+            "Two-way merge",
+            "The two-way merge restarts from the raw forward/backward channels, "
+            "so the steps already applied to this image will be discarded.\n\n"
+            "Apply anyway?",
+            parent=self,
+        ):
+            return
+        self.app.apply_operation(self.op_key, params)
+        self.destroy()
+
+
+DIALOG_CLASSES["two_way"] = TwoWayDialog
+
+
 class GwyProcessorGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1254,6 +1642,12 @@ class GwyProcessorGUI(tk.Tk):
                 text=OPERATIONS[key]["label"] + suffix,
                 command=lambda k=key: self.open_operation(k),
             ).pack(fill=tk.X, pady=1)
+
+        ttk.Button(
+            proc,
+            text=OPERATIONS["two_way"]["label"] + "...",
+            command=lambda: self.open_operation("two_way"),
+        ).pack(fill=tk.X, pady=(6, 1))
 
         ttk.Button(proc, text="View FFT spectrum", command=self.show_fft).pack(
             fill=tk.X, pady=(6, 1)
@@ -1392,12 +1786,32 @@ class GwyProcessorGUI(tk.Tk):
         dialog_cls = DIALOG_CLASSES.get(op_key, OperationDialog)
         dialog_cls(self, op_key)
 
+    def channel_context(self):
+        """Extra channels handed to operations that need more than the current
+        image (the two-way merge needs the forward/backward pair)."""
+        if not self.channels:
+            return None
+        fwd_title, bwd_title = gtw.find_pair(self.channels, self.channel_var.get())
+        z = getattr(self, "z_factor", 1.0)
+        context = {"fwd_title": fwd_title, "bwd_title": bwd_title,
+                   "fwd": None, "bwd": None}
+        if fwd_title in self.channels:
+            context["fwd"] = self.channels[fwd_title].data.astype(np.float64) * z
+        if bwd_title in self.channels:
+            context["bwd"] = self.channels[bwd_title].data.astype(np.float64) * z
+        return context
+
     def apply_operation(self, op_key, params):
         """Apply one operation, push undo state, record pipeline + log.
         Called by the operation dialogs on Apply."""
-        func = OPERATIONS[op_key]["func"]
+        spec = OPERATIONS[op_key]
+        func = spec["func"]
         try:
-            new_data = func(self.data, params, self.dx, self.dy)
+            if spec.get("needs_pair"):
+                new_data = func(self.data, params, self.dx, self.dy,
+                                self.channel_context())
+            else:
+                new_data = func(self.data, params, self.dx, self.dy)
         except Exception as e:
             messagebox.showerror(
                 "Processing error", f"{describe_step(op_key, params)} failed:\n{e}"
@@ -1648,7 +2062,19 @@ class GwyProcessorGUI(tk.Tk):
                 y_real = (field.yreal or ny) * xy_factor
                 dx, dy = x_real / nx, y_real / ny
 
-                processed = apply_pipeline(data, pipeline, dx, dy)
+                # Two-way operations need this file's own forward/backward
+                # pair; the shift is re-measured for every image because the
+                # scanner lag differs from scan to scan.
+                fwd_title, bwd_title = gtw.find_pair(channels, channel)
+                context = {
+                    "fwd_title": fwd_title, "bwd_title": bwd_title,
+                    "fwd": (channels[fwd_title].data.astype(np.float64) * z_factor
+                            if fwd_title in channels else data),
+                    "bwd": (channels[bwd_title].data.astype(np.float64) * z_factor
+                            if bwd_title in channels else None),
+                }
+
+                processed = apply_pipeline(data, pipeline, dx, dy, context)
 
                 # Recompute extents from the processed shape - operations
                 # like crop change the image dimensions (pixel size is fixed)
