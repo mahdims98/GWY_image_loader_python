@@ -159,7 +159,38 @@ def twoway_kwargs(params, detect=False):
         consensus_size=int(g("consensus_size", 5)),
         beta=float(g("beta", 0.0)),
         both_flagged=g("both_flagged", "paper"),
+        corr_margin=float(g("corr_margin", 0.7)),
+        corr_window=int(g("corr_window", 11)),
     )
+
+
+#: Auxiliary channel base names consulted by the correlation merge, keyed by
+#: the ``corr_aux`` dialog choice.
+AUX_CHOICES = {
+    "phase+error": ("Phase", "Error"),
+    "phase": ("Phase",),
+    "error": ("Error",),
+    "none": (),
+}
+
+
+def aux_pairs_for(channels, fwd_title, which="phase+error"):
+    """The raw (fwd, bwd) auxiliary-channel pairs (phase / error) that belong
+    to a height channel, as referee data for ``combine='correlation'``.
+    Missing channels are silently skipped - the merge falls back to its
+    consensus rule when no referee is available."""
+    pairs = []
+    if not channels or not fwd_title:
+        return pairs
+    for name in AUX_CHOICES.get(which, ()):
+        aux_f = re.sub(r"^.*?(?=\s*\[)", name, fwd_title)
+        if aux_f == fwd_title or aux_f not in channels:
+            continue
+        aux_b = gtw.backward_title(aux_f)
+        if aux_b and aux_b in channels:
+            pairs.append((channels[aux_f].data.astype(np.float64),
+                          channels[aux_b].data.astype(np.float64)))
+    return pairs
 
 
 def _require_pair(context):
@@ -177,7 +208,12 @@ def _op_two_way(data, params, dx, dy, context=None):
     forward/backward channel pair supplied in `context` - so it belongs at the
     very start of a pipeline."""
     _require_pair(context)
+    aux = None
+    if params.get("combine") == "correlation":
+        aux = aux_pairs_for(context.get("channels"), context.get("fwd_title"),
+                            params.get("corr_aux", "phase+error"))
     result = gtw.process_two_way(context["fwd"], context["bwd"],
+                                 aux_pairs=aux,
                                  **twoway_kwargs(params, detect=False))
     return result.merged
 
@@ -203,6 +239,10 @@ def _describe_combine(params):
         return f"slope-select gain={params.get('slope_gain', 2.0)}"
     if combine == "consensus":
         return f"consensus size={params.get('consensus_size', 5)}"
+    if combine == "correlation":
+        return (f"correlation margin={params.get('corr_margin', 0.7)}, "
+                f"win={params.get('corr_window', 11)}px, "
+                f"referee={params.get('corr_aux', 'phase+error')}")
     return combine
 
 
@@ -441,8 +481,8 @@ OPERATIONS = {
             # -- merge
             {"name": "combine", "label": "Combine", "type": "choice",
              "default": "average",
-             "values": ["average", "slope", "consensus", "softmin",
-                        "min", "max", "forward", "backward"]},
+             "values": ["average", "correlation", "slope", "consensus",
+                        "softmin", "min", "max", "forward", "backward"]},
             {"name": "weight", "label": "Forward weight (0-1)", "type": "float",
              "default": 0.5, "min": 0.0, "max": 1.0},
             {"name": "slope_gain", "label": "Slope gain", "type": "float",
@@ -451,6 +491,14 @@ OPERATIONS = {
              "default": 5, "min": 1, "max": 100},
             {"name": "beta", "label": "Soft-min beta (1/z)", "type": "float",
              "default": 0.0, "min": 0.0, "max": 1e6},
+            # -- combine='correlation' only
+            {"name": "corr_margin", "label": "Corr margin (0-1)", "type": "float",
+             "default": 0.7, "min": -1.0, "max": 1.0},
+            {"name": "corr_window", "label": "Corr window (px)", "type": "int",
+             "default": 11, "min": 3, "max": 101},
+            {"name": "corr_aux", "label": "Referee channels", "type": "choice",
+             "default": "phase+error",
+             "values": ["phase+error", "phase", "error", "none"]},
         ],
         "removed_label": "Difference (forward - merged)",
         "describe": _describe_two_way,
@@ -1455,7 +1503,8 @@ class TwoWayDialog(tk.Toplevel):
          ["mapping", "poly_order", "n_blocks", "max_lag", "match_level",
           "match_poly_order", "warp", "flip_backward", "crop"]),
         ("Merge",
-         ["combine", "weight", "slope_gain", "consensus_size", "beta"]),
+         ["combine", "weight", "slope_gain", "consensus_size", "beta",
+          "corr_margin", "corr_window", "corr_aux"]),
     ]
 
     def __init__(self, app, op_key="two_way"):
@@ -1561,7 +1610,8 @@ class TwoWayDialog(tk.Toplevel):
         ttk.Label(frame, text="Overlay:").grid(row=0, column=0, sticky=tk.W,
                                                padx=(0, 6), pady=1)
         ttk.Combobox(frame, textvariable=self.overlay_style,
-                     values=["blend", "anaglyph"], state="readonly",
+                     values=["blend", "anaglyph", "corr map", "decision"],
+                     state="readonly",
                      width=12).grid(row=0, column=1, sticky=tk.W, pady=1)
         ttk.Label(frame, text="Bwd opacity:").grid(row=1, column=0, sticky=tk.W,
                                                    padx=(0, 6), pady=1)
@@ -1667,8 +1717,12 @@ class TwoWayDialog(tk.Toplevel):
         self.status_var.set("computing...")
         self.update_idletasks()
         try:
+            aux = None
+            if params.get("combine") == "correlation":
+                aux = aux_pairs_for(self.app.channels, self.fwd_title,
+                                    params.get("corr_aux", "phase+error"))
             self.result = gtw.process_two_way(
-                self.fwd, self.bwd,
+                self.fwd, self.bwd, aux_pairs=aux,
                 **twoway_kwargs(params, detect=self.DETECT))
             self.status_var.set("")
         except Exception as e:
@@ -1708,11 +1762,47 @@ class TwoWayDialog(tk.Toplevel):
         return np.clip((img - v0) / ((v1 - v0) or 1.0), 0.0, 1.0)
 
     def _overlay_panel(self, ax, fwd, bwd):
-        """Forward and backward on top of each other: either an opacity blend
-        (backward drawn over forward with adjustable alpha) or a red/cyan
-        anaglyph where any residual misalignment shows as color fringes."""
-        nf, nb = self._normalized(fwd), self._normalized(bwd)
+        """Forward and backward on top of each other: an opacity blend
+        (backward drawn over forward with adjustable alpha), a red/cyan
+        anaglyph where any residual misalignment shows as color fringes, or -
+        with combine='correlation' - the local fwd/bwd correlation map or the
+        per-pixel decision (averaged / forward kept / backward kept)."""
         style = self.overlay_style.get()
+        res = self.result
+        if style in ("corr map", "decision"):
+            if getattr(res, "corr_map", None) is None:
+                ax.text(0.5, 0.5, "set Combine = 'correlation'\n"
+                        "to see the correlation views",
+                        ha="center", va="center", transform=ax.transAxes,
+                        fontsize=9)
+                ax.set_axis_off()
+                return
+            margin = float((self._last_params or {}).get("corr_margin", 0.7))
+            extent = self._extent_of(res.corr_map)
+            if style == "corr map":
+                im = ax.imshow(res.corr_map, origin="upper", cmap="viridis",
+                               extent=extent, aspect="equal", vmin=-1, vmax=1)
+                self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(
+                    "local correlation")
+                shared = float(np.mean(res.corr_map >= margin))
+                ax.set_title(f"Local fwd/bwd correlation - "
+                             f"{100 * shared:.1f}% above margin {margin:g}",
+                             fontsize=9)
+            else:
+                dec = res.corr_decision
+                im = ax.imshow(dec, origin="upper", extent=extent,
+                               aspect="equal", vmin=0, vmax=2,
+                               cmap=matplotlib.colors.ListedColormap(
+                                   ["#c8c8c8", "#d62728", "#1f77b4"]))
+                self.figure.colorbar(im, ax=ax, fraction=0.046,
+                                     ticks=[0.33, 1.0, 1.67]).ax \
+                    .set_yticklabels(["avg", "fwd", "bwd"])
+                ax.set_title(
+                    f"Decision: averaged {100 * np.mean(dec == 0):.1f}%, "
+                    f"fwd {100 * np.mean(dec == 1):.1f}%, "
+                    f"bwd {100 * np.mean(dec == 2):.1f}%", fontsize=9)
+            return
+        nf, nb = self._normalized(fwd), self._normalized(bwd)
         alpha = float(self.overlay_alpha.get())
         if style == "anaglyph":
             comp = np.dstack([nf, nb, nb])
@@ -2383,7 +2473,7 @@ class GwyProcessorGUI(tk.Tk):
         fwd_title, bwd_title = gtw.find_pair(self.channels, self.channel_var.get())
         z = getattr(self, "z_factor", 1.0)
         context = {"fwd_title": fwd_title, "bwd_title": bwd_title,
-                   "fwd": None, "bwd": None}
+                   "fwd": None, "bwd": None, "channels": self.channels}
         if fwd_title in self.channels:
             context["fwd"] = self.channels[fwd_title].data.astype(np.float64) * z
         if bwd_title in self.channels:
@@ -2661,6 +2751,7 @@ class GwyProcessorGUI(tk.Tk):
                             if fwd_title in channels else data),
                     "bwd": (channels[bwd_title].data.astype(np.float64) * z_factor
                             if bwd_title in channels else None),
+                    "channels": channels,
                 }
 
                 processed = apply_pipeline(data, pipeline, dx, dy, context)

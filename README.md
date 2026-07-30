@@ -79,6 +79,15 @@ two-way scanning data", in three independently tunable stages:
   * `consensus` — outlier rejection: keep whichever scan is closer to the
     local (`consensus_size` box) mean of the two. Rejects single-scan
     glitches.
+  * `correlation` (`correlation_select`) — correlation-gated merge: the local
+    windowed correlation between the two scans (`corr_window`) marks each
+    pixel as shared (`corr >= corr_margin` → weighted average) or disputed.
+    Disputed pixels are refereed by the phase and error channels of the same
+    file (warped with the same alignment as the heights): each direction's
+    height is locally correlated against the direction-averaged phase/error
+    pattern and the direction with the highest |correlation| keeps the pixel.
+    The dialog's Overlay selector gains `corr map` and `decision` views for
+    tuning the margin.
   * `softmin` — the paper's corrected soft-minimum with parameter `beta`;
     `beta = 0` degenerates to the plain mean, large `beta` to a hard minimum.
   * `min`, `max`, `forward`, `backward`.

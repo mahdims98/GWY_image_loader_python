@@ -696,6 +696,10 @@ def combine_scans(fwd, bwd, combine="average", weight=0.5, beta=0.0,
       ``forward``/``backward`` - take one scan unchanged (useful for
                       comparing against the merge, or for using the alignment
                       and parachuting stages on their own).
+
+    ``combine='correlation'`` is not handled here: it needs the auxiliary
+    channels and lives in :func:`correlation_select` /
+    :func:`process_two_way`.
     """
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
@@ -744,6 +748,12 @@ def merge_two_way(fwd, bwd, mask_fwd=None, mask_bwd=None, combine="average",
     bwd = np.asarray(bwd, dtype=float)
     out = combine_scans(fwd, bwd, combine, weight, beta, slope_gain,
                         consensus_size)
+    return _replace_flagged(out, fwd, bwd, mask_fwd, mask_bwd, both_flagged)
+
+
+def _replace_flagged(out, fwd, bwd, mask_fwd, mask_bwd, both_flagged="paper"):
+    """Overwrite flagged (parachuting) pixels of a combined image with the
+    value from the opposite scan; see :func:`merge_two_way`."""
     if mask_fwd is None and mask_bwd is None:
         return out
 
@@ -765,6 +775,96 @@ def merge_two_way(fwd, bwd, mask_fwd=None, mask_bwd=None, combine="average",
 
 
 # --------------------------------------------------------------------------- #
+#  Correlation-gated merge (average where the scans agree, referee elsewhere)
+# --------------------------------------------------------------------------- #
+def apply_alignment(alignment, image, which="bwd", interp="spline"):
+    """Warp an arbitrary same-shape image (e.g. a phase or error channel)
+    exactly the way the height image of scan direction `which` was warped by
+    :func:`align_two_way` (including the mirror of the backward scan)."""
+    image = np.asarray(image, dtype=float)
+    if which == "bwd":
+        if alignment.flipped_backward:
+            image = image[:, ::-1]
+        cols = alignment.columns_bwd
+    elif which == "fwd":
+        cols = alignment.columns_fwd
+    else:
+        raise ValueError(f"unknown direction {which!r}")
+    if np.array_equal(cols, np.arange(image.shape[1], dtype=float)):
+        return image.copy()
+    return resample_columns(image, cols, interp)
+
+
+def local_correlation(a, b, window=11):
+    """Windowed zero-mean normalized cross-correlation between two images:
+    at every pixel, the Pearson correlation of the two `window` x `window`
+    neighbourhoods. 1 = identical local pattern, 0 = unrelated, -1 = inverted.
+    Insensitive to any local offset or gain difference between the images."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    w = max(3, int(window))
+    ma = uniform_filter(a, w)
+    mb = uniform_filter(b, w)
+    cov = uniform_filter(a * b, w) - ma * mb
+    va = np.maximum(uniform_filter(a * a, w) - ma * ma, 0.0)
+    vb = np.maximum(uniform_filter(b * b, w) - mb * mb, 0.0)
+    return np.clip(cov / (np.sqrt(va * vb) + 1e-30), -1.0, 1.0)
+
+
+def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
+                       weight=0.5):
+    """Correlation-gated merge of two aligned scans.
+
+    The local (windowed) correlation between the scans decides, pixel by
+    pixel, whether the two directions imaged the same feature:
+
+    * ``corr >= margin`` - the feature is shared: take the weighted average
+      (``weight`` * fwd + (1-``weight``) * bwd).
+    * ``corr < margin``  - the scans disagree there. The auxiliary channels
+      (phase / error) referee: each direction's height is locally correlated
+      against the direction-averaged auxiliary pattern (which is much less
+      affected by a height artifact of one direction), and the pixel is kept
+      from the direction with the highest mean |correlation|. Without any
+      auxiliary channel the direction closer to the local mean wins instead.
+
+    Returns ``(merged, corr_map, decision)`` where ``decision`` is 0 where the
+    scans were averaged, 1 where the forward pixel was kept and 2 where the
+    backward pixel was kept.
+    """
+    fwd = np.asarray(fwd, dtype=float)
+    bwd = np.asarray(bwd, dtype=float)
+    corr = local_correlation(fwd, bwd, window)
+    w = float(np.clip(weight, 0.0, 1.0))
+    avg = w * fwd + (1.0 - w) * bwd
+
+    disputed = corr < float(margin)
+    decision = np.zeros(fwd.shape, np.uint8)
+    if not disputed.any():
+        return avg, corr, decision
+
+    score_f = np.zeros(fwd.shape)
+    score_b = np.zeros(fwd.shape)
+    n_aux = 0
+    for aux_f, aux_b in aux_pairs:
+        ref = 0.5 * (np.asarray(aux_f, dtype=float)
+                     + np.asarray(aux_b, dtype=float))
+        # |corr|: an edge shows up in phase/error with an arbitrary sign
+        score_f += np.abs(local_correlation(fwd, ref, window))
+        score_b += np.abs(local_correlation(bwd, ref, window))
+        n_aux += 1
+    if n_aux == 0:
+        ref = uniform_filter(avg, max(3, int(window)))
+        score_f = -np.abs(fwd - ref)
+        score_b = -np.abs(bwd - ref)
+
+    take_f = score_f >= score_b
+    merged = np.where(disputed, np.where(take_f, fwd, bwd), avg)
+    decision[disputed & take_f] = 1
+    decision[disputed & ~take_f] = 2
+    return merged, corr, decision
+
+
+# --------------------------------------------------------------------------- #
 #  Full pipeline
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -779,6 +879,8 @@ class TwoWayResult:
     slope_bwd: float = float("nan")
     fraction_fwd: float = 0.0       # fraction of pixels flagged in each scan
     fraction_bwd: float = 0.0
+    corr_map: np.ndarray = field(repr=False, default=None)
+    corr_decision: np.ndarray = field(repr=False, default=None)
 
     @property
     def removed(self):
@@ -820,6 +922,8 @@ DEFAULTS = dict(
     slope_gain=2.0,
     consensus_size=5,
     both_flagged="paper",
+    corr_margin=0.7,     # combine='correlation': shared-feature threshold
+    corr_window=11,      # ... local correlation window (px)
     # -- output
     crop=True,           # trim edge columns not imaged in both directions
 )
@@ -831,9 +935,14 @@ _ALIGN_KEYS = ("mapping", "flip_backward", "warp", "poly_order", "n_blocks",
                "maxiter", "smooth_measured", "max_shift_px", "interp")
 
 
-def process_two_way(fwd, bwd, hysteresis_result=None, **params):
+def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
+                    **params):
     """Run alignment -> detection -> merge. Keyword arguments override
     :data:`DEFAULTS`; see that dict for the full list of tunables.
+
+    ``aux_pairs`` - optional list of raw ``(aux_fwd, aux_bwd)`` channel pairs
+    (phase, error, ...) used as referees by ``combine='correlation'``. They
+    are warped with the same alignment as the height images.
 
     Returns a :class:`TwoWayResult`."""
     p = dict(DEFAULTS)
@@ -885,11 +994,22 @@ def process_two_way(fwd, bwd, hysteresis_result=None, **params):
                                     p["max_delta"], p["detrend"])
 
     # ---- 3. merge -------------------------------------------------------- #
-    merged = merge_two_way(a_fwd, a_bwd, mask_f, mask_b,
-                           combine=p["combine"], weight=p["weight"],
-                           beta=p["beta"], slope_gain=p["slope_gain"],
-                           consensus_size=p["consensus_size"],
-                           both_flagged=p["both_flagged"])
+    corr_map = corr_decision = None
+    if p["combine"] == "correlation":
+        pairs = [(apply_alignment(alignment, af, "fwd", p["interp"]),
+                  apply_alignment(alignment, ab, "bwd", p["interp"]))
+                 for af, ab in (aux_pairs or [])]
+        merged, corr_map, corr_decision = correlation_select(
+            a_fwd, a_bwd, pairs, margin=p["corr_margin"],
+            window=p["corr_window"], weight=p["weight"])
+        merged = _replace_flagged(merged, a_fwd, a_bwd, mask_f, mask_b,
+                                  p["both_flagged"])
+    else:
+        merged = merge_two_way(a_fwd, a_bwd, mask_f, mask_b,
+                               combine=p["combine"], weight=p["weight"],
+                               beta=p["beta"], slope_gain=p["slope_gain"],
+                               consensus_size=p["consensus_size"],
+                               both_flagged=p["both_flagged"])
 
     # ---- 4. crop to the doubly-imaged region ----------------------------- #
     if p["crop"] and alignment.crop_cols is not None:
@@ -900,6 +1020,9 @@ def process_two_way(fwd, bwd, hysteresis_result=None, **params):
             a_bwd = a_bwd[:, c0:c1]
             mask_f = mask_f[:, c0:c1]
             mask_b = mask_b[:, c0:c1]
+            if corr_map is not None:
+                corr_map = corr_map[:, c0:c1]
+                corr_decision = corr_decision[:, c0:c1]
 
     return TwoWayResult(
         merged=merged, fwd=a_fwd, bwd=a_bwd,
@@ -908,6 +1031,7 @@ def process_two_way(fwd, bwd, hysteresis_result=None, **params):
         slope_fwd=slope_f, slope_bwd=slope_b,
         fraction_fwd=float(mask_f.mean()),
         fraction_bwd=float(mask_b.mean()),
+        corr_map=corr_map, corr_decision=corr_decision,
     )
 
 
