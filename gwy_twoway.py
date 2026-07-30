@@ -190,6 +190,18 @@ def backward_needs_flip(fwd, bwd):
     return _similarity(fwd, bwd[:, ::-1]) > _similarity(fwd, bwd)
 
 
+def highpass_x(image, sigma):
+    """Remove the smooth background along the fast axis (gaussian high-pass
+    per row). Used before any column matching: the raw heights are dominated
+    by the leveling background, which swamps the feature contrast the
+    matching needs. NOT a processing step - only a matching aid."""
+    image = np.asarray(image, dtype=float)
+    if not sigma or sigma <= 0:
+        return image
+    return image - gaussian_filter1d(image, float(sigma), axis=1,
+                                     mode="nearest")
+
+
 def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20, highpass=8.0,
                           min_quality=0.2):
     """Measure the forward->backward column shift directly, by block-wise
@@ -208,9 +220,8 @@ def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20, highpass=8.0,
     bwd = np.asarray(bwd, dtype=float)
     nx = fwd.shape[1]
 
-    if highpass and highpass > 0:
-        fwd = fwd - gaussian_filter1d(fwd, highpass, axis=1, mode="nearest")
-        bwd = bwd - gaussian_filter1d(bwd, highpass, axis=1, mode="nearest")
+    fwd = highpass_x(fwd, highpass)
+    bwd = highpass_x(bwd, highpass)
 
     n_blocks = max(1, int(n_blocks))
     width = nx // n_blocks
@@ -250,15 +261,20 @@ def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20, highpass=8.0,
 
 
 def _hysteresis_model_shape(fwd, bwd, l_points, n_var, maxiter, seed,
-                            hysteresis_result=None):
+                            highpass=0.0, hysteresis_result=None):
     """Run (or reuse) the power-law hysteresis fit and return
     ``(shift_shape_u, result)``: the model's forward->backward shift in
-    normalized [0,1] coordinates, sampled on ``result.x_c``."""
+    normalized [0,1] coordinates, sampled on ``result.x_c``.
+
+    The images are high-passed along the fast axis first (``highpass`` > 0);
+    the original hysteresis pipeline matches raw columns, and on images with a
+    strong leveling background the background dominates the correlation and
+    the match degenerates."""
     hc = load_hysteresis_module()
     res = hysteresis_result
     if res is None:
         res = hc.hysteresis_detect(
-            fwd, bwd,
+            highpass_x(fwd, highpass), highpass_x(bwd, highpass),
             l_points=int(l_points),
             flip_backward=False,          # orientation handled by the caller
             n_var=int(n_var),
@@ -340,7 +356,10 @@ def align_two_way(
         Degree of the polynomial fitted to the measured shift profile
         (``mapping='xcorr'``). 0 = constant lag, 2 = lag + bow.
     n_blocks, max_lag, highpass, min_quality
-        Passed to :func:`measure_shift_profile`.
+        Passed to :func:`measure_shift_profile`. ``highpass`` is also applied
+        before the power-law model fit (``mapping='model'/'model_scaled'``):
+        without it the leveling background dominates the column correlation
+        and the measured mapping is meaningless on tilted samples.
     l_points, n_var, maxiter, seed
         Power-law model size and differential-evolution settings.
     smooth_measured : float
@@ -407,7 +426,8 @@ def align_two_way(
 
     elif mapping in ("model", "model_scaled"):
         shape_u, res = _hysteresis_model_shape(
-            fwd, bwd_oriented, l_points, n_var, maxiter, seed, hysteresis_result)
+            fwd, bwd_oriented, l_points, n_var, maxiter, seed,
+            highpass=highpass, hysteresis_result=hysteresis_result)
         shape_px = np.interp(t_grid, res.x_c, shape_u) * (nx - 1)
         if mapping == "model":
             shift = shape_px

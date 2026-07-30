@@ -1506,23 +1506,29 @@ class TwoWayDialog(tk.Toplevel):
     def _build_display_controls(self, outer):
         """Display-only settings (they re-render the preview but are not part
         of the operation parameters and are not recorded in the pipeline)."""
-        frame = ttk.LabelFrame(outer, text="Overlay display", padding=6)
+        frame = ttk.LabelFrame(outer, text="Display", padding=6)
         frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=4)
 
         self.overlay_style = tk.StringVar(value="blend")
         self.overlay_alpha = tk.DoubleVar(value=0.5)
+        self.curve_view = tk.StringVar(value="mapping (0-1)")
 
-        ttk.Label(frame, text="Style:").grid(row=0, column=0, sticky=tk.W,
-                                             padx=(0, 6), pady=1)
+        ttk.Label(frame, text="Overlay:").grid(row=0, column=0, sticky=tk.W,
+                                               padx=(0, 6), pady=1)
         ttk.Combobox(frame, textvariable=self.overlay_style,
                      values=["blend", "anaglyph"], state="readonly",
-                     width=10).grid(row=0, column=1, sticky=tk.W, pady=1)
+                     width=12).grid(row=0, column=1, sticky=tk.W, pady=1)
         ttk.Label(frame, text="Bwd opacity:").grid(row=1, column=0, sticky=tk.W,
                                                    padx=(0, 6), pady=1)
         ttk.Scale(frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL, length=110,
                   variable=self.overlay_alpha).grid(row=1, column=1,
                                                     sticky=tk.W, pady=1)
-        for var in (self.overlay_style, self.overlay_alpha):
+        ttk.Label(frame, text="Curves:").grid(row=2, column=0, sticky=tk.W,
+                                              padx=(0, 6), pady=1)
+        ttk.Combobox(frame, textvariable=self.curve_view,
+                     values=["mapping (0-1)", "shift (px)"], state="readonly",
+                     width=12).grid(row=2, column=1, sticky=tk.W, pady=1)
+        for var in (self.overlay_style, self.overlay_alpha, self.curve_view):
             var.trace_add("write", self._on_display_change)
 
     def _on_display_change(self, *args):
@@ -1649,12 +1655,54 @@ class TwoWayDialog(tk.Toplevel):
         ax.set_title(title, fontsize=9)
 
     def _curves_panel(self, ax):
-        """The hysteresis / lag curves in both directions: the fitted
-        forward->backward column shift, its inverse (backward->forward), and
-        the raw measured matches. Vertical lines mark the crop boundary."""
+        """The hysteresis / lag curves in both directions, in one of two
+        views (Display > Curves):
+
+        ``mapping (0-1)`` - the classic hysteresis plot: backward coordinate
+        against forward coordinate, both normalized to [0, 1], curving around
+        the slope-1 identity line. Includes the fitted mapping, the measured
+        column matches, and (when the power-law model was used) its f(t) and
+        g(t) distortion curves bowing on either side of the diagonal.
+
+        ``shift (px)`` - the same information as a deviation from identity in
+        pixels, which makes small lags/bows much easier to read.
+        """
         a = self.result.alignment
         n = len(a.shift_px)
         grid = np.arange(n)
+        mapping_view = self.curve_view.get().startswith("mapping")
+
+        if mapping_view:
+            s = n - 1.0
+            t = grid / s
+            ax.plot([0, 1], [0, 1], "--", color="gray", lw=1,
+                    label="identity (slope 1)")
+            if a.measured_centers is not None:
+                good = a.measured_quality > 0
+                ax.plot(a.measured_centers[good] / s,
+                        (a.measured_centers[good]
+                         + a.measured_shift_px[good]) / s,
+                        "o", ms=4, color="tab:blue", label="measured")
+            ax.plot(t, (grid + a.shift_px) / s, "-", lw=2, color="tab:red",
+                    label=f"fwd->bwd ({a.mapping})")
+            res = a.hysteresis_result
+            if res is not None:
+                ax.plot(res.x_c, res.f_x, lw=1.2, color="tab:green",
+                        label="model f(t) fwd")
+                ax.plot(res.x_c, res.g_x, lw=1.2, color="tab:purple",
+                        label="model g(t) bwd")
+            if a.crop_cols is not None and a.crop_cols != (0, n):
+                ax.axvspan(0, a.crop_cols[0] / s, color="gray", alpha=0.15)
+                ax.axvspan(a.crop_cols[1] / s, 1, color="gray", alpha=0.15)
+            ax.set_title("Hysteresis mapping (shaded = cropped)", fontsize=9)
+            ax.set_xlabel("forward coordinate (0-1)")
+            ax.set_ylabel("backward coordinate (0-1)")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_aspect("equal")
+            ax.legend(fontsize=6, loc="lower right")
+            return
+
         if a.measured_centers is not None:
             good = a.measured_quality > 0
             ax.plot(a.measured_centers[good], a.measured_shift_px[good], "o",
