@@ -36,7 +36,7 @@ environment variable to point elsewhere.
 * **Scar Removal** (`remove_scars`): Detects and interpolates horizontal line defects (strokes) introduced during scanning.
 * **Baseline Adjustment** (`set_baseline_to_zero`): Shifts the minimum data point to a base of zero.
 * **Outlier Filtering** (`filter_by_percentile`): Clips extreme values (spikes) based on a designated percentile range.
-* **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft`): Performs 2D Fast Fourier Transform analysis and applies lowpass or highpass frequency filters.
+* **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft_mask`): 2D FFT analysis (no windowing - the displayed spectrum is exactly the one being filtered, normalized so the DC bin is the image mean) and frequency-domain filtering through a single boolean mask that can combine a radial lowpass/highpass (`build_pass_mask`), circular notches (`build_notch_mask`, auto-detectable with `detect_fft_peaks`), and straight bands (`build_band_mask`). The GUI exposes all of these in one FFT-filter dialog.
 
 ### Two-Way Scan Processing (`gwy_twoway.py`)
 

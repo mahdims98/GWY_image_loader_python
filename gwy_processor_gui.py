@@ -10,8 +10,9 @@ Provides an interactive Tkinter application to:
         (level_by_polynomial_xy)
       * Align rows: median of differences / polynomial (align_rows)
       * Percentile range clipping (filter_by_percentile)
-      * FFT lowpass/highpass filtering (filter_by_2d_fft) with the
-        spectrum shown and click-to-set cutoff
+      * FFT filtering (filter_by_2d_fft_mask): lowpass/highpass, circular
+        notches and straight bands combined in one dialog, with the
+        spectrum shown and click-to-place cutoff/notches
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
       * Two-way merge of the forward and backward scans (gwy_twoway):
@@ -85,48 +86,39 @@ def _op_percentile(data, params, dx, dy):
 
 
 def _op_fft(data, params, dx, dy):
-    window = params.get("window", "hanning")
-    if window in (True, False):  # backward compat with old bool pipelines
-        window = "hanning" if window else "none"
-    return gp.filter_by_2d_fft(
-        data,
-        cutoff_freq=params["cutoff"],
-        mode=params["mode"],
-        dx=dx,
-        dy=dy,
-        window=None if window == "none" else window,
-        alpha=params.get("alpha", 0.5),
-    )
-
-
-def _op_fft_notch(data, params, dx, dy):
-    notches = list(params.get("notches", []))
+    """Unified FFT filter: one frequency mask combining an optional radial
+    lowpass/highpass with circular notches and straight bands."""
+    radius = params.get("radius", 0.5)
+    notches = [list(n) for n in params.get("notches", [])]
     if params.get("auto"):
         # Re-detect peaks on THIS image (batch-friendly: every image gets
         # its own detection instead of replaying fixed frequencies)
-        window = params.get("window", "hanning")
         detected = gp.detect_fft_peaks(
             data, dx=dx, dy=dy,
             protect_radius=params.get("protect_radius", 3.0),
             threshold_db=params.get("threshold_db", 15.0),
             max_peaks=50,
-            min_separation=params["radius"],
-            window=None if window == "none" else window,
-            alpha=params.get("alpha", 0.5),
+            min_separation=radius,
         )
         notches += [list(p) for p in detected]
-    mask = gp.build_notch_mask(
-        data.shape, dx=dx, dy=dy,
-        notches=notches,
-        radius=params["radius"],
-    )
+
+    mask = np.ones(data.shape, dtype=bool)
+    mode = params.get("mode", "none")
+    if mode in ("lowpass", "highpass"):
+        mask &= gp.build_pass_mask(
+            data.shape, dx=dx, dy=dy, mode=mode, cutoff=params["cutoff"]
+        )
+    if notches:
+        mask &= gp.build_notch_mask(
+            data.shape, dx=dx, dy=dy, notches=notches, radius=radius
+        )
     x_bands = params.get("x_bands", [])
     y_bands = params.get("y_bands", [])
     if x_bands or y_bands:
         mask &= gp.build_band_mask(
             data.shape, dx=dx, dy=dy,
             x_bands=x_bands, y_bands=y_bands,
-            half_width=params["radius"],
+            half_width=radius,
         )
     return gp.filter_by_2d_fft_mask(data, mask)
 
@@ -377,36 +369,33 @@ def _validate_percentile(params):
     return None
 
 
-def _validate_alpha(params):
-    if not (0.0 <= params.get("alpha", 0.5) <= 1.0):
-        return "Tukey taper must be between 0 and 1"
-    return None
-
-
 def _validate_fft(params):
-    if params["cutoff"] <= 0:
+    if params.get("mode", "none") in ("lowpass", "highpass") and params["cutoff"] <= 0:
         return "Cutoff frequency must be positive"
-    return _validate_alpha(params)
-
-
-def _validate_notch(params):
     if params["radius"] <= 0:
         return "Notch radius must be positive"
     if params["protect_radius"] < 0:
         return "Protect radius cannot be negative"
-    return _validate_alpha(params)
+    return None
 
 
-def _describe_notch(params):
-    parts = [f"{len(params.get('notches', []))} notches"]
+def _describe_fft(params):
+    parts = []
+    mode = params.get("mode", "none")
+    if mode in ("lowpass", "highpass"):
+        parts.append(f"{mode}@{params['cutoff']}")
+    n_notch = len(params.get("notches", []))
+    if n_notch:
+        parts.append(f"{n_notch} notches")
     if params.get("auto"):
         parts.append(f"auto-detect@{params.get('threshold_db')}dB")
     if params.get("x_bands"):
         parts.append(f"{len(params['x_bands'])} v-bands")
     if params.get("y_bands"):
         parts.append(f"{len(params['y_bands'])} h-bands")
-    parts.append(f"radius={params['radius']}")
-    return ", ".join(parts)
+    if n_notch or params.get("auto") or params.get("x_bands") or params.get("y_bands"):
+        parts.append(f"radius={params['radius']}")
+    return ", ".join(parts) if parts else "no-op"
 
 
 OPERATIONS = {
@@ -470,38 +459,22 @@ OPERATIONS = {
         "label": "FFT filter",
         "func": _op_fft,
         "params": [
-            {"name": "mode", "label": "Mode", "type": "choice",
-             "default": "lowpass", "values": ["lowpass", "highpass"]},
+            {"name": "mode", "label": "Pass filter", "type": "choice",
+             "default": "none", "values": ["none", "lowpass", "highpass"]},
             {"name": "cutoff", "label": "Cutoff (1/spatial unit)", "type": "float",
              "default": 10.0, "min": 0.0, "max": 1e9},
-            {"name": "window", "label": "Window", "type": "choice",
-             "default": "hanning", "values": ["hanning", "tukey", "none"]},
-            {"name": "alpha", "label": "Tukey taper (0-1)", "type": "float",
-             "default": 0.5, "min": 0.0, "max": 1.0},
-        ],
-        "removed_label": "Removed component (noise)",
-        "validate": _validate_fft,
-    },
-    "fft_notch": {
-        "label": "FFT notch filter",
-        "func": _op_fft_notch,
-        "params": [
             {"name": "radius", "label": "Notch radius", "type": "float",
              "default": 0.5, "min": 0.0, "max": 1e9},
             {"name": "threshold_db", "label": "Detect threshold (dB)", "type": "float",
              "default": 15.0, "min": 0.0, "max": 200.0},
             {"name": "protect_radius", "label": "Protect center radius", "type": "float",
              "default": 3.0, "min": 0.0, "max": 1e9},
-            {"name": "window", "label": "Spectrum window", "type": "choice",
-             "default": "hanning", "values": ["hanning", "tukey", "none"]},
-            {"name": "alpha", "label": "Tukey taper (0-1)", "type": "float",
-             "default": 0.5, "min": 0.0, "max": 1.0},
             {"name": "auto", "label": "Auto re-detect (per image)", "type": "bool",
              "default": False},
         ],
-        "removed_label": "Removed periodic noise",
-        "validate": _validate_notch,
-        "describe": _describe_notch,
+        "removed_label": "Removed component (noise)",
+        "validate": _validate_fft,
+        "describe": _describe_fft,
     },
     "remove_scars": {
         "label": "Remove scars",
@@ -653,7 +626,6 @@ OPERATION_ORDER = [
     "align_rows",
     "percentile",
     "fft_filter",
-    "fft_notch",
     "remove_scars",
     "zero_baseline",
 ]
@@ -1058,116 +1030,34 @@ class PolynomialDialog(OperationDialog):
 
 class FFTFilterDialog(OperationDialog):
     """
-    FFT filter dialog with three panels: the FFT magnitude spectrum with
-    the cutoff drawn as a circle (click on the spectrum to set the cutoff),
-    the filtered result, and the removed component.
+    Combined FFT filter dialog: an optional radial lowpass/highpass and
+    notch filtering of specific periodic signals, all applied as ONE
+    frequency-domain mask in a single inverse transform.
+
+    Three panels: the FFT magnitude spectrum (interactive), the filtered
+    result, and the removed component. What a left-click on the spectrum
+    does is chosen with the "Click sets" selector:
+
+      * cutoff - set the pass-filter cutoff to the clicked radius
+      * circle notch - notch a circular patch at the clicked frequency
+      * vertical / horizontal band - notch a straight stripe
+        (single-frequency interference along one scan axis)
+
+    Right-click removes the nearest notch/band. Every notch is applied
+    symmetrically at +/-f, so clicking one peak of a conjugate pair is
+    enough.
+
+    'Auto-detect peaks' finds all sharp spectral peaks outside the
+    protected center region and notches them in one go - this removes
+    most periodic signals that are not part of the low-frequency image
+    content.
     """
 
     def __init__(self, app, op_key="fft_filter"):
-        self._spectrum = None
-        self._spectrum_key = None
-        self._spec_ax = None
-        super().__init__(app, op_key)
-        self.geometry("1350x560")
-        self.canvas.mpl_connect("button_press_event", self._on_click)
-
-    def _window_settings(self):
-        """Current (window, alpha) from the dialog, with safe fallbacks."""
-        try:
-            window = self.vars["window"].get()
-        except (KeyError, tk.TclError):
-            window = "hanning"
-        try:
-            alpha = self.vars["alpha"].get()
-        except (KeyError, tk.TclError):
-            alpha = 0.5
-        return window, alpha
-
-    def _ensure_spectrum(self):
-        window, alpha = self._window_settings()
-        key = (window, alpha)
-        if self._spectrum is None or self._spectrum_key != key:
-            self._spectrum = gp.get_2d_fft_magnitude(
-                self.app.data, dx=self.app.dx, dy=self.app.dy,
-                window=None if window == "none" else window, alpha=alpha,
-            )
-            self._spectrum_key = key
-
-    def _on_click(self, event):
-        if event.inaxes is not self._spec_ax or event.xdata is None:
-            return
-        cutoff = float(np.hypot(event.xdata, event.ydata))
-        self.vars["cutoff"].set(round(cutoff, 3))
-        # trace on the variable triggers the debounced preview update
-
-    def _draw(self, result, removed):
-        app = self.app
-        self._ensure_spectrum()
-        mag, freq_extent = self._spectrum
-        extent = (0, app.x_real, 0, app.y_real)
-
-        self.figure.clf()
-        ax0, ax1, ax2 = self.figure.subplots(1, 3)
-
-        im0 = ax0.imshow(
-            mag, origin="upper", cmap="viridis",
-            extent=freq_extent, aspect="equal",
-        )
-        ax0.set_title("FFT spectrum (click to set cutoff)")
-        ax0.set_xlabel(f"fx (1/{app.spatial_units})")
-        ax0.set_ylabel(f"fy (1/{app.spatial_units})")
-        self.figure.colorbar(im0, ax=ax0, fraction=0.046).set_label("dB")
-        try:
-            cutoff = self.vars["cutoff"].get()
-            ax0.add_patch(Circle((0, 0), cutoff, fill=False,
-                                 color="red", linewidth=1.5))
-        except tk.TclError:
-            pass
-        self._spec_ax = ax0
-
-        im1 = ax1.imshow(
-            result, origin="upper", cmap=gp.get_gwyddion_cmap(),
-            extent=extent, aspect="equal",
-        )
-        ax1.set_title("Preview: result")
-        ax1.set_xlabel(f"x ({app.spatial_units})")
-        ax1.set_ylabel(f"y ({app.spatial_units})")
-        self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
-
-        im2 = ax2.imshow(
-            removed, origin="upper", cmap="viridis",
-            extent=extent, aspect="equal",
-        )
-        ax2.set_title(self.spec["removed_label"])
-        ax2.set_xlabel(f"x ({app.spatial_units})")
-        self.figure.colorbar(im2, ax=ax2, fraction=0.046).set_label(app.z_units)
-
-        self.figure.tight_layout()
-        self.canvas.draw()
-
-
-class NotchFilterDialog(OperationDialog):
-    """
-    FFT notch filter dialog for removing specific periodic signals.
-
-    Three panels: the FFT magnitude spectrum where notches are placed by
-    clicking (left-click adds a notch at the clicked frequency, right-click
-    removes the nearest one), the filtered result, and the removed noise.
-
-    'Auto-detect peaks' finds all sharp spectral peaks outside the protected
-    center region and notches them in one go - this removes most periodic
-    signals that are not part of the low-frequency image content.
-
-    Every notch is applied symmetrically at +/-f, so clicking one peak of a
-    conjugate pair is enough.
-    """
-
-    def __init__(self, app, op_key="fft_notch"):
         self.notches = []       # list of [fx, fy] circular notches
         self.x_bands = []       # list of fx centers (vertical band notches)
         self.y_bands = []       # list of fy centers (horizontal band notches)
         self._spectrum = None
-        self._spectrum_key = None
         self._spec_ax = None
         super().__init__(app, op_key)
         self.geometry("1400x620")
@@ -1177,25 +1067,35 @@ class NotchFilterDialog(OperationDialog):
 
     def _build_params(self):
         super()._build_params()
+        self.vars["mode"].trace_add("write", lambda *a: self._sync_cutoff_state())
+        self._sync_cutoff_state()
         btns = ttk.Frame(self, padding=(8, 0, 8, 4))
         btns.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(btns, text="Auto-detect peaks", command=self.auto_detect).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(btns, text="Clear all", command=self.clear_notches).pack(
+        ttk.Button(btns, text="Clear notches", command=self.clear_notches).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Label(btns, text="Click adds:").pack(side=tk.LEFT, padx=(12, 2))
-        self.click_mode_var = tk.StringVar(value="circle")
+        ttk.Label(btns, text="Click sets:").pack(side=tk.LEFT, padx=(12, 2))
+        self.click_mode_var = tk.StringVar(value="circle notch")
         ttk.Combobox(
             btns, textvariable=self.click_mode_var,
-            values=["circle", "vertical band", "horizontal band"],
+            values=["cutoff", "circle notch", "vertical band", "horizontal band"],
             state="readonly", width=15,
         ).pack(side=tk.LEFT)
         ttk.Label(
             btns,
-            text="Left-click spectrum: add  |  Right-click: remove nearest",
+            text="Left-click spectrum: set/add  |  Right-click: remove nearest",
         ).pack(side=tk.LEFT, padx=12)
+
+    def _sync_cutoff_state(self):
+        """The cutoff entry only matters while a pass filter is selected."""
+        try:
+            on = self.vars["mode"].get() in ("lowpass", "highpass")
+        except tk.TclError:
+            return
+        self.param_widgets["cutoff"].state(["!disabled"] if on else ["disabled"])
 
     def get_params(self):
         params = super().get_params()
@@ -1211,7 +1111,6 @@ class NotchFilterDialog(OperationDialog):
         params = self._validated_params()
         if params is None:
             return
-        window, alpha = self._window_settings()
         peaks = gp.detect_fft_peaks(
             self.app.data,
             dx=self.app.dx,
@@ -1220,8 +1119,6 @@ class NotchFilterDialog(OperationDialog):
             threshold_db=params["threshold_db"],
             max_peaks=50,
             min_separation=params["radius"],
-            window=None if window == "none" else window,
-            alpha=alpha,
         )
         self.notches = [list(p) for p in peaks]
         self.status_var.set(f"{len(peaks)} peaks detected")
@@ -1239,6 +1136,19 @@ class NotchFilterDialog(OperationDialog):
         x, y = float(event.xdata), float(event.ydata)
         if event.button == 1:
             mode = self.click_mode_var.get()
+            if mode == "cutoff":
+                try:
+                    pass_on = self.vars["mode"].get() in ("lowpass", "highpass")
+                except tk.TclError:
+                    pass_on = False
+                if not pass_on:
+                    self.status_var.set(
+                        "Pick lowpass/highpass first, then click to set the cutoff"
+                    )
+                    return
+                self.vars["cutoff"].set(round(float(np.hypot(x, y)), 3))
+                # trace on the variable triggers the debounced preview update
+                return
             if mode == "vertical band":
                 self.x_bands.append(abs(x))
             elif mode == "horizontal band":
@@ -1268,8 +1178,13 @@ class NotchFilterDialog(OperationDialog):
 
     # ---- drawing ----
 
-    _window_settings = FFTFilterDialog._window_settings
-    _ensure_spectrum = FFTFilterDialog._ensure_spectrum
+    def _ensure_spectrum(self):
+        # The spectrum depends only on the data (no windowing), so it is
+        # computed once per dialog.
+        if self._spectrum is None:
+            self._spectrum = gp.get_2d_fft_magnitude(
+                self.app.data, dx=self.app.dx, dy=self.app.dy
+            )
 
     def _draw(self, result, removed):
         app = self.app
@@ -1285,17 +1200,22 @@ class NotchFilterDialog(OperationDialog):
             extent=freq_extent, aspect="equal",
         )
         n_items = len(self.notches) + len(self.x_bands) + len(self.y_bands)
-        ax0.set_title(f"Spectrum - {n_items} notches/bands")
+        ax0.set_title(f"FFT spectrum - {n_items} notches/bands")
         ax0.set_xlabel(f"fx (1/{app.spatial_units})")
         ax0.set_ylabel(f"fy (1/{app.spatial_units})")
         self.figure.colorbar(im0, ax=ax0, fraction=0.046).set_label("dB")
         self._spec_ax = ax0
 
         try:
+            pass_on = self.vars["mode"].get() in ("lowpass", "highpass")
+            cutoff = self.vars["cutoff"].get()
             radius = self.vars["radius"].get()
             protect = self.vars["protect_radius"].get()
         except tk.TclError:
-            radius, protect = None, None
+            pass_on, cutoff, radius, protect = False, None, None, None
+        if pass_on and cutoff:
+            ax0.add_patch(Circle((0, 0), cutoff, fill=False,
+                                 color="red", linewidth=1.5))
         if protect:
             ax0.add_patch(Circle((0, 0), protect, fill=False, color="lime",
                                  linewidth=1.2, linestyle="--"))
@@ -1532,7 +1452,6 @@ DIALOG_CLASSES = {
     "crop": CropDialog,
     "polynomial": PolynomialDialog,
     "fft_filter": FFTFilterDialog,
-    "fft_notch": NotchFilterDialog,
     "percentile": PercentileDialog,
 }
 
@@ -2931,9 +2850,7 @@ class GwyProcessorGUI(tk.Tk):
         """Open a window showing the current FFT magnitude spectrum."""
         if not self._require_data():
             return
-        mag, extent = gp.get_2d_fft_magnitude(
-            self.data, dx=self.dx, dy=self.dy, window="hanning"
-        )
+        mag, extent = gp.get_2d_fft_magnitude(self.data, dx=self.dx, dy=self.dy)
         win = tk.Toplevel(self)
         win.title("2D FFT magnitude")
         fig = Figure(figsize=(6, 5), dpi=100)

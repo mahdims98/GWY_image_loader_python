@@ -341,85 +341,81 @@ def remove_scars(data, threshold=3.0, min_length=5):
     return corrected_data
 
 
-def _tukey_1d(n, alpha):
-    """
-    1D Tukey (tapered cosine) window without scipy.
-
-    alpha is the fraction of the window inside the cosine taper:
-    alpha=0 -> rectangular (no window), alpha=1 -> Hann window.
-    """
-    if alpha <= 0:
-        return np.ones(n)
-    if alpha >= 1:
-        return np.hanning(n)
-    w = np.ones(n)
-    edge = int(np.floor(alpha * (n - 1) / 2.0))
-    if edge < 1:
-        return w
-    t = np.arange(0, edge + 1)
-    taper = 0.5 * (1 + np.cos(np.pi * (2.0 * t / (alpha * (n - 1)) - 1)))
-    w[:edge + 1] = taper
-    w[-(edge + 1):] = taper[::-1]
-    return w
-
-
-def make_fft_window(shape, window='hanning', alpha=0.5):
-    """
-    Builds a separable 2D window for FFT analysis.
-
-    Args:
-        shape (tuple): (ny, nx) shape of the image.
-        window (str or None): 'hanning', 'tukey', or None/'none'.
-        alpha (float): Taper fraction for the Tukey window (0..1).
-                       alpha=0 is no tapering, alpha=1 equals Hann.
-                       Ignored for 'hanning'.
-
-    Returns:
-        np.ndarray or None: The 2D window, or None if no windowing.
-    """
-    if window is None or window == 'none':
-        return None
+def _fft_freq_grids(shape, dx=1.0, dy=1.0):
+    """(FX, FY) frequency coordinate grids on the fftshift-ed layout."""
     ny, nx = shape
-    if window == 'hanning':
-        wy, wx = np.hanning(ny), np.hanning(nx)
-    elif window == 'tukey':
-        wy, wx = _tukey_1d(ny, alpha), _tukey_1d(nx, alpha)
-    else:
-        raise ValueError("Unknown window: '{}'".format(window))
-    return np.sqrt(np.outer(wy, wx))
+    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    return np.meshgrid(freq_x, freq_y)
 
 
-def get_2d_fft_magnitude(data, dx=1.0, dy=1.0, window=None, alpha=0.5):
+def get_2d_fft_magnitude(data, dx=1.0, dy=1.0):
     """
     Calculates the 2D FFT magnitude spectrum (in decibels) and frequency extents.
+
+    No window is applied, so the spectrum shown is exactly the one the FFT
+    filters operate on. The FFT is normalized by the number of pixels: the
+    DC bin holds the mean value of the image and the dB scale is
+    independent of the image size.
 
     Args:
         data (np.ndarray): 2D numpy array.
         dx (float): Pixel size in x.
         dy (float): Pixel size in y.
-        window (str, optional): Windowing function: 'hanning', 'tukey' or None.
-        alpha (float): Taper fraction for the Tukey window (0..1).
+
+    Returns:
+        (np.ndarray, list): The dB magnitude on the fftshift-ed grid and
+        the matching [left, right, bottom, top] extent for an
+        origin='upper' imshow. The extent runs along the frequency-bin
+        EDGES (each bin is drawn centred on its frequency), so cursor
+        coordinates on the plot map exactly onto bin frequencies.
     """
     ny, nx = data.shape
-    w2d = make_fft_window((ny, nx), window, alpha)
-    if w2d is not None:
-        data = data * w2d
-
-    f = np.fft.fft2(data)
-    fshift = np.fft.fftshift(f)
-    magnitude_spectrum = 20 * np.log10(np.abs(fshift) + 1e-8)
+    fshift = np.fft.fftshift(np.fft.fft2(data)) / (nx * ny)
+    magnitude_spectrum = 20 * np.log10(np.abs(fshift) + 1e-12)
 
     freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
     freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
-
-    extent = [freq_x[0], freq_x[-1], freq_y[-1], freq_y[0]]
+    hx = 0.5 / (nx * dx)   # half a frequency bin
+    hy = 0.5 / (ny * dy)
+    extent = [freq_x[0] - hx, freq_x[-1] + hx,
+              freq_y[-1] + hy, freq_y[0] - hy]
     return magnitude_spectrum, extent
 
 
-def filter_by_2d_fft(data, cutoff_freq, mode='lowpass', dx=1.0, dy=1.0,
-                     window=None, alpha=0.5):
+def build_pass_mask(shape, dx=1.0, dy=1.0, mode='lowpass', cutoff=10.0):
     """
-    Applies a basic 2D FFT lowpass or highpass filter.
+    Builds a boolean frequency-domain mask for a radial lowpass or
+    highpass filter, on the fftshift-ed grid (matching
+    `filter_by_2d_fft_mask`).
+
+    The DC bin is always kept, so a highpass filters the texture without
+    shifting the mean height of the image.
+
+    Args:
+        shape (tuple): (ny, nx) shape of the image.
+        dx (float): Pixel size in x.
+        dy (float): Pixel size in y.
+        mode (str): 'lowpass' or 'highpass'.
+        cutoff (float): Cutoff frequency in the same inverse units as dx/dy.
+
+    Returns:
+        np.ndarray: Boolean mask (True = keep frequency).
+    """
+    FX, FY = _fft_freq_grids(shape, dx, dy)
+    F_dist = np.sqrt(FX**2 + FY**2)
+    if mode == 'lowpass':
+        return F_dist <= cutoff
+    if mode == 'highpass':
+        mask = F_dist > cutoff
+        mask[F_dist == 0] = True   # keep the mean height
+        return mask
+    raise ValueError("Unknown mode: '{}'".format(mode))
+
+
+def filter_by_2d_fft(data, cutoff_freq, mode='lowpass', dx=1.0, dy=1.0):
+    """
+    Applies a hard radial 2D FFT lowpass or highpass filter.
 
     Args:
         data (np.ndarray): 2D numpy array.
@@ -427,64 +423,37 @@ def filter_by_2d_fft(data, cutoff_freq, mode='lowpass', dx=1.0, dy=1.0,
         mode (str): 'lowpass' or 'highpass'.
         dx (float): Pixel size in x.
         dy (float): Pixel size in y.
-        window (str, optional): Windowing function: 'hanning', 'tukey' or None.
-        alpha (float): Taper fraction for the Tukey window (0..1).
 
     Returns:
         np.ndarray: The filtered data.
     """
-    ny, nx = data.shape
-    original_mean = data.mean()
-
-    w2d = make_fft_window((ny, nx), window, alpha)
-    if w2d is not None:
-        data = data * w2d
-
-    f = np.fft.fft2(data)
-    fshift = np.fft.fftshift(f)
-
-    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
-    FX, FY = np.meshgrid(freq_x, freq_y)
-    F_dist = np.sqrt(FX**2 + FY**2)
-
-    mask = F_dist <= cutoff_freq if mode == 'lowpass' else F_dist > cutoff_freq
-
-    fshift_filtered = fshift * mask
-    img_back = np.fft.ifft2(np.fft.ifftshift(fshift_filtered))
-
-    # Correct for amplitude loss from windowing and restore mean
-    filtered_data = np.real(img_back)
-    if w2d is not None:
-        # The window reduces the total power. We need to compensate.
-        # A simple approach for visualization is to rescale to the original mean.
-        filtered_data = filtered_data * (1.0 / w2d.mean())
-        filtered_data = filtered_data - filtered_data.mean() + original_mean
-
-    return filtered_data
+    mask = build_pass_mask(data.shape, dx=dx, dy=dy,
+                           mode=mode, cutoff=cutoff_freq)
+    return filter_by_2d_fft_mask(data, mask)
 
 
-def filter_by_2d_fft_mask(data, mask, window=None):
+def filter_by_2d_fft_mask(data, mask):
     """
-    Applies a user-defined mask in the frequency domain.
-    This is useful for removing specific periodic noise (notch filtering).
+    Keeps only the frequencies where `mask` is True and transforms back.
+    This is the single code path every FFT filter goes through
+    (lowpass/highpass via `build_pass_mask`, notches via
+    `build_notch_mask`, bands via `build_band_mask` - masks combine
+    with `&`).
 
     Args:
         data (np.ndarray): 2D numpy array.
-        mask (np.ndarray): A 2D boolean or binary array of the same shape as data.
-                           Frequencies where the mask is True (or 1) will be kept.
-                           Frequencies where the mask is False (or 0) will be removed.
-        window (str, optional): The windowing function to apply.
-                                Currently supports 'hanning'. Defaults to None.
+        mask (np.ndarray): A 2D boolean or binary array of the same shape
+                           as data, on the fftshift-ed frequency grid.
+                           It must be point-symmetric about the origin so
+                           the filtered image stays real (every mask
+                           builder here is); the numerically tiny
+                           imaginary residue is discarded.
+
     Returns:
         np.ndarray: The filtered data.
     """
-    # The logic for windowing, FFT, applying mask, and inverse FFT would be
-    # very similar to `filter_by_2d_fft`. For brevity, the core step is shown.
-    f = np.fft.fft2(data)
-    fshift = np.fft.fftshift(f)
-    fshift_filtered = fshift * mask
-    img_back = np.fft.ifft2(np.fft.ifftshift(fshift_filtered))
+    fshift = np.fft.fftshift(np.fft.fft2(data))
+    img_back = np.fft.ifft2(np.fft.ifftshift(fshift * mask))
     return np.real(img_back)
 
 
@@ -509,10 +478,7 @@ def build_notch_mask(shape, dx=1.0, dy=1.0, notches=(), radius=0.1):
     Returns:
         np.ndarray: Boolean mask (True = keep frequency).
     """
-    ny, nx = shape
-    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
-    FX, FY = np.meshgrid(freq_x, freq_y)
+    FX, FY = _fft_freq_grids(shape, dx, dy)
 
     mask = np.ones(shape, dtype=bool)
     for nfx, nfy in notches:
@@ -545,10 +511,7 @@ def build_band_mask(shape, dx=1.0, dy=1.0, x_bands=(), y_bands=(), half_width=0.
         np.ndarray: Boolean mask (True = keep frequency), on the
                     fftshift-ed grid, matching `filter_by_2d_fft_mask`.
     """
-    ny, nx = shape
-    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
-    FX, FY = np.meshgrid(freq_x, freq_y)
+    FX, FY = _fft_freq_grids(shape, dx, dy)
 
     mask = np.ones(shape, dtype=bool)
     for c in x_bands:
@@ -559,8 +522,7 @@ def build_band_mask(shape, dx=1.0, dy=1.0, x_bands=(), y_bands=(), half_width=0.
 
 
 def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
-                     threshold_db=20.0, max_peaks=50, min_separation=None,
-                     window='hanning', alpha=0.5):
+                     threshold_db=20.0, max_peaks=50, min_separation=None):
     """
     Detects sharp peaks in the 2D FFT magnitude spectrum (periodic noise).
 
@@ -583,26 +545,16 @@ def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
         max_peaks (int): Maximum number of peaks to return.
         min_separation (float): Minimum distance between reported peaks.
                                 Defaults to ~3 frequency pixels.
-        window (str, optional): Windowing before the FFT
-                                ('hanning', 'tukey' or None).
-        alpha (float): Taper fraction for the Tukey window (0..1).
 
     Returns:
         list of (fx, fy): Detected peak positions, strongest first. Only one
                           of each conjugate +/- pair is returned.
     """
     ny, nx = data.shape
-    d = data
-    w2d = make_fft_window((ny, nx), window, alpha)
-    if w2d is not None:
-        d = data * w2d
-
-    fshift = np.fft.fftshift(np.fft.fft2(d))
+    fshift = np.fft.fftshift(np.fft.fft2(data)) / (nx * ny)
     mag_db = 20 * np.log10(np.abs(fshift) + 1e-12)
 
-    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
-    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
-    FX, FY = np.meshgrid(freq_x, freq_y)
+    FX, FY = _fft_freq_grids((ny, nx), dx, dy)
     F_dist = np.sqrt(FX**2 + FY**2)
 
     background = np.median(mag_db)
@@ -623,8 +575,8 @@ def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
         return []
 
     if min_separation is None:
-        dfx = freq_x[1] - freq_x[0] if nx > 1 else 1.0
-        dfy = freq_y[1] - freq_y[0] if ny > 1 else 1.0
+        dfx = 1.0 / (nx * dx) if nx > 1 else 1.0
+        dfy = 1.0 / (ny * dy) if ny > 1 else 1.0
         min_separation = 3.0 * max(dfx, dfy)
 
     order = np.argsort(mag_db[ys, xs])[::-1]
@@ -777,7 +729,7 @@ def plot_2d_fft(
     freq_units="1/units"
 ):
     """Plots the 2D FFT magnitude spectrum."""
-    magnitude_spectrum, extent = get_2d_fft_magnitude(data, dx, dy, window='hanning')
+    magnitude_spectrum, extent = get_2d_fft_magnitude(data, dx, dy)
     
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(
@@ -856,7 +808,7 @@ if __name__ == "__main__":
 
         # Step 8: Apply and plot a lowpass filter
         print("\nApplying lowpass FFT filter (cutoff = 10 1/µm)...")
-        filtered_height = filter_by_2d_fft(final_height_data, cutoff_freq=10.0, mode='lowpass', dx=dx_um, dy=dy_um, window='hanning')
+        filtered_height = filter_by_2d_fft(final_height_data, cutoff_freq=10.0, mode='lowpass', dx=dx_um, dy=dy_um)
         
         plot_image(
             data=filtered_height * 1e9,
