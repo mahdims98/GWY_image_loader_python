@@ -44,7 +44,7 @@ from matplotlib.backends.backend_tkagg import (
     NavigationToolbar2Tk,
 )
 from matplotlib.figure import Figure
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import RectangleSelector, SpanSelector
 
 import gwy_loader
@@ -1389,6 +1389,44 @@ DIALOG_CLASSES = {
 }
 
 
+class ZoomWindow(tk.Toplevel):
+    """A large side-by-side view of one region of the forward, backward, and
+    merged images, so edges can be inspected close up. The region is picked
+    by dragging a rectangle on the Forward panel of the parent dialog; until
+    one is picked the full images are shown. The three views share one color
+    scale so heights are directly comparable, and the window follows every
+    preview update and display-leveling change."""
+
+    def __init__(self, dialog):
+        super().__init__(dialog)
+        self.title("Zoom - drag a rectangle on the Forward panel "
+                   "to pick the area")
+        self.geometry("1500x600")
+        self.figure = Figure(figsize=(15, 5.4), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+    def show(self, panels, extent, subtitle, z_units):
+        """panels: [(title, image), ...], all the same shape."""
+        self.figure.clf()
+        axes = np.atleast_1d(self.figure.subplots(1, len(panels)))
+        allv = np.concatenate([img.ravel() for _, img in panels])
+        v0, v1 = np.percentile(allv, [0.5, 99.5])
+        if v1 <= v0:
+            v1 = v0 + 1.0
+        cmap = gp.get_gwyddion_cmap()
+        im = None
+        for ax, (title, img) in zip(axes, panels):
+            im = ax.imshow(img, origin="upper", cmap=cmap, extent=extent,
+                           aspect="equal", vmin=v0, vmax=v1)
+            ax.set_title(title, fontsize=10)
+        self.figure.colorbar(im, ax=list(axes), fraction=0.03,
+                             pad=0.02).set_label(z_units)
+        self.figure.suptitle(subtitle, fontsize=10)
+        self.canvas.draw()
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -1432,6 +1470,9 @@ class TwoWayDialog(tk.Toplevel):
         self.vars = {}
         self.result = None
         self._last_params = None
+        self._zoom_rect = None      # (x0, x1, y0, y1) in physical units
+        self._zoom_win = None
+        self._zoom_selector = None
 
         self.fwd_title, self.bwd_title = gtw.find_pair(
             app.channels, app.channel_var.get())
@@ -1541,7 +1582,6 @@ class TwoWayDialog(tk.Toplevel):
         self.display_plane = tk.BooleanVar(value=True)
         self.display_rows = tk.BooleanVar(value=False)
         self.display_rows_order = tk.IntVar(value=2)
-        self.display_level_scope = tk.StringVar(value="per image")
 
         ttk.Label(frame, text="Plane level:").grid(
             row=row0, column=0, sticky=tk.W, padx=(0, 6), pady=1)
@@ -1555,13 +1595,11 @@ class TwoWayDialog(tk.Toplevel):
         ttk.Spinbox(inner, from_=0, to=10, width=3,
                     textvariable=self.display_rows_order).pack(
             side=tk.LEFT, padx=(4, 0))
-        ttk.Label(frame, text="Level fit:").grid(
-            row=row0 + 2, column=0, sticky=tk.W, padx=(0, 6), pady=1)
-        ttk.Combobox(frame, textvariable=self.display_level_scope,
-                     values=["per image", "shared (fwd)"], state="readonly",
-                     width=12).grid(row=row0 + 2, column=1, sticky=tk.W, pady=1)
+        ttk.Button(frame, text="Zoom window...",
+                   command=self.open_zoom_window).grid(
+            row=row0 + 2, column=0, columnspan=2, sticky=tk.EW, pady=(4, 1))
         for var in (self.display_plane, self.display_rows,
-                    self.display_rows_order, self.display_level_scope):
+                    self.display_rows_order):
             var.trace_add("write", self._on_display_change)
 
     def _on_display_change(self, *args):
@@ -1774,12 +1812,10 @@ class TwoWayDialog(tk.Toplevel):
         """The forward, backward, and merged images as shown in the panels.
 
         Display-only leveling for observing the features: 'Plane level'
-        subtracts a fitted plane and 'Row align (poly)' additionally subtracts
-        a per-row polynomial background of the chosen order. 'Level fit'
-        chooses whether each panel gets its own fit ('per image') or all three
-        share the forward image's fit ('shared (fwd)' - keeps the panels
-        mutually comparable, e.g. for the difference view). The data that gets
-        applied or saved is never leveled here."""
+        subtracts each panel's own fitted plane and 'Row align (poly)'
+        additionally subtracts each panel's own per-row polynomial background
+        of the chosen order. The data that gets applied or saved is never
+        leveled here."""
         res = self.result
         images = [res.fwd, res.bwd, res.merged]
         tags = []
@@ -1788,29 +1824,113 @@ class TwoWayDialog(tk.Toplevel):
             order = int(self.display_rows_order.get())
         except tk.TclError:
             rows_on, order = False, 2   # spinbox mid-typing
-        per_image = self.display_level_scope.get() == "per image"
         if self.display_plane.get():
-            if per_image:
-                images = [img - gtw.fit_plane(img) for img in images]
-            else:
-                plane = gtw.fit_plane(images[0])
-                images = [img - plane for img in images]
+            images = [img - gtw.fit_plane(img) for img in images]
             tags.append("plane")
         if rows_on:
-            if per_image:
-                images = [img - gtw.fit_rows_poly(img, order)
-                          for img in images]
-            else:
-                background = gtw.fit_rows_poly(images[0], order)
-                images = [img - background for img in images]
+            images = [img - gtw.fit_rows_poly(img, order) for img in images]
             tags.append(f"rows p{order}")
-        if tags:
-            scope = "per image" if per_image else "shared"
-            tag = f" ({' + '.join(tags)} leveled, {scope})"
-        else:
-            tag = ""
+        tag = f" ({' + '.join(tags)} leveled)" if tags else ""
         fwd, bwd, merged = images
         return fwd, bwd, merged, tag
+
+    # ---- Zoom on a selected area ----
+
+    def open_zoom_window(self):
+        """Open (or raise) the large zoom view of the selected area."""
+        if self._zoom_win is None or not self._zoom_win.winfo_exists():
+            self._zoom_win = ZoomWindow(self)
+        else:
+            self._zoom_win.lift()
+        self._update_zoom_window()
+
+    def _attach_zoom_selector(self, ax):
+        """Drag-to-select on the Forward panel; the rectangle is shown big
+        in the zoom window. Re-created on every draw (figure was cleared)."""
+        try:
+            self._zoom_selector = RectangleSelector(
+                ax, self._on_zoom_select, useblit=True, button=[1],
+                props=dict(fill=False, edgecolor="red", linestyle="--"),
+            )
+        except TypeError:
+            # Older matplotlib uses `rectprops`
+            self._zoom_selector = RectangleSelector(
+                ax, self._on_zoom_select, useblit=True, button=[1],
+                rectprops=dict(fill=False, edgecolor="red", linestyle="--"),
+            )
+
+    def _on_zoom_select(self, eclick, erelease):
+        toolbar = getattr(self.canvas, "toolbar", None)
+        if toolbar is not None and getattr(toolbar, "mode", ""):
+            return              # pan/zoom tool active - not a selection
+        coords = (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata)
+        if any(c is None for c in coords):
+            return
+        x0, x1 = sorted(coords[:2])
+        y0, y1 = sorted(coords[2:])
+        if (x1 - x0) < 2 * self.app.dx or (y1 - y0) < 2 * self.app.dy:
+            return              # a click, not a drag
+        self._zoom_rect = (x0, x1, y0, y1)
+        self.open_zoom_window()
+        self._draw(self._last_params)   # re-render to outline the area
+
+    def _zoom_slices(self, shape):
+        """The pixel rows/columns of the current zoom rectangle, or None for
+        the full image (images are drawn with origin='upper', so pixel row 0
+        sits at the TOP of the physical extent)."""
+        if self._zoom_rect is None:
+            return None
+        ny, nx = shape
+        dx, dy = self.app.dx, self.app.dy
+        x0, x1, y0, y1 = self._zoom_rect
+        ix0 = max(0, int(np.floor(x0 / dx)))
+        ix1 = min(nx, int(np.ceil(x1 / dx)))
+        iy0 = max(0, int(np.floor(ny - y1 / dy)))
+        iy1 = min(ny, int(np.ceil(ny - y0 / dy)))
+        if ix1 - ix0 < 2 or iy1 - iy0 < 2:
+            return None
+        return slice(iy0, iy1), slice(ix0, ix1)
+
+    def _update_zoom_window(self):
+        if (self._zoom_win is None or not self._zoom_win.winfo_exists()
+                or self.result is None):
+            return
+        fwd_d, bwd_d, merged_d, tag = self._display_images()
+        sl = self._zoom_slices(fwd_d.shape)
+        if sl is None:
+            crops = [fwd_d, bwd_d, merged_d]
+            extent = self._extent_of(fwd_d)
+            where = "full image (drag on the Forward panel to pick an area)"
+        else:
+            rows, cols = sl
+            crops = [fwd_d[rows, cols], bwd_d[rows, cols],
+                     merged_d[rows, cols]]
+            ny = fwd_d.shape[0]
+            dx, dy = self.app.dx, self.app.dy
+            extent = (cols.start * dx, cols.stop * dx,
+                      (ny - rows.stop) * dy, (ny - rows.start) * dy)
+            where = (f"area {cols.stop - cols.start}x{rows.stop - rows.start}"
+                     f" px at ({extent[0]:.3g}, {extent[2]:.3g}) "
+                     f"{self.app.spatial_units}")
+        titles = [f"Forward ({self.fwd_title})", "Backward, aligned", "Merged"]
+        self._zoom_win.show(list(zip(titles, crops)), extent,
+                            f"{where}{tag}", self.app.z_units)
+
+    def _mark_zoom_rect(self, *axes):
+        """Outline the zoomed area on the dialog's own image panels."""
+        if self._zoom_rect is None:
+            return
+        x0, x1, y0, y1 = self._zoom_rect
+        for ax in axes:
+            ax.add_patch(Rectangle(
+                (x0, y0), x1 - x0, y1 - y0, fill=False,
+                edgecolor="red", lw=1.2))
+
+    def destroy(self):
+        if getattr(self, "_zoom_win", None) is not None \
+                and self._zoom_win.winfo_exists():
+            self._zoom_win.destroy()
+        super().destroy()
 
     def _set_info(self):
         a = self.result.alignment
@@ -1840,9 +1960,12 @@ class TwoWayDialog(tk.Toplevel):
         self._image_panel(axes[1, 2], res.fwd - res.merged,
                           self.spec["removed_label"], symmetric=True)
 
+        self._mark_zoom_rect(axes[0, 0], axes[0, 1], axes[1, 1])
+        self._attach_zoom_selector(axes[0, 0])
         self.figure.tight_layout()
         self.canvas.draw()
         self._set_info()
+        self._update_zoom_window()
 
     # ---- Apply ----
 
@@ -1969,9 +2092,12 @@ class ParachuteDialog(TwoWayDialog):
         self._image_panel(axes[1, 2], res.fwd - res.merged,
                           self.spec["removed_label"], symmetric=True)
 
+        self._mark_zoom_rect(axes[1, 0], axes[1, 1])
+        self._attach_zoom_selector(axes[1, 0])
         self.figure.tight_layout()
         self.canvas.draw()
         self._set_info()
+        self._update_zoom_window()
 
 
 DIALOG_CLASSES["two_way"] = TwoWayDialog
