@@ -1515,7 +1515,6 @@ class TwoWayDialog(tk.Toplevel):
         self.overlay_style = tk.StringVar(value="blend")
         self.overlay_alpha = tk.DoubleVar(value=0.5)
         self.curve_view = tk.StringVar(value="mapping (0-1)")
-        self.display_plane = tk.BooleanVar(value=True)
 
         ttk.Label(frame, text="Overlay:").grid(row=0, column=0, sticky=tk.W,
                                                padx=(0, 6), pady=1)
@@ -1542,6 +1541,7 @@ class TwoWayDialog(tk.Toplevel):
         self.display_plane = tk.BooleanVar(value=True)
         self.display_rows = tk.BooleanVar(value=False)
         self.display_rows_order = tk.IntVar(value=2)
+        self.display_level_scope = tk.StringVar(value="per image")
 
         ttk.Label(frame, text="Plane level:").grid(
             row=row0, column=0, sticky=tk.W, padx=(0, 6), pady=1)
@@ -1555,8 +1555,13 @@ class TwoWayDialog(tk.Toplevel):
         ttk.Spinbox(inner, from_=0, to=10, width=3,
                     textvariable=self.display_rows_order).pack(
             side=tk.LEFT, padx=(4, 0))
+        ttk.Label(frame, text="Level fit:").grid(
+            row=row0 + 2, column=0, sticky=tk.W, padx=(0, 6), pady=1)
+        ttk.Combobox(frame, textvariable=self.display_level_scope,
+                     values=["per image", "shared (fwd)"], state="readonly",
+                     width=12).grid(row=row0 + 2, column=1, sticky=tk.W, pady=1)
         for var in (self.display_plane, self.display_rows,
-                    self.display_rows_order):
+                    self.display_rows_order, self.display_level_scope):
             var.trace_add("write", self._on_display_change)
 
     def _on_display_change(self, *args):
@@ -1769,31 +1774,42 @@ class TwoWayDialog(tk.Toplevel):
         """The forward, backward, and merged images as shown in the panels.
 
         Display-only leveling for observing the features: 'Plane level'
-        subtracts ONE plane fitted to the forward image, and 'Row align
-        (poly)' additionally subtracts the forward image's per-row polynomial
-        background of the chosen order. Both corrections come from the forward
-        image alone and are applied identically to all three panels, so they
-        stay mutually comparable. The data that gets applied or saved is never
-        leveled here."""
+        subtracts a fitted plane and 'Row align (poly)' additionally subtracts
+        a per-row polynomial background of the chosen order. 'Level fit'
+        chooses whether each panel gets its own fit ('per image') or all three
+        share the forward image's fit ('shared (fwd)' - keeps the panels
+        mutually comparable, e.g. for the difference view). The data that gets
+        applied or saved is never leveled here."""
         res = self.result
-        fwd, bwd, merged = res.fwd, res.bwd, res.merged
+        images = [res.fwd, res.bwd, res.merged]
         tags = []
-        if self.display_plane.get():
-            plane = gtw.fit_plane(fwd)
-            fwd, bwd, merged = fwd - plane, bwd - plane, merged - plane
-            tags.append("plane")
         try:
             rows_on = self.display_rows.get()
             order = int(self.display_rows_order.get())
         except tk.TclError:
             rows_on, order = False, 2   # spinbox mid-typing
+        per_image = self.display_level_scope.get() == "per image"
+        if self.display_plane.get():
+            if per_image:
+                images = [img - gtw.fit_plane(img) for img in images]
+            else:
+                plane = gtw.fit_plane(images[0])
+                images = [img - plane for img in images]
+            tags.append("plane")
         if rows_on:
-            background = gtw.fit_rows_poly(fwd, order)
-            fwd = fwd - background
-            bwd = bwd - background
-            merged = merged - background
+            if per_image:
+                images = [img - gtw.fit_rows_poly(img, order)
+                          for img in images]
+            else:
+                background = gtw.fit_rows_poly(images[0], order)
+                images = [img - background for img in images]
             tags.append(f"rows p{order}")
-        tag = f" ({' + '.join(tags)} leveled)" if tags else ""
+        if tags:
+            scope = "per image" if per_image else "shared"
+            tag = f" ({' + '.join(tags)} leveled, {scope})"
+        else:
+            tag = ""
+        fwd, bwd, merged = images
         return fwd, bwd, merged, tag
 
     def _set_info(self):
