@@ -87,24 +87,17 @@ def _op_percentile(data, params, dx, dy):
 
 
 def _fft_auto_items(data, params, dx, dy):
-    """Auto-detect spectral noise on `data`: connected regions of excess
-    power become circular notches when compact (a few bins) and
-    rectangles when extended. Returns (notches, rects)."""
-    regions = gp.detect_fft_regions(
+    """Auto-detect spectral noise on `data` against its local radial
+    background (gp.detect_fft_noise): streak columns/rows and extended
+    patches become rectangles, sharp peaks circular notches.
+    Returns (notches, rects)."""
+    notches, rects = gp.detect_fft_noise(
         data, dx=dx, dy=dy,
         protect_radius=params.get("protect_radius", 3.0),
-        threshold_db=params.get("threshold_db", 15.0),
-        max_regions=50,
+        peak_db=params.get("threshold_db", 12.0),
+        max_items=50,
     )
-    ny, nx = data.shape
-    compact = 4.0 * max(1.0 / (nx * dx), 1.0 / (ny * dy))
-    notches, rects = [], []
-    for fx, fy, wx, wy in regions:
-        if wx <= compact and wy <= compact:
-            notches.append([fx, fy])
-        else:
-            rects.append([fx, fy, wx, wy])
-    return notches, rects
+    return [list(n) for n in notches], [list(r) for r in rects]
 
 
 def _op_fft(data, params, dx, dy):
@@ -499,7 +492,7 @@ OPERATIONS = {
             {"name": "radius", "label": "Notch radius", "type": "float",
              "default": 0.5, "min": 0.0, "max": 1e9},
             {"name": "threshold_db", "label": "Detect threshold (dB)", "type": "float",
-             "default": 15.0, "min": 0.0, "max": 200.0},
+             "default": 12.0, "min": 0.0, "max": 200.0},
             {"name": "protect_radius", "label": "Protect center radius", "type": "float",
              "default": 3.0, "min": 0.0, "max": 1e9},
             {"name": "smooth", "label": "Edge smoothing (freq)", "type": "float",

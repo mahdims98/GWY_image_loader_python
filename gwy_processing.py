@@ -580,165 +580,245 @@ def smooth_fft_mask(mask, dx=1.0, dy=1.0, width=0.0):
     return ndimage.gaussian_filter(mask.astype(float), sigma, mode="nearest")
 
 
-def detect_fft_peaks(data, dx=1.0, dy=1.0, protect_radius=0.0,
-                     threshold_db=20.0, max_peaks=50, min_separation=None):
+def fft_excess_db(data, dx=1.0, dy=1.0, apodize=True):
     """
-    Detects sharp peaks in the 2D FFT magnitude spectrum (periodic noise).
+    dB magnitude of the spectrum ABOVE its local radial background.
 
-    A pixel is considered a peak candidate when its magnitude (in dB)
-    exceeds the spectrum median by `threshold_db` AND it is a local maximum
-    in its 3x3 neighbourhood AND it lies outside the central low-frequency
-    region of radius `protect_radius`.
+    The magnitude spectrum of real topography falls off smoothly with
+    |f|, so a fixed threshold on the raw spectrum flags the whole low-
+    and mid-frequency image content. Instead the background is estimated
+    as the median dB magnitude in annuli of constant |f| (the median is
+    robust against the noise features themselves), lightly smoothed
+    along the radius, and subtracted. The result is ~0 dB wherever the
+    spectrum is ordinary, and positive where something sticks out of it.
 
-    Candidates are then accepted strongest-first, skipping any candidate
-    closer than `min_separation` to an already accepted peak (or to its
-    mirrored counterpart, since conjugate peaks come in +/- pairs).
+    With `apodize` (default) the mean is removed and a Hann window is
+    applied before the FFT, for THIS ANALYSIS ONLY: the image boundaries
+    are not periodic, and the wrap-around jumps otherwise leak power
+    into a wide cross along both frequency axes that buries real
+    features near the axes. Nothing here ever windows the data being
+    filtered - the excess map is used to FIND noise, not to remove it.
+
+    Args:
+        data (np.ndarray): 2D numpy array.
+        dx (float): Pixel size in x.
+        dy (float): Pixel size in y.
+        apodize (bool): Suppress boundary leakage before the analysis.
+
+    Returns:
+        (np.ndarray, list): The excess map on the fftshift-ed grid and
+        the matching imshow extent (as in `get_2d_fft_magnitude`).
+    """
+    ny, nx = data.shape
+    if apodize:
+        d = (data - data.mean()) * np.outer(np.hanning(ny), np.hanning(nx))
+    else:
+        d = data
+    fshift = np.fft.fftshift(np.fft.fft2(d)) / (nx * ny)
+    mag_db = 20 * np.log10(np.abs(fshift) + 1e-12)
+    hx, hy = 0.5 / (nx * dx), 0.5 / (ny * dy)
+    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=dx))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=dy))
+    extent = [freq_x[0] - hx, freq_x[-1] + hx,
+              freq_y[-1] + hy, freq_y[0] - hy]
+
+    FX, FY = _fft_freq_grids((ny, nx), dx, dy)
+    r_phys = np.hypot(FX, FY)
+    n_annuli = max(ny, nx) // 2
+    r_idx = np.minimum((r_phys / r_phys.max() * n_annuli).astype(int),
+                       n_annuli).ravel()
+
+    order = np.argsort(r_idx, kind="stable")
+    r_sorted = r_idx[order]
+    v_sorted = mag_db.ravel()[order]
+    edges = np.searchsorted(r_sorted, np.arange(n_annuli + 2))
+    profile = np.full(n_annuli + 1, np.nan)
+    for k in range(n_annuli + 1):
+        if edges[k + 1] > edges[k]:
+            profile[k] = np.median(v_sorted[edges[k]:edges[k + 1]])
+    good = np.flatnonzero(~np.isnan(profile))
+    profile = np.interp(np.arange(profile.size), good, profile[good])
+    profile = ndimage.median_filter(profile, size=5, mode="nearest")
+
+    background = profile[r_idx].reshape(ny, nx)
+    return mag_db - background, extent
+
+
+def detect_fft_noise(data, dx=1.0, dy=1.0, protect_radius=0.0,
+                     peak_db=12.0, streak_db=None, max_items=50, pad=1):
+    """
+    Systematic detection of periodic noise in the 2D FFT spectrum.
+
+    Everything is measured on the EXCESS spectrum (`fft_excess_db`): the
+    dB magnitude above the local radial background. Real topography sits
+    near zero excess whatever its shape, so only genuinely anomalous
+    power is reported. Three kinds of noise are searched for, each with
+    its own statistically matched test:
+
+    1. STREAKS - noise with a fixed frequency along one scan axis but no
+       phase coherence in the other direction fills a whole column (or
+       row) of the spectrum. A column/row is a streak when the MEDIAN
+       excess along it exceeds `streak_db`: the median over hundreds of
+       bins is a very stable statistic, so a consistent streak only a
+       few dB high is detected while no isolated feature can trigger
+       it. Adjacent streak columns/rows are merged and reported as one
+       full-height (full-width) rectangle.
+    2. AXIS PEAKS - interference that IS phase-coherent from line to
+       line sits exactly on the fy=0 axis (or fx=0). Those axes carry
+       real directional image content, so each is compared against its
+       own running median; sharp local peaks more than `peak_db` above
+       it become circular notches.
+    3. OFF-AXIS REGIONS - 8-connected patches of bins with excess above
+       `peak_db`, with the axes, the protected center and the detected
+       streaks excluded. Compact patches (up to ~4 bins across) become
+       circular notches, extended ones bounding-box rectangles padded
+       by `pad` bins.
+
+    Anything centered within `protect_radius` of the origin, or whose
+    box would cover the origin (the central cross), is dropped. Only one
+    member of each conjugate +/- pair is returned.
 
     Args:
         data (np.ndarray): 2D image data.
         dx, dy (float): Pixel sizes.
-        protect_radius (float): Frequencies within this radius of the origin
-                                are never reported (protects the actual image
-                                content around DC).
-        threshold_db (float): Peak height above the spectrum median, in dB.
-        max_peaks (int): Maximum number of peaks to return.
-        min_separation (float): Minimum distance between reported peaks.
-                                Defaults to ~3 frequency pixels.
+        protect_radius (float): Protected low-frequency radius.
+        peak_db (float): Excess threshold for axis peaks and regions.
+        streak_db (float): Median-excess threshold for streaks. Defaults
+                           to peak_db / 4, at least 2 dB.
+        max_items (int): Maximum total number of items returned.
+        pad (int): Bins added around each streak / region bounding box.
 
     Returns:
-        list of (fx, fy): Detected peak positions, strongest first. Only one
-                          of each conjugate +/- pair is returned.
+        (notches, rects): notches is a list of (fx, fy) circular-notch
+        centers, rects a list of (fx, fy, wx, wy) rectangles (center
+        and full widths); both sorted strongest first.
     """
     ny, nx = data.shape
-    fshift = np.fft.fftshift(np.fft.fft2(data)) / (nx * ny)
-    mag_db = 20 * np.log10(np.abs(fshift) + 1e-12)
-
+    excess, _ = fft_excess_db(data, dx, dy)
     FX, FY = _fft_freq_grids((ny, nx), dx, dy)
-    F_dist = np.sqrt(FX**2 + FY**2)
-
-    background = np.median(mag_db)
-    candidates = (mag_db > background + threshold_db) & (F_dist > protect_radius)
-
-    # Local maximum in the 3x3 neighbourhood (edges wrap, which is harmless
-    # here since the spectrum decays toward Nyquist).
-    local_max = np.ones((ny, nx), dtype=bool)
-    for sy in (-1, 0, 1):
-        for sx in (-1, 0, 1):
-            if sx == 0 and sy == 0:
-                continue
-            local_max &= mag_db >= np.roll(np.roll(mag_db, sy, axis=0), sx, axis=1)
-
-    peak_mask = candidates & local_max
-    ys, xs = np.nonzero(peak_mask)
-    if len(ys) == 0:
-        return []
-
-    if min_separation is None:
-        dfx = 1.0 / (nx * dx) if nx > 1 else 1.0
-        dfy = 1.0 / (ny * dy) if ny > 1 else 1.0
-        min_separation = 3.0 * max(dfx, dfy)
-
-    order = np.argsort(mag_db[ys, xs])[::-1]
-    peaks = []
-    for idx in order:
-        fx_, fy_ = float(FX[ys[idx], xs[idx]]), float(FY[ys[idx], xs[idx]])
-        too_close = any(
-            (fx_ - px) ** 2 + (fy_ - py) ** 2 < min_separation**2
-            or (fx_ + px) ** 2 + (fy_ + py) ** 2 < min_separation**2
-            for px, py in peaks
-        )
-        if too_close:
-            continue
-        peaks.append((fx_, fy_))
-        if len(peaks) >= max_peaks:
-            break
-    return peaks
-
-
-def detect_fft_regions(data, dx=1.0, dy=1.0, protect_radius=0.0,
-                       threshold_db=20.0, max_regions=50, pad=1):
-    """
-    Detects connected regions of excess power in the 2D FFT magnitude
-    spectrum and returns their bounding rectangles.
-
-    This complements `detect_fft_peaks`: a single-frequency interference
-    is one sharp bin, but periodic noise often fills an extended patch or
-    streak of the spectrum. A bin belongs to a region when its magnitude
-    exceeds the spectrum median by `threshold_db` and it lies outside the
-    protected center; 8-connected bins are grouped into one region, and
-    each region is reported as its frequency bounding box grown by `pad`
-    bins on every side.
-
-    Compact regions (a few bins) are sharp peaks; extended ones are the
-    rectangles/streaks. The caller decides how to treat each size.
-
-    Regions whose padded bounding box would cover the origin are dropped:
-    they are dominated by the central cross / low-frequency image content
-    (use straight bands for the cross), and notching them would take the
-    actual topography with them.
-
-    Args:
-        data (np.ndarray): 2D image data.
-        dx, dy (float): Pixel sizes.
-        protect_radius (float): Frequencies within this radius of the
-                                origin are never part of a region.
-        threshold_db (float): Region height above the spectrum median.
-        max_regions (int): Maximum number of regions to return.
-        pad (int): Bins added around each bounding box.
-
-    Returns:
-        list of (fx, fy, wx, wy): Center frequency and FULL widths of
-        each region, strongest first. Only one of each conjugate +/-
-        pair is returned.
-    """
-    ny, nx = data.shape
-    fshift = np.fft.fftshift(np.fft.fft2(data)) / (nx * ny)
-    mag_db = 20 * np.log10(np.abs(fshift) + 1e-12)
-
-    FX, FY = _fft_freq_grids((ny, nx), dx, dy)
-    F_dist = np.sqrt(FX**2 + FY**2)
+    freq_x, freq_y = FX[0], FY[:, 0]
     dfx = 1.0 / (nx * dx)
     dfy = 1.0 / (ny * dy)
+    mid_y, mid_x = ny // 2, nx // 2
+    if streak_db is None:
+        streak_db = max(2.0, peak_db / 4.0)
 
-    background = np.median(mag_db)
-    candidates = (mag_db > background + threshold_db) & (F_dist > protect_radius)
-    labels, n_labels = ndimage.label(candidates, structure=np.ones((3, 3)))
-    if n_labels == 0:
-        return []
+    def _runs(flags):
+        idx = np.flatnonzero(flags)
+        if idx.size == 0:
+            return []
+        splits = np.flatnonzero(np.diff(idx) > 1) + 1
+        return [(int(g[0]), int(g[-1])) for g in np.split(idx, splits)]
 
-    slices = ndimage.find_objects(labels)
-    strengths = ndimage.maximum(mag_db, labels, index=np.arange(1, n_labels + 1))
+    found = []                              # (strength, kind, item)
+    blocked_cols = np.zeros(nx, dtype=bool)   # bins explained by a streak
+    blocked_rows = np.zeros(ny, dtype=bool)
 
-    boxes = []
-    for sl, strength in zip(slices, strengths):
-        ys, xs = sl
-        fx0 = FX[0, xs.start] - pad * dfx
-        fx1 = FX[0, xs.stop - 1] + pad * dfx
-        fy0 = min(FY[ys.start, 0], FY[ys.stop - 1, 0]) - pad * dfy
-        fy1 = max(FY[ys.start, 0], FY[ys.stop - 1, 0]) + pad * dfy
-        boxes.append((strength,
-                      (fx0 + fx1) / 2.0, (fy0 + fy1) / 2.0,
-                      fx1 - fx0, fy1 - fy0))
-    boxes.sort(key=lambda b: -b[0])
+    # -- 1. streaks: columns / rows with elevated median excess ---------
+    col_med = np.median(excess, axis=0)
+    for i0, i1 in _runs(col_med > streak_db):
+        blocked_cols[max(i0 - pad, 0):i1 + pad + 1] = True
+        fx0, fx1 = freq_x[i0] - pad * dfx, freq_x[i1] + pad * dfx
+        cx, wx = (fx0 + fx1) / 2.0, fx1 - fx0
+        if abs(cx) <= max(protect_radius, wx / 2.0):
+            continue        # the central cross is not removable noise
+        found.append((float(col_med[i0:i1 + 1].max()), "rect",
+                      (cx, 0.0, wx, 1.0 / dy)))
+    row_med = np.median(excess, axis=1)
+    for i0, i1 in _runs(row_med > streak_db):
+        blocked_rows[max(i0 - pad, 0):i1 + pad + 1] = True
+        fy0 = min(freq_y[i0], freq_y[i1]) - pad * dfy
+        fy1 = max(freq_y[i0], freq_y[i1]) + pad * dfy
+        cy, wy = (fy0 + fy1) / 2.0, fy1 - fy0
+        if abs(cy) <= max(protect_radius, wy / 2.0):
+            continue
+        found.append((float(row_med[i0:i1 + 1].max()), "rect",
+                      (0.0, cy, 1.0 / dx, wy)))
 
-    regions = []
+    # -- 2. axis peaks: sharp features on the fx=0 / fy=0 lines ---------
+    def _axis_peaks(line, freqs):
+        base = ndimage.median_filter(line, size=max(9, 4 * pad + 1),
+                                     mode="nearest")
+        rel = line - base
+        out = []
+        # +4 dB over the region threshold: a single axis bin has the whole
+        # noise-floor tail to beat, like the lone-bin case below
+        for i in np.flatnonzero((rel > peak_db + 4.0)
+                                & (freqs > protect_radius)):
+            lo, hi = max(i - 1, 0), min(i + 1, len(line) - 1)
+            if line[i] >= line[lo] and line[i] >= line[hi]:
+                out.append((float(rel[i]), int(i)))
+        return out
+
+    # a peak on the fy=0 axis is already covered by a VERTICAL streak at
+    # the same fx (and vice versa) - but not by the perpendicular one
+    for s, i in _axis_peaks(excess[mid_y], freq_x):
+        if not blocked_cols[i]:
+            found.append((s, "notch", (float(freq_x[i]), 0.0)))
+    for s, i in _axis_peaks(excess[:, mid_x], freq_y):
+        if not blocked_rows[i]:
+            found.append((s, "notch", (0.0, float(freq_y[i]))))
+
+    # -- 3. off-axis regions of excess power ----------------------------
+    cand = (excess > peak_db) & (np.hypot(FX, FY) > protect_radius)
+    cand[:, blocked_cols] = False
+    cand[blocked_rows, :] = False
+    cand[mid_y, :] = False
+    cand[:, mid_x] = False
+    labels, n_labels = ndimage.label(cand, structure=np.ones((3, 3)))
+    if n_labels:
+        slices = ndimage.find_objects(labels)
+        strengths = ndimage.maximum(excess, labels,
+                                    index=np.arange(1, n_labels + 1))
+        sizes = ndimage.sum_labels(cand, labels,
+                                   index=np.arange(1, n_labels + 1))
+        for sl, strength, size in zip(slices, strengths, sizes):
+            # small clusters are expected from the tail of the noise-floor
+            # distribution (leakage correlates neighbouring bins, so even
+            # pairs happen by chance); demand evidence scaled to the size
+            need = peak_db + (8.0 if size < 2 else 4.0 if size < 4 else 0.0)
+            if strength < need:
+                continue
+            ys, xs = sl
+            fx0 = freq_x[xs.start] - pad * dfx
+            fx1 = freq_x[xs.stop - 1] + pad * dfx
+            fy0 = min(freq_y[ys.start], freq_y[ys.stop - 1]) - pad * dfy
+            fy1 = max(freq_y[ys.start], freq_y[ys.stop - 1]) + pad * dfy
+            cx, cy = (fx0 + fx1) / 2.0, (fy0 + fy1) / 2.0
+            wx, wy = fx1 - fx0, fy1 - fy0
+            if abs(cx) <= wx / 2.0 and abs(cy) <= wy / 2.0:
+                continue        # box covers the origin
+            if (xs.stop - xs.start) <= 4 and (ys.stop - ys.start) <= 4:
+                found.append((float(strength), "notch", (cx, cy)))
+            else:
+                found.append((float(strength), "rect", (cx, cy, wx, wy)))
+
+    # -- keep one of each conjugate pair, strongest first ---------------
+    found.sort(key=lambda t: -t[0])
+    notches, rects, accepted = [], [], []
     tol = max(dfx, dfy)
-    for _, cx, cy, wx, wy in boxes:
-        if abs(cx) <= wx / 2.0 and abs(cy) <= wy / 2.0:
-            continue            # box covers the origin - not removable noise
-        # skip the conjugate twin of an already accepted region: its
-        # mirror image overlaps that region's rectangle
+    for strength, kind, item in found:
+        if kind == "notch":
+            cx, cy = item
+            hx = hy = 2.0 * tol
+        else:
+            cx, cy, wx, wy = item
+            hx, hy = wx / 2.0, wy / 2.0
         dup = any(
-            abs(cx + ax) <= (wx + aw) / 2.0 + tol
-            and abs(cy + ay) <= (wy + ah) / 2.0 + tol
-            for ax, ay, aw, ah in regions
+            (abs(cx + ax) <= hx + ahx + tol and abs(cy + ay) <= hy + ahy + tol)
+            or (abs(cx - ax) <= hx + ahx + tol and abs(cy - ay) <= hy + ahy + tol)
+            for ax, ay, ahx, ahy in accepted
         )
         if dup:
             continue
-        regions.append((cx, cy, wx, wy))
-        if len(regions) >= max_regions:
+        accepted.append((cx, cy, hx, hy))
+        if kind == "notch":
+            notches.append(item)
+        else:
+            rects.append(item)
+        if len(notches) + len(rects) >= max_items:
             break
-    return regions
+    return notches, rects
 
 
 # --- Utility and Loading Functions ---
