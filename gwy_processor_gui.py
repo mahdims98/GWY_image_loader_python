@@ -145,6 +145,7 @@ def twoway_kwargs(params, detect=False):
         n_blocks=int(g("n_blocks", 16)),
         max_lag=int(g("max_lag", 20)),
         match_level=g("match_level", "plane"),
+        match_poly_order=int(g("match_poly_order", 2)),
         flip_backward=flip,
         crop=bool(g("crop", True)),
         detect=detect,
@@ -427,7 +428,9 @@ OPERATIONS = {
             {"name": "max_lag", "label": "Max lag (px)", "type": "int",
              "default": 20, "min": 1, "max": 200},
             {"name": "match_level", "label": "Level for match", "type": "choice",
-             "default": "plane", "values": ["plane", "none"]},
+             "default": "plane", "values": ["plane", "poly_rows", "none"]},
+            {"name": "match_poly_order", "label": "Match row-poly order",
+             "type": "int", "default": 2, "min": 0, "max": 10},
             {"name": "warp", "label": "Warp", "type": "choice",
              "default": "bwd_to_fwd",
              "values": ["bwd_to_fwd", "split", "linearize_both"]},
@@ -1411,7 +1414,7 @@ class TwoWayDialog(tk.Toplevel):
     GROUPS = [
         ("Alignment (hysteresis + lag)",
          ["mapping", "poly_order", "n_blocks", "max_lag", "match_level",
-          "warp", "flip_backward", "crop"]),
+          "match_poly_order", "warp", "flip_backward", "crop"]),
         ("Merge",
          ["combine", "weight", "slope_gain", "consensus_size", "beta"]),
     ]
@@ -1529,12 +1532,31 @@ class TwoWayDialog(tk.Toplevel):
         ttk.Combobox(frame, textvariable=self.curve_view,
                      values=["mapping (0-1)", "shift (px)"], state="readonly",
                      width=12).grid(row=2, column=1, sticky=tk.W, pady=1)
-        ttk.Label(frame, text="Plane level:").grid(row=3, column=0, sticky=tk.W,
-                                                   padx=(0, 6), pady=1)
+        self._build_level_controls(frame, 3)
+        for var in (self.overlay_style, self.overlay_alpha, self.curve_view):
+            var.trace_add("write", self._on_display_change)
+
+    def _build_level_controls(self, frame, row0):
+        """Display-only leveling widgets (plane + polynomial row alignment),
+        shared by the merge and parachuting dialogs."""
+        self.display_plane = tk.BooleanVar(value=True)
+        self.display_rows = tk.BooleanVar(value=False)
+        self.display_rows_order = tk.IntVar(value=2)
+
+        ttk.Label(frame, text="Plane level:").grid(
+            row=row0, column=0, sticky=tk.W, padx=(0, 6), pady=1)
         ttk.Checkbutton(frame, variable=self.display_plane).grid(
-            row=3, column=1, sticky=tk.W, pady=1)
-        for var in (self.overlay_style, self.overlay_alpha, self.curve_view,
-                    self.display_plane):
+            row=row0, column=1, sticky=tk.W, pady=1)
+        ttk.Label(frame, text="Row align (poly):").grid(
+            row=row0 + 1, column=0, sticky=tk.W, padx=(0, 6), pady=1)
+        inner = ttk.Frame(frame)
+        inner.grid(row=row0 + 1, column=1, sticky=tk.W, pady=1)
+        ttk.Checkbutton(inner, variable=self.display_rows).pack(side=tk.LEFT)
+        ttk.Spinbox(inner, from_=0, to=10, width=3,
+                    textvariable=self.display_rows_order).pack(
+            side=tk.LEFT, padx=(4, 0))
+        for var in (self.display_plane, self.display_rows,
+                    self.display_rows_order):
             var.trace_add("write", self._on_display_change)
 
     def _on_display_change(self, *args):
@@ -1746,17 +1768,33 @@ class TwoWayDialog(tk.Toplevel):
     def _display_images(self):
         """The forward, backward, and merged images as shown in the panels.
 
-        With 'Plane level' checked (default), ONE plane - fitted to the
-        forward image - is subtracted from all three, so the surface features
-        become visible instead of the tilt gradient, while the three panels
-        stay mutually comparable. Display only: the data that gets applied or
-        saved is never leveled here."""
+        Display-only leveling for observing the features: 'Plane level'
+        subtracts ONE plane fitted to the forward image, and 'Row align
+        (poly)' additionally subtracts the forward image's per-row polynomial
+        background of the chosen order. Both corrections come from the forward
+        image alone and are applied identically to all three panels, so they
+        stay mutually comparable. The data that gets applied or saved is never
+        leveled here."""
         res = self.result
-        if not self.display_plane.get():
-            return res.fwd, res.bwd, res.merged, ""
-        plane = gtw.fit_plane(res.fwd)
-        return (res.fwd - plane, res.bwd - plane, res.merged - plane,
-                " (plane leveled)")
+        fwd, bwd, merged = res.fwd, res.bwd, res.merged
+        tags = []
+        if self.display_plane.get():
+            plane = gtw.fit_plane(fwd)
+            fwd, bwd, merged = fwd - plane, bwd - plane, merged - plane
+            tags.append("plane")
+        try:
+            rows_on = self.display_rows.get()
+            order = int(self.display_rows_order.get())
+        except tk.TclError:
+            rows_on, order = False, 2   # spinbox mid-typing
+        if rows_on:
+            background = gtw.fit_rows_poly(fwd, order)
+            fwd = fwd - background
+            bwd = bwd - background
+            merged = merged - background
+            tags.append(f"rows p{order}")
+        tag = f" ({' + '.join(tags)} leveled)" if tags else ""
+        return fwd, bwd, merged, tag
 
     def _set_info(self):
         a = self.result.alignment
@@ -1855,15 +1893,10 @@ class ParachuteDialog(TwoWayDialog):
         super().__init__(app, op_key)
 
     def _build_display_controls(self, outer):
-        # no overlay/curves panel here - only the display plane leveling
+        # no overlay/curves panel here - only the display leveling
         frame = ttk.LabelFrame(outer, text="Display", padding=6)
         frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=4)
-        self.display_plane = tk.BooleanVar(value=True)
-        ttk.Label(frame, text="Plane level:").grid(row=0, column=0, sticky=tk.W,
-                                                   padx=(0, 6), pady=1)
-        ttk.Checkbutton(frame, variable=self.display_plane).grid(
-            row=0, column=1, sticky=tk.W, pady=1)
-        self.display_plane.trace_add("write", self._on_display_change)
+        self._build_level_controls(frame, 0)
 
     def _histogram_panel(self, ax, img, direction, slope, offset, max_delta,
                          tag):

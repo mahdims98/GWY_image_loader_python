@@ -207,19 +207,46 @@ def remove_plane(image):
     return image - fit_plane(image)
 
 
-def _level_for_match(image, level):
+def fit_rows_poly(image, order=2):
+    """Per-row polynomial background: fit a 1-D polynomial of degree ``order``
+    to every row (the 'align rows: polynomial' operation) and return the
+    fitted background, same shape as the image."""
+    image = np.asarray(image, dtype=float)
+    nx = image.shape[1]
+    t = np.linspace(-1.0, 1.0, nx)
+    order = max(0, int(order))
+    # Vandermonde least squares for all rows at once
+    A = np.vander(t, order + 1, increasing=True)          # (nx, order+1)
+    coeffs, *_ = np.linalg.lstsq(A, image.T, rcond=None)  # (order+1, ny)
+    return (A @ coeffs).T
+
+
+def align_rows_poly(image, order=2):
+    """Subtract the per-row polynomial background from the image."""
+    image = np.asarray(image, dtype=float)
+    return image - fit_rows_poly(image, order)
+
+
+def _level_for_match(image, level, poly_order=2):
     """Preprocessing applied before column matching only (never to the output
     data): the raw heights are dominated by the sample tilt, which swamps the
-    feature contrast the matching needs. ``level``: 'plane' or 'none'."""
+    feature contrast the matching needs.
+
+    ``level``: 'plane' (least-squares plane), 'poly_rows' (per-row polynomial
+    of degree ``poly_order``, the align-rows-polynomial operation), or
+    'none'."""
     if level == "plane":
         return remove_plane(image)
+    if level == "poly_rows":
+        return align_rows_poly(image, poly_order)
     if level in ("none", None, ""):
         return np.asarray(image, dtype=float)
     raise ValueError(f"unknown match level {level!r}")
 
 
 def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20,
-                          match_level="plane", min_quality=0.2):
+                          match_level="plane", match_poly_order=2,
+                          min_quality=0.2):
     """Measure the forward->backward column shift directly, by block-wise
     normalized cross-correlation.
 
@@ -232,8 +259,8 @@ def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20,
     to backward column ``j + shift``, and the peak correlation of each block.
     Blocks whose peak correlation falls below ``min_quality`` (featureless
     regions) get ``quality = 0`` and should be ignored by the caller."""
-    fwd = _level_for_match(fwd, match_level)
-    bwd = _level_for_match(bwd, match_level)
+    fwd = _level_for_match(fwd, match_level, match_poly_order)
+    bwd = _level_for_match(bwd, match_level, match_poly_order)
     nx = fwd.shape[1]
 
     n_blocks = max(1, int(n_blocks))
@@ -274,7 +301,8 @@ def measure_shift_profile(fwd, bwd, n_blocks=16, max_lag=20,
 
 
 def _hysteresis_model_shape(fwd, bwd, l_points, n_var, maxiter, seed,
-                            match_level="plane", hysteresis_result=None):
+                            match_level="plane", match_poly_order=2,
+                            hysteresis_result=None):
     """Run (or reuse) the power-law hysteresis fit and return
     ``(shift_shape_u, result)``: the model's forward->backward shift in
     normalized [0,1] coordinates, sampled on ``result.x_c``.
@@ -286,8 +314,8 @@ def _hysteresis_model_shape(fwd, bwd, l_points, n_var, maxiter, seed,
     res = hysteresis_result
     if res is None:
         res = hc.hysteresis_detect(
-            _level_for_match(fwd, match_level),
-            _level_for_match(bwd, match_level),
+            _level_for_match(fwd, match_level, match_poly_order),
+            _level_for_match(bwd, match_level, match_poly_order),
             l_points=int(l_points),
             flip_backward=False,          # orientation handled by the caller
             n_var=int(n_var),
@@ -315,6 +343,7 @@ def align_two_way(
     n_blocks=16,
     max_lag=20,
     match_level="plane",
+    match_poly_order=2,
     min_quality=0.2,
     l_points=400,
     n_var=10,
@@ -368,9 +397,9 @@ def align_two_way(
     poly_order : int
         Degree of the polynomial fitted to the measured shift profile
         (``mapping='xcorr'``). 0 = constant lag, 2 = lag + bow.
-    n_blocks, max_lag, match_level, min_quality
-        Passed to :func:`measure_shift_profile`. ``match_level`` ('plane' or
-        'none') is also applied before the power-law model fit
+    n_blocks, max_lag, match_level, match_poly_order, min_quality
+        Passed to :func:`measure_shift_profile`. ``match_level`` ('plane',
+        'poly_rows' with degree ``match_poly_order``, or 'none') is also applied before the power-law model fit
         (``mapping='model'/'model_scaled'``): without leveling, the sample
         tilt dominates the column correlation on tilted samples and the
         measured mapping is meaningless. The leveling is a matching aid only
@@ -414,7 +443,8 @@ def align_two_way(
     if mapping in ("xcorr", "model_scaled", "measured"):
         centers, meas_shift, quality = measure_shift_profile(
             fwd, bwd_oriented, n_blocks=n_blocks, max_lag=max_lag,
-            match_level=match_level, min_quality=min_quality)
+            match_level=match_level, match_poly_order=match_poly_order,
+            min_quality=min_quality)
         good = quality > 0
         if good.sum() < 2:
             raise RuntimeError(
@@ -442,7 +472,8 @@ def align_two_way(
     elif mapping in ("model", "model_scaled"):
         shape_u, res = _hysteresis_model_shape(
             fwd, bwd_oriented, l_points, n_var, maxiter, seed,
-            match_level=match_level, hysteresis_result=hysteresis_result)
+            match_level=match_level, match_poly_order=match_poly_order,
+            hysteresis_result=hysteresis_result)
         shape_px = np.interp(t_grid, res.x_c, shape_u) * (nx - 1)
         if mapping == "model":
             shift = shape_px
@@ -766,6 +797,7 @@ DEFAULTS = dict(
     n_blocks=16,
     max_lag=20,
     match_level="plane",
+    match_poly_order=2,
     min_quality=0.2,
     l_points=400,
     n_var=10,
@@ -794,7 +826,8 @@ DEFAULTS = dict(
 
 #: Alignment keys forwarded to :func:`align_two_way`.
 _ALIGN_KEYS = ("mapping", "flip_backward", "warp", "poly_order", "n_blocks",
-               "max_lag", "match_level", "min_quality", "l_points", "n_var",
+               "max_lag", "match_level", "match_poly_order", "min_quality",
+               "l_points", "n_var",
                "maxiter", "smooth_measured", "max_shift_px", "interp")
 
 

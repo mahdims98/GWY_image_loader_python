@@ -47,8 +47,9 @@ two-way scanning data", in three independently tunable stages:
 * **Alignment** (`align_two_way`): the forward and backward images do not sample
   the same x positions, because of piezo hysteresis and of the feedback lag of
   the scanner. The shift is measured directly by block-wise cross-correlation on
-  plane-leveled data (`measure_shift_profile`; the leveling is a matching
-  aid only and never touches the output data) and then regularized. Choose
+  leveled data (`measure_shift_profile`; `match_level` chooses a plane fit
+  or a per-row polynomial of degree `match_poly_order` - a matching aid only,
+  never applied to the output data) and then regularized. Choose
   the model with `mapping`:
   * `xcorr` (default) — polynomial fit to the measured shift. Degree 0 is a pure
     constant lag, degree 2 adds the hysteresis bow.
