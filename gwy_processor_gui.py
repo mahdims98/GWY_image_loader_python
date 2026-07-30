@@ -1669,6 +1669,95 @@ class CorrelationWindow(tk.Toplevel):
         self.canvas.draw()
 
 
+class StripeWindow(tk.Toplevel):
+    """Diagnostics of the stripe-gated merge, in its own big window: the
+    per-scan stripe evidence (same-sign vertical jump in robust-sigma units,
+    which the threshold cuts), the detected artifact segments, the per-pixel
+    decision, the merged result and what the merge changed. All panels are
+    linked for zooming and the window follows every preview update."""
+
+    def __init__(self, dialog):
+        super().__init__(dialog)
+        self.title("Stripe merge - details")
+        self.geometry("1400x780")
+        self.figure = Figure(figsize=(14, 7.6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+    def show(self, res, thresh, pref, extent, merged_d, tag, z_units):
+        fig = self.figure
+        fig.clf()
+        if res is None or getattr(res, "stripe_mask_fwd", None) is None:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Set Combine = 'stripes' and update the\n"
+                    "preview to see the stripe diagnostics.",
+                    ha="center", va="center", fontsize=11)
+            ax.set_axis_off()
+            self.canvas.draw()
+            return
+        axes = fig.subplots(2, 3, sharex=True, sharey=True)
+        vmax = 2.0 * thresh
+
+        for k, (img, name) in enumerate(((res.fwd, "Forward"),
+                                         (res.bwd, "Backward"))):
+            ax = axes[0, k]
+            im = ax.imshow(gtw.line_artifact_score(img), origin="upper",
+                           cmap="inferno", extent=extent, aspect="equal",
+                           vmin=0, vmax=vmax)
+            fig.colorbar(im, ax=ax, fraction=0.046).set_label("jump (sigma)")
+            ax.set_title(f"{name} stripe evidence\n"
+                         f"(same-sign vertical jump; threshold "
+                         f"{thresh:g} sigma)", fontsize=9)
+
+        ax = axes[0, 2]
+        overlay = (res.stripe_mask_fwd.astype(float)
+                   + 2.0 * res.stripe_mask_bwd)
+        im = ax.imshow(overlay, origin="upper", cmap="viridis",
+                       extent=extent, aspect="equal", vmin=0, vmax=3)
+        fig.colorbar(im, ax=ax, fraction=0.046,
+                     ticks=[0, 1, 2, 3]).set_label(
+            "0 none / 1 fwd / 2 bwd / 3 both")
+        ax.set_title(f"Detected stripes (runs >= min length): "
+                     f"fwd {100 * res.stripe_mask_fwd.mean():.2f}%, "
+                     f"bwd {100 * res.stripe_mask_bwd.mean():.2f}%",
+                     fontsize=9)
+
+        ax = axes[1, 0]
+        dec = res.corr_decision
+        im = ax.imshow(dec, origin="upper", extent=extent, aspect="equal",
+                       vmin=0, vmax=2,
+                       cmap=matplotlib.colors.ListedColormap(
+                           ["#c8c8c8", "#d62728", "#1f77b4"]))
+        fig.colorbar(im, ax=ax, fraction=0.046,
+                     ticks=[0.33, 1.0, 1.67]).ax.set_yticklabels(
+            ["combined", "fwd", "bwd"])
+        ax.set_title(f"Decision (clean-scan weight {pref:g}): "
+                     f"combined {100 * np.mean(dec == 0):.1f}%, "
+                     f"fwd {100 * np.mean(dec == 1):.1f}%, "
+                     f"bwd {100 * np.mean(dec == 2):.1f}%", fontsize=9)
+
+        ax = axes[1, 1]
+        v0, v1 = np.percentile(merged_d, [0.5, 99.5])
+        im = ax.imshow(merged_d, origin="upper",
+                       cmap=gp.get_gwyddion_cmap(), extent=extent,
+                       aspect="equal", vmin=v0, vmax=v1)
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label(z_units)
+        ax.set_title(f"Merged result{tag}", fontsize=9)
+
+        ax = axes[1, 2]
+        removed = res.fwd - res.merged
+        v = np.percentile(np.abs(removed - np.mean(removed)), 99.0) or 1.0
+        im = ax.imshow(removed - np.mean(removed), origin="upper",
+                       cmap="coolwarm", extent=extent, aspect="equal",
+                       vmin=-v, vmax=v)
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label(z_units)
+        ax.set_title("Difference (forward - merged)", fontsize=9)
+
+        fig.tight_layout()
+        self.canvas.draw()
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -1721,6 +1810,7 @@ class TwoWayDialog(tk.Toplevel):
         self._zoom_win = None
         self._zoom_selector = None
         self._corr_win = None
+        self._stripe_win = None
         self._aux_names = []
 
         self.fwd_title, self.bwd_title = gtw.find_pair(
@@ -1828,9 +1918,11 @@ class TwoWayDialog(tk.Toplevel):
                      values=["mapping (0-1)", "shift (px)"], state="readonly",
                      width=12).grid(row=2, column=1, sticky=tk.W, pady=1)
         self._build_level_controls(frame, 3)
-        ttk.Button(frame, text="Correlation details...",
-                   command=self.open_corr_window).grid(
-            row=6, column=0, columnspan=2, sticky=tk.EW, pady=1)
+        self._details_btn = ttk.Button(frame, text="Correlation details...",
+                                       command=self.open_details_window)
+        self._details_btn.grid(row=6, column=0, columnspan=2, sticky=tk.EW,
+                               pady=1)
+        self._update_details_button()
         for var in (self.overlay_style, self.overlay_alpha, self.curve_view):
             var.trace_add("write", self._on_display_change)
 
@@ -1925,6 +2017,7 @@ class TwoWayDialog(tk.Toplevel):
             else:
                 label.grid_remove()
                 widget.grid_remove()
+        self._update_details_button()
 
     def _on_param_change(self, *args):
         self._update_param_visibility()
@@ -2266,7 +2359,57 @@ class TwoWayDialog(tk.Toplevel):
                 (x0, y0), x1 - x0, y1 - y0, fill=False,
                 edgecolor="red", lw=1.2))
 
-    # ---- Correlation-merge details window ----
+    # ---- Merge-details windows (correlation / stripes) ----
+
+    def _current_combine(self):
+        try:
+            return self.vars["combine"].get()
+        except (KeyError, tk.TclError):
+            return ""
+
+    def _update_details_button(self):
+        """The details button belongs to the gated merge modes: shown as
+        'Correlation details...' or 'Stripe details...' when one of them is
+        selected, hidden otherwise."""
+        btn = getattr(self, "_details_btn", None)
+        if btn is None:
+            return
+        combine = self._current_combine()
+        if combine == "correlation":
+            btn.configure(text="Correlation details...")
+            btn.grid()
+        elif combine == "stripes":
+            btn.configure(text="Stripe details...")
+            btn.grid()
+        else:
+            btn.grid_remove()
+
+    def open_details_window(self):
+        if self._current_combine() == "stripes":
+            self.open_stripe_window()
+        else:
+            self.open_corr_window()
+
+    def open_stripe_window(self):
+        """Open (or raise) the stripe-merge diagnostics window."""
+        if self._stripe_win is None or not self._stripe_win.winfo_exists():
+            self._stripe_win = StripeWindow(self)
+        else:
+            self._stripe_win.lift()
+        self._update_stripe_window()
+
+    def _update_stripe_window(self):
+        if self._stripe_win is None or not self._stripe_win.winfo_exists():
+            return
+        res = self.result
+        p = self._last_params or {}
+        merged_d = tag = extent = None
+        if res is not None and getattr(res, "stripe_mask_fwd", None) is not None:
+            _, _, merged_d, tag = self._display_images()
+            extent = self._extent_of(res.merged)
+        self._stripe_win.show(res, float(p.get("stripe_thresh", 3.0)),
+                              float(p.get("stripe_pref", 1.0)), extent,
+                              merged_d, tag, self.app.z_units)
 
     def open_corr_window(self):
         """Open (or raise) the correlation-merge diagnostics window."""
@@ -2303,7 +2446,8 @@ class TwoWayDialog(tk.Toplevel):
 
     def destroy(self):
         for win in (getattr(self, "_zoom_win", None),
-                    getattr(self, "_corr_win", None)):
+                    getattr(self, "_corr_win", None),
+                    getattr(self, "_stripe_win", None)):
             if win is not None and win.winfo_exists():
                 win.destroy()
         super().destroy()
@@ -2345,6 +2489,7 @@ class TwoWayDialog(tk.Toplevel):
         self._set_info()
         self._update_zoom_window()
         self._update_corr_window()
+        self._update_stripe_window()
 
     # ---- Apply ----
 

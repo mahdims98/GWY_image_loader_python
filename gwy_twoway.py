@@ -892,29 +892,38 @@ def _prune_short_runs(mask, min_length):
     return out
 
 
+def line_artifact_score(image):
+    """Per-pixel stripe evidence in robust-sigma units: the smaller of the
+    two vertical jumps (to the row above and the row below) where they agree
+    in sign, 0 where they disagree. The sigma is the MAD of the image's
+    vertical pixel differences. :func:`detect_line_artifacts` thresholds
+    this score."""
+    z = np.asarray(image, dtype=float)
+    score = np.zeros(z.shape)
+    if z.shape[0] < 3:
+        return score
+    dv = np.diff(z, axis=0)
+    sigma = (1.4826 * float(np.median(np.abs(dv)))
+             or float(np.std(dv)) or 1.0)
+    d_up = z[1:-1] - z[:-2]
+    d_dn = z[1:-1] - z[2:]
+    same = d_up * d_dn > 0
+    score[1:-1] = np.where(
+        same, np.minimum(np.abs(d_up), np.abs(d_dn)) / sigma, 0.0)
+    return score
+
+
 def detect_line_artifacts(image, thresh=3.0, min_length=3):
     """Mask of line (stripe / scratch) artifact pixels in a single scan.
 
     A scan-line artifact makes a pixel jut out from BOTH vertical neighbours
     in the same direction - unlike real topography, which continues into the
-    neighbouring scan lines. A pixel is a candidate when its differences to
-    the row above and the row below agree in sign and both exceed ``thresh``
-    robust sigmas (MAD of the image's vertical pixel differences).
+    neighbouring scan lines. A pixel is a candidate when its
+    :func:`line_artifact_score` exceeds ``thresh`` (robust sigmas).
     Candidates are kept only in runs of at least ``min_length`` consecutive
     pixels along the scan line - so a stripe does not need to span the full
     line (a few pixels are enough), but isolated noisy pixels are ignored."""
-    z = np.asarray(image, dtype=float)
-    ny = z.shape[0]
-    if ny < 3:
-        return np.zeros(z.shape, bool)
-    dv = np.diff(z, axis=0)
-    sigma = (1.4826 * float(np.median(np.abs(dv)))
-             or float(np.std(dv)) or 1.0)
-    t = float(thresh) * sigma
-    d_up = z[1:-1] - z[:-2]
-    d_dn = z[1:-1] - z[2:]
-    cand = np.zeros(z.shape, bool)
-    cand[1:-1] = (d_up * d_dn > 0) & (np.abs(d_up) > t) & (np.abs(d_dn) > t)
+    cand = line_artifact_score(image) > float(thresh)
     return _prune_short_runs(cand, int(min_length))
 
 
