@@ -63,14 +63,26 @@ two-way scanning data", in three independently tunable stages:
   follow. The decision line `dz = -(slope*delta + offset)` is chosen from the
   `H(delta, dz)` histogram, as in the paper. A symmetric histogram with no sharp
   lower border means there is no parachuting to remove.
-* **Merge** (`softmin`, `merge_two_way`): flagged pixels are replaced by the
-  opposite scan; elsewhere the two scans are combined with the paper's corrected
-  soft-min. `beta = 0` gives a plain average (best noise reduction, no bias),
-  large `beta` approaches a hard minimum.
+* **Merge** (`combine_scans`, `merge_two_way`): flagged pixels are replaced by
+  the opposite scan; elsewhere the two scans are combined according to
+  `combine`:
+  * `average` (default) — weighted average `weight*fwd + (1-weight)*bwd`.
+    `0.5` is the plain mean (lowest noise, no bias), `1` keeps the forward scan
+    and `0` the backward one.
+  * `softmin` — the paper's corrected soft-minimum with parameter `beta`;
+    `beta = 0` degenerates to the plain mean, large `beta` to a hard minimum.
+  * `min`, `max`, `forward`, `backward`.
 
 All of this is exposed in the GUI under **Two-way merge (Fwd/Bwd)**, with the
 shift profile, the `H(delta, dz)` histogram, the flagged mask and the merged
-result previewed live.
+result previewed live. Two ways to commit the result:
+
+* **Merge to new channel** adds the merged image as a new channel (e.g.
+  `Height [Merged]`), leaves the forward and backward channels untouched, and
+  switches editing to it, so the rest of the processing chain runs on the merged
+  data. The merge is recorded as the first pipeline step, so *Batch process
+  folder* reproduces it on every file (re-measuring the shift for each one).
+* **Replace current image** overwrites the image being edited.
 
 ### Visualization
 * Offers a custom colormap approximating the default Gwyddion "Gwy" palette (`get_gwyddion_cmap`).
@@ -120,7 +132,7 @@ fwd = channels['Height [Fwd]'].data * 1e9      # nm
 bwd = channels['Height [Bwd]'].data * 1e9
 
 result = tw.process_two_way(fwd, bwd, mapping='xcorr', poly_order=2,
-                            detect=False, beta=0.0)
+                            detect=False, combine='average', weight=0.5)
 
 a = result.alignment
 print(f"lag {a.lag_px:+.2f} px, bow {a.bow_px:.2f} px")

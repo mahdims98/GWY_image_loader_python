@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -591,23 +592,55 @@ def softmin(x, y, beta):
     return lo - np.log1p(np.exp(-bd)) / beta + (np.log(2.0) / beta) * np.exp(-bd * bd)
 
 
-def merge_two_way(fwd, bwd, mask_fwd=None, mask_bwd=None, beta=2.0,
-                  both_flagged="paper"):
+def combine_scans(fwd, bwd, combine="average", weight=0.5, beta=0.0):
+    """Combine two aligned scans pixel by pixel, ignoring any parachuting mask.
+
+    ``combine``:
+      ``average``  - weighted average ``weight*fwd + (1-weight)*bwd``.
+                     ``weight=0.5`` is the plain mean (lowest noise, no bias),
+                     ``1`` keeps the forward scan, ``0`` the backward one.
+      ``softmin``  - the paper's soft-minimum with parameter ``beta``.
+      ``min``/``max`` - hard minimum / maximum of the two.
+      ``forward``/``backward`` - take one scan unchanged (useful for
+                     comparing against the merge, or for using the alignment
+                     and parachuting stages on their own).
+    """
+    fwd = np.asarray(fwd, dtype=float)
+    bwd = np.asarray(bwd, dtype=float)
+    if combine == "average":
+        w = float(np.clip(weight, 0.0, 1.0))
+        return w * fwd + (1.0 - w) * bwd
+    if combine == "softmin":
+        return softmin(fwd, bwd, beta)
+    if combine == "min":
+        return np.minimum(fwd, bwd)
+    if combine == "max":
+        return np.maximum(fwd, bwd)
+    if combine == "forward":
+        return fwd.copy()
+    if combine == "backward":
+        return bwd.copy()
+    raise ValueError(f"unknown combine {combine!r}")
+
+
+def merge_two_way(fwd, bwd, mask_fwd=None, mask_bwd=None, combine="average",
+                  weight=0.5, beta=0.0, both_flagged="paper"):
     """Merge two aligned scans into one image.
 
-    Away from any flagged pixel the two scans are soft-min averaged. Where one
-    scan is flagged as parachuting its value is discarded in favour of the
-    other scan (parachuting can only ever make a height too *high*).
+    Away from any flagged pixel the two scans are combined with
+    :func:`combine_scans`. Where one scan is flagged as parachuting its value
+    is discarded in favour of the other scan (parachuting can only ever make a
+    height too *high*).
 
     ``both_flagged`` decides what to do where both scans are flagged:
       ``paper``    - follow the paper's precedence: forward flagged -> take
                      backward (even if the backward is flagged too)
       ``min``      - take the lower of the two
-      ``softmin``  - fall back to the soft-min average
+      ``softmin``  - fall back to the combined value
     """
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
-    out = softmin(fwd, bwd, beta)
+    out = combine_scans(fwd, bwd, combine, weight, beta)
     if mask_fwd is None and mask_bwd is None:
         return out
 
@@ -677,7 +710,9 @@ DEFAULTS = dict(
     detrend=True,
     envelope_percentile=0.2,
     # -- merge
-    beta=2.0,
+    combine="average",
+    weight=0.5,
+    beta=0.0,
     both_flagged="paper",
 )
 
@@ -742,6 +777,7 @@ def process_two_way(fwd, bwd, hysteresis_result=None, **params):
 
     # ---- 3. merge -------------------------------------------------------- #
     merged = merge_two_way(a_fwd, a_bwd, mask_f, mask_b,
+                           combine=p["combine"], weight=p["weight"],
                            beta=p["beta"], both_flagged=p["both_flagged"])
 
     return TwoWayResult(
@@ -779,4 +815,12 @@ def find_pair(channels, title):
     for a, b in (("[Bwd]", "[Fwd]"), ("Bwd", "Fwd")):
         if a in title and title.replace(a, b) in channels:
             return title.replace(a, b), title
+    # a derived channel such as 'Height [Merged]': fall back to the raw pair
+    # of the same base name, so the dialog still works after merging once
+    match = re.match(r"^(.*?)\s*\[[^\]]*\]$", title)
+    if match:
+        base = match.group(1).strip()
+        f, b = f"{base} [Fwd]", f"{base} [Bwd]"
+        if f in channels and b in channels:
+            return f, b
     return title, None

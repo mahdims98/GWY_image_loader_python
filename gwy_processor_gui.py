@@ -26,6 +26,7 @@ Run with:  python gwy_processor_gui.py
 """
 
 import os
+import re
 import threading
 import traceback
 from datetime import datetime
@@ -147,6 +148,8 @@ def twoway_kwargs(params):
         slope_scale=float(params["slope_scale"]),
         offset=float(params["offset"]),
         max_delta=int(params["max_delta"]),
+        combine=params["combine"],
+        weight=float(params["weight"]),
         beta=float(params["beta"]),
         both_flagged=params["both_flagged"],
     )
@@ -173,7 +176,13 @@ def _describe_two_way(params):
     if params["mapping"] == "xcorr":
         parts.append(f"order={params['poly_order']}")
     parts.append(f"warp={params['warp']}")
-    parts.append(f"beta={params['beta']}")
+    if params["combine"] == "average":
+        w = float(params["weight"])
+        parts.append(f"average {w:.2f} fwd / {1 - w:.2f} bwd")
+    elif params["combine"] == "softmin":
+        parts.append(f"softmin beta={params['beta']}")
+    else:
+        parts.append(params["combine"])
     if params.get("detect"):
         slope = ("auto" if params.get("slope_mode") == "auto"
                  else f"{params['slope']}")
@@ -398,6 +407,12 @@ OPERATIONS = {
             {"name": "max_delta", "label": "Max lag delta (px)", "type": "int",
              "default": 20, "min": 1, "max": 200},
             # -- merge
+            {"name": "combine", "label": "Combine", "type": "choice",
+             "default": "average",
+             "values": ["average", "softmin", "min", "max",
+                        "forward", "backward"]},
+            {"name": "weight", "label": "Forward weight (0-1)", "type": "float",
+             "default": 0.5, "min": 0.0, "max": 1.0},
             {"name": "beta", "label": "Soft-min beta (1/z)", "type": "float",
              "default": 0.0, "min": 0.0, "max": 1e6},
             {"name": "both_flagged", "label": "Both flagged", "type": "choice",
@@ -1323,7 +1338,7 @@ class TwoWayDialog(tk.Toplevel):
         ("Parachuting detection",
          ["detect", "slope_mode", "slope", "slope_scale", "offset", "max_delta"]),
         ("Merge",
-         ["beta", "both_flagged"]),
+         ["combine", "weight", "beta", "both_flagged"]),
     ]
 
     def __init__(self, app, op_key="two_way"):
@@ -1356,9 +1371,12 @@ class TwoWayDialog(tk.Toplevel):
         self.fwd = app.channels[self.fwd_title].data.astype(np.float64) * z
         self.bwd = app.channels[self.bwd_title].data.astype(np.float64) * z
 
+        # Buttons are packed before the figure: the canvas expands to fill
+        # whatever is left, so anything packed after it can get squeezed out
+        # of the window.
         self._build_params()
-        self._build_figure()
         self._build_buttons()
+        self._build_figure()
         self.update_preview()
 
     # ---- UI construction ----
@@ -1416,10 +1434,21 @@ class TwoWayDialog(tk.Toplevel):
     def _build_buttons(self):
         frame = ttk.Frame(self, padding=8)
         frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Label(
+            frame,
+            text=("'New channel' keeps the originals and switches editing to "
+                  "the merged image; 'Replace current image' overwrites the "
+                  "channel you are editing."),
+            foreground="gray", wraplength=600,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
         ttk.Button(frame, text="Cancel", command=self.destroy).pack(
             side=tk.RIGHT, padx=4)
-        ttk.Button(frame, text="Apply", command=self.apply).pack(
-            side=tk.RIGHT, padx=4)
+        ttk.Button(frame, text="Replace current image",
+                   command=self.apply).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(frame, text="Merge to new channel",
+                   command=self.apply_as_channel).pack(side=tk.RIGHT, padx=4)
         ttk.Button(frame, text="Update preview", command=self.update_preview).pack(
             side=tk.RIGHT, padx=4)
 
@@ -1562,6 +1591,7 @@ class TwoWayDialog(tk.Toplevel):
     # ---- Apply ----
 
     def apply(self):
+        """Overwrite the image currently being edited with the merged result."""
         params = self.get_params()
         if params is None:
             return
@@ -1574,6 +1604,25 @@ class TwoWayDialog(tk.Toplevel):
         ):
             return
         self.app.apply_operation(self.op_key, params)
+        self.destroy()
+
+    def apply_as_channel(self):
+        """Add the merged image as a new channel and switch editing to it,
+        leaving the forward and backward channels untouched."""
+        params = self.get_params()
+        if params is None:
+            return
+        if self.result is None:
+            self.update_preview()
+            if self.result is None:
+                return
+        base = re.sub(r"\s*\[[^\]]*\]$", "", self.fwd_title).strip() or "Height"
+        title = self.app.add_channel(
+            f"{base} [Merged]", self.result.merged,
+            template=self.app.channels[self.fwd_title],
+            pipeline_step=(self.op_key, params),
+        )
+        self.app.status_var.set(f"Created channel '{title}'")
         self.destroy()
 
 
@@ -1785,6 +1834,53 @@ class GwyProcessorGUI(tk.Tk):
             return
         dialog_cls = DIALOG_CLASSES.get(op_key, OperationDialog)
         dialog_cls(self, op_key)
+
+    def add_channel(self, title, data, template=None, pipeline_step=None,
+                    select=True):
+        """Insert a derived image as a new in-memory channel and (by default)
+        switch editing to it. The file on disk is not touched; use
+        'Save channel to .gwy...' to write it out.
+
+        `data` is in display units and is stored back in SI units, so the new
+        channel behaves exactly like one read from the file.
+
+        `pipeline_step` is an (op_key, params) pair recorded as the first step
+        of the new channel's pipeline, so a batch run can reproduce it.
+
+        Returns the title actually used (uniquified if it was taken)."""
+        template = template or self.field
+        z_factor = getattr(self, "z_factor", 1.0) or 1.0
+
+        unique = title
+        n = 2
+        while unique in self.channels:
+            unique = f"{title} ({n})"
+            n += 1
+
+        ny, nx = data.shape
+        t_ny, t_nx = template.data.shape
+        field = gwy_loader.GwyDataField(
+            np.ascontiguousarray(np.asarray(data, dtype=np.float64) / z_factor),
+            xreal=nx * float(template.xreal or t_nx) / t_nx,
+            yreal=ny * float(template.yreal or t_ny) / t_ny,
+            si_unit_xy=_unit_of(template, "si_unit_xy") or None,
+            si_unit_z=_unit_of(template, "si_unit_z") or None,
+        )
+        self.channels[unique] = field
+        self.channel_combo["values"] = list(self.channels)
+
+        if select:
+            # select_channel() resets the history, so suppress its prompt by
+            # clearing the pipeline first - the merge is a fresh starting point
+            self.pipeline = []
+            self.channel_var.set(unique)
+            self.select_channel()
+            if pipeline_step is not None:
+                # record it so 'Batch process folder' replays the merge on
+                # every file, re-measuring the shift for each one
+                self.pipeline.append(pipeline_step)
+                self._log(describe_step(*pipeline_step))
+        return unique
 
     def channel_context(self):
         """Extra channels handed to operations that need more than the current
