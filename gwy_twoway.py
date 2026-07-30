@@ -812,7 +812,7 @@ def local_correlation(a, b, window=11):
 
 
 def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
-                       weight=0.5, shared=None):
+                       weight=0.5, shared=None, return_scores=False):
     """Correlation-gated merge of two aligned scans.
 
     The local (windowed) correlation between the scans decides, pixel by
@@ -831,7 +831,9 @@ def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
 
     Returns ``(merged, corr_map, decision)`` where ``decision`` is 0 where the
     scans were combined, 1 where the forward pixel was kept and 2 where the
-    backward pixel was kept.
+    backward pixel was kept. With ``return_scores=True`` a fourth element is
+    appended: a dict with the referee internals (``score_fwd``, ``score_bwd``,
+    and the ``aux_refs`` reference patterns), for diagnostics.
     """
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
@@ -844,20 +846,18 @@ def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
 
     disputed = corr < float(margin)
     decision = np.zeros(fwd.shape, np.uint8)
-    if not disputed.any():
-        return avg.copy(), corr, decision
 
     score_f = np.zeros(fwd.shape)
     score_b = np.zeros(fwd.shape)
-    n_aux = 0
+    refs = []
     for aux_f, aux_b in aux_pairs:
         ref = 0.5 * (np.asarray(aux_f, dtype=float)
                      + np.asarray(aux_b, dtype=float))
+        refs.append(ref)
         # |corr|: an edge shows up in phase/error with an arbitrary sign
         score_f += np.abs(local_correlation(fwd, ref, window))
         score_b += np.abs(local_correlation(bwd, ref, window))
-        n_aux += 1
-    if n_aux == 0:
+    if not refs:
         ref = uniform_filter(avg, max(3, int(window)))
         score_f = -np.abs(fwd - ref)
         score_b = -np.abs(bwd - ref)
@@ -866,6 +866,9 @@ def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
     merged = np.where(disputed, np.where(take_f, fwd, bwd), avg)
     decision[disputed & take_f] = 1
     decision[disputed & ~take_f] = 2
+    if return_scores:
+        return merged, corr, decision, {
+            "score_fwd": score_f, "score_bwd": score_b, "aux_refs": refs}
     return merged, corr, decision
 
 
@@ -886,6 +889,9 @@ class TwoWayResult:
     fraction_bwd: float = 0.0
     corr_map: np.ndarray = field(repr=False, default=None)
     corr_decision: np.ndarray = field(repr=False, default=None)
+    corr_score_fwd: np.ndarray = field(repr=False, default=None)
+    corr_score_bwd: np.ndarray = field(repr=False, default=None)
+    corr_aux_refs: list = field(repr=False, default=None)
 
     @property
     def removed(self):
@@ -1001,7 +1007,7 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
                                     p["max_delta"], p["detrend"])
 
     # ---- 3. merge -------------------------------------------------------- #
-    corr_map = corr_decision = None
+    corr_map = corr_decision = corr_scores = None
     if p["combine"] == "correlation":
         pairs = [(apply_alignment(alignment, af, "fwd", p["interp"]),
                   apply_alignment(alignment, ab, "bwd", p["interp"]))
@@ -1009,9 +1015,10 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
         shared = combine_scans(a_fwd, a_bwd, p["corr_combine"], p["weight"],
                                p["beta"], p["slope_gain"],
                                p["consensus_size"])
-        merged, corr_map, corr_decision = correlation_select(
+        merged, corr_map, corr_decision, corr_scores = correlation_select(
             a_fwd, a_bwd, pairs, margin=p["corr_margin"],
-            window=p["corr_window"], weight=p["weight"], shared=shared)
+            window=p["corr_window"], weight=p["weight"], shared=shared,
+            return_scores=True)
         merged = _replace_flagged(merged, a_fwd, a_bwd, mask_f, mask_b,
                                   p["both_flagged"])
     else:
@@ -1033,7 +1040,14 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
             if corr_map is not None:
                 corr_map = corr_map[:, c0:c1]
                 corr_decision = corr_decision[:, c0:c1]
+                corr_scores = {
+                    "score_fwd": corr_scores["score_fwd"][:, c0:c1],
+                    "score_bwd": corr_scores["score_bwd"][:, c0:c1],
+                    "aux_refs": [r[:, c0:c1]
+                                 for r in corr_scores["aux_refs"]],
+                }
 
+    corr_scores = corr_scores or {}
     return TwoWayResult(
         merged=merged, fwd=a_fwd, bwd=a_bwd,
         mask_fwd=mask_f, mask_bwd=mask_b,
@@ -1042,6 +1056,9 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
         fraction_fwd=float(mask_f.mean()),
         fraction_bwd=float(mask_b.mean()),
         corr_map=corr_map, corr_decision=corr_decision,
+        corr_score_fwd=corr_scores.get("score_fwd"),
+        corr_score_bwd=corr_scores.get("score_bwd"),
+        corr_aux_refs=corr_scores.get("aux_refs"),
     )
 
 

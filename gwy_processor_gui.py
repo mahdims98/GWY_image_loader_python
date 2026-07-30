@@ -211,22 +211,23 @@ AUX_CHOICES = {
 
 
 def aux_pairs_for(channels, fwd_title, which="phase+error"):
-    """The raw (fwd, bwd) auxiliary-channel pairs (phase / error) that belong
-    to a height channel, as referee data for ``combine='correlation'``.
-    Missing channels are silently skipped - the merge falls back to its
-    consensus rule when no referee is available."""
-    pairs = []
+    """The raw ``(name, fwd, bwd)`` auxiliary-channel triples (phase / error)
+    that belong to a height channel, as referee data for
+    ``combine='correlation'``. Missing channels are silently skipped - the
+    merge falls back to its consensus rule when no referee is available."""
+    triples = []
     if not channels or not fwd_title:
-        return pairs
+        return triples
     for name in AUX_CHOICES.get(which, ()):
         aux_f = re.sub(r"^.*?(?=\s*\[)", name, fwd_title)
         if aux_f == fwd_title or aux_f not in channels:
             continue
         aux_b = gtw.backward_title(aux_f)
         if aux_b and aux_b in channels:
-            pairs.append((channels[aux_f].data.astype(np.float64),
-                          channels[aux_b].data.astype(np.float64)))
-    return pairs
+            triples.append((name,
+                            channels[aux_f].data.astype(np.float64),
+                            channels[aux_b].data.astype(np.float64)))
+    return triples
 
 
 def _require_pair(context):
@@ -246,8 +247,9 @@ def _op_two_way(data, params, dx, dy, context=None):
     _require_pair(context)
     aux = None
     if params.get("combine") == "correlation":
-        aux = aux_pairs_for(context.get("channels"), context.get("fwd_title"),
-                            params.get("corr_aux", "phase+error"))
+        aux = [(f, b) for _, f, b in aux_pairs_for(
+            context.get("channels"), context.get("fwd_title"),
+            params.get("corr_aux", "phase+error"))]
     result = gtw.process_two_way(context["fwd"], context["bwd"],
                                  aux_pairs=aux,
                                  **twoway_kwargs(params, detect=False))
@@ -1520,6 +1522,99 @@ class ZoomWindow(tk.Toplevel):
         self.canvas.draw()
 
 
+class CorrelationWindow(tk.Toplevel):
+    """Diagnostics of the correlation-gated merge, in its own big window:
+    the local forward/backward height correlation with the margin, the
+    per-pixel decision, the referee score that picks the winning direction on
+    the disputed pixels, the merged result, and the phase/error reference
+    patterns the referee correlates against. All panels are linked for
+    zooming and the window follows every preview update of the dialog."""
+
+    def __init__(self, dialog):
+        super().__init__(dialog)
+        self.title("Correlation merge - details")
+        self.geometry("1400x780")
+        self.figure = Figure(figsize=(14, 7.6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+    def show(self, res, margin, aux_names, extent, merged_d, tag, z_units):
+        fig = self.figure
+        fig.clf()
+        if res is None or getattr(res, "corr_map", None) is None:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Set Combine = 'correlation' and update the\n"
+                    "preview to see the correlation diagnostics.",
+                    ha="center", va="center", fontsize=11)
+            ax.set_axis_off()
+            self.canvas.draw()
+            return
+        axes = fig.subplots(2, 3, sharex=True, sharey=True)
+
+        ax = axes[0, 0]
+        im = ax.imshow(res.corr_map, origin="upper", cmap="viridis",
+                       extent=extent, aspect="equal", vmin=-1, vmax=1)
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label("correlation")
+        shared = float(np.mean(res.corr_map >= margin))
+        ax.set_title(f"Local fwd/bwd height correlation\n"
+                     f"{100 * shared:.1f}% >= margin {margin:g} = shared",
+                     fontsize=9)
+
+        ax = axes[0, 1]
+        dec = res.corr_decision
+        im = ax.imshow(dec, origin="upper", extent=extent, aspect="equal",
+                       vmin=0, vmax=2,
+                       cmap=matplotlib.colors.ListedColormap(
+                           ["#c8c8c8", "#d62728", "#1f77b4"]))
+        fig.colorbar(im, ax=ax, fraction=0.046,
+                     ticks=[0.33, 1.0, 1.67]).ax.set_yticklabels(
+            ["combined", "fwd", "bwd"])
+        ax.set_title(f"Decision: combined {100 * np.mean(dec == 0):.1f}%, "
+                     f"fwd {100 * np.mean(dec == 1):.1f}%, "
+                     f"bwd {100 * np.mean(dec == 2):.1f}%", fontsize=9)
+
+        ax = axes[0, 2]
+        diff = np.where(dec > 0,
+                        res.corr_score_fwd - res.corr_score_bwd, np.nan)
+        v = (float(np.nanpercentile(np.abs(diff), 99.0))
+             if np.any(dec > 0) else 1.0) or 1.0
+        cmap = matplotlib.colormaps["coolwarm"].copy()
+        cmap.set_bad("#e8e8e8")
+        im = ax.imshow(diff, origin="upper", cmap=cmap, extent=extent,
+                       aspect="equal", vmin=-v, vmax=v)
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label("score fwd - bwd")
+        ax.set_title("Referee score on the disputed pixels\n"
+                     "(red = forward wins, blue = backward wins)", fontsize=9)
+
+        ax = axes[1, 0]
+        v0, v1 = np.percentile(merged_d, [0.5, 99.5])
+        im = ax.imshow(merged_d, origin="upper",
+                       cmap=gp.get_gwyddion_cmap(), extent=extent,
+                       aspect="equal", vmin=v0, vmax=v1)
+        fig.colorbar(im, ax=ax, fraction=0.046).set_label(z_units)
+        ax.set_title(f"Merged result{tag}", fontsize=9)
+
+        refs = res.corr_aux_refs or []
+        for k in range(2):
+            ax = axes[1, 1 + k]
+            if k < len(refs):
+                name = aux_names[k] if k < len(aux_names) else f"aux {k + 1}"
+                v0, v1 = np.percentile(refs[k], [0.5, 99.5])
+                im = ax.imshow(refs[k], origin="upper", cmap="gray",
+                               extent=extent, aspect="equal",
+                               vmin=v0, vmax=v1)
+                fig.colorbar(im, ax=ax, fraction=0.046)
+                ax.set_title(f"{name} referee pattern\n"
+                             "(fwd/bwd mean, aligned like the heights)",
+                             fontsize=9)
+            else:
+                ax.set_axis_off()
+
+        fig.tight_layout()
+        self.canvas.draw()
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -1568,6 +1663,8 @@ class TwoWayDialog(tk.Toplevel):
         self._zoom_rect = None      # (x0, x1, y0, y1) in physical units
         self._zoom_win = None
         self._zoom_selector = None
+        self._corr_win = None
+        self._aux_names = []
 
         self.fwd_title, self.bwd_title = gtw.find_pair(
             app.channels, app.channel_var.get())
@@ -1673,6 +1770,9 @@ class TwoWayDialog(tk.Toplevel):
                      values=["mapping (0-1)", "shift (px)"], state="readonly",
                      width=12).grid(row=2, column=1, sticky=tk.W, pady=1)
         self._build_level_controls(frame, 3)
+        ttk.Button(frame, text="Correlation details...",
+                   command=self.open_corr_window).grid(
+            row=6, column=0, columnspan=2, sticky=tk.EW, pady=1)
         for var in (self.overlay_style, self.overlay_alpha, self.curve_view):
             var.trace_add("write", self._on_display_change)
 
@@ -1788,9 +1888,12 @@ class TwoWayDialog(tk.Toplevel):
         self.update_idletasks()
         try:
             aux = None
+            self._aux_names = []
             if params.get("combine") == "correlation":
-                aux = aux_pairs_for(self.app.channels, self.fwd_title,
-                                    params.get("corr_aux", "phase+error"))
+                triples = aux_pairs_for(self.app.channels, self.fwd_title,
+                                        params.get("corr_aux", "phase+error"))
+                self._aux_names = [t[0] for t in triples]
+                aux = [(f, b) for _, f, b in triples]
             self.result = gtw.process_two_way(
                 self.fwd, self.bwd, aux_pairs=aux,
                 **twoway_kwargs(params, detect=self.DETECT))
@@ -2087,6 +2190,28 @@ class TwoWayDialog(tk.Toplevel):
                 (x0, y0), x1 - x0, y1 - y0, fill=False,
                 edgecolor="red", lw=1.2))
 
+    # ---- Correlation-merge details window ----
+
+    def open_corr_window(self):
+        """Open (or raise) the correlation-merge diagnostics window."""
+        if self._corr_win is None or not self._corr_win.winfo_exists():
+            self._corr_win = CorrelationWindow(self)
+        else:
+            self._corr_win.lift()
+        self._update_corr_window()
+
+    def _update_corr_window(self):
+        if self._corr_win is None or not self._corr_win.winfo_exists():
+            return
+        res = self.result
+        margin = float((self._last_params or {}).get("corr_margin", 0.7))
+        merged_d = tag = extent = None
+        if res is not None and getattr(res, "corr_map", None) is not None:
+            _, _, merged_d, tag = self._display_images()
+            extent = self._extent_of(res.corr_map)
+        self._corr_win.show(res, margin, self._aux_names, extent,
+                            merged_d, tag, self.app.z_units)
+
     @staticmethod
     def _link_panels(*axes):
         """Share the x/y limits of the image panels, so toolbar zoom or pan
@@ -2101,9 +2226,10 @@ class TwoWayDialog(tk.Toplevel):
                 first.get_shared_y_axes().join(first, ax)
 
     def destroy(self):
-        if getattr(self, "_zoom_win", None) is not None \
-                and self._zoom_win.winfo_exists():
-            self._zoom_win.destroy()
+        for win in (getattr(self, "_zoom_win", None),
+                    getattr(self, "_corr_win", None)):
+            if win is not None and win.winfo_exists():
+                win.destroy()
         super().destroy()
 
     def _set_info(self):
@@ -2142,6 +2268,7 @@ class TwoWayDialog(tk.Toplevel):
         self.canvas.draw()
         self._set_info()
         self._update_zoom_window()
+        self._update_corr_window()
 
     # ---- Apply ----
 
