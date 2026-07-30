@@ -165,6 +165,9 @@ def twoway_kwargs(params, detect=False):
         corr_margin=float(g("corr_margin", 0.7)),
         corr_window=int(g("corr_window", 11)),
         corr_combine=g("corr_combine", "average"),
+        stripe_thresh=float(g("stripe_thresh", 3.0)),
+        stripe_min_len=int(g("stripe_min_len", 3)),
+        stripe_pref=float(g("stripe_pref", 1.0)),
     )
 
 
@@ -176,7 +179,9 @@ def twoway_param_relevant(name, p):
     mapping = g("mapping", "xcorr")
     combine = g("combine", "average")
     corr = combine == "correlation"
-    corr_combine = g("corr_combine", "average") if corr else None
+    stripes = combine == "stripes"
+    corr_combine = (g("corr_combine", "average")
+                    if (corr or stripes) else None)
     measured = mapping in ("xcorr", "model_scaled", "measured")
     rules = {
         # preprocessing
@@ -197,7 +202,10 @@ def twoway_param_relevant(name, p):
         "corr_margin": corr,
         "corr_window": corr,
         "corr_aux": corr,
-        "corr_combine": corr,
+        "corr_combine": corr or stripes,
+        "stripe_thresh": stripes,
+        "stripe_min_len": stripes,
+        "stripe_pref": stripes,
         # parachuting detection
         "slope": g("slope_mode", "manual") == "manual",
         "slope_scale": g("slope_mode", "manual") == "auto",
@@ -282,14 +290,18 @@ def _describe_combine(params):
         return f"slope-select gain={params.get('slope_gain', 2.0)}"
     if combine == "consensus":
         return f"consensus size={params.get('consensus_size', 5)}"
-    if combine == "correlation":
+    if combine in ("correlation", "stripes"):
         shared = params.get("corr_combine", "average")
         if shared == "softmin":
             shared += f" beta={params.get('beta', 0.0)}"
-        return (f"correlation margin={params.get('corr_margin', 0.7)}, "
-                f"win={params.get('corr_window', 11)}px, "
-                f"referee={params.get('corr_aux', 'phase+error')}, "
-                f"shared={shared}")
+        if combine == "correlation":
+            return (f"correlation margin={params.get('corr_margin', 0.7)}, "
+                    f"win={params.get('corr_window', 11)}px, "
+                    f"referee={params.get('corr_aux', 'phase+error')}, "
+                    f"shared={shared}")
+        return (f"stripes thr={params.get('stripe_thresh', 3.0)}sigma, "
+                f"minlen={params.get('stripe_min_len', 3)}px, "
+                f"pref={params.get('stripe_pref', 1.0)}, shared={shared}")
     return combine
 
 
@@ -550,8 +562,9 @@ OPERATIONS = {
             # -- merge
             {"name": "combine", "label": "Combine", "type": "choice",
              "default": "average",
-             "values": ["average", "correlation", "slope", "consensus",
-                        "softmin", "min", "max", "forward", "backward"]},
+             "values": ["average", "correlation", "stripes", "slope",
+                        "consensus", "softmin", "min", "max", "forward",
+                        "backward"]},
             {"name": "weight", "label": "Forward weight (0-1)", "type": "float",
              "default": 0.5, "min": 0.0, "max": 1.0},
             {"name": "slope_gain", "label": "Slope gain", "type": "float",
@@ -572,6 +585,13 @@ OPERATIONS = {
              "default": "average",
              "values": ["average", "softmin", "slope", "consensus",
                         "min", "max"]},
+            # -- combine='stripes' only
+            {"name": "stripe_thresh", "label": "Stripe threshold (sigma)",
+             "type": "float", "default": 3.0, "min": 0.1, "max": 100.0},
+            {"name": "stripe_min_len", "label": "Stripe min length (px)",
+             "type": "int", "default": 3, "min": 1, "max": 512},
+            {"name": "stripe_pref", "label": "Clean-scan weight (0.5-1)",
+             "type": "float", "default": 1.0, "min": 0.5, "max": 1.0},
         ],
         "removed_label": "Difference (forward - merged)",
         "describe": _describe_two_way,
@@ -1680,7 +1700,8 @@ class TwoWayDialog(tk.Toplevel):
         ("Merge",
          ["combine", "corr_combine", "weight", "slope_gain",
           "consensus_size", "beta",
-          "corr_margin", "corr_window", "corr_aux"]),
+          "corr_margin", "corr_window", "corr_aux",
+          "stripe_thresh", "stripe_min_len", "stripe_pref"]),
     ]
 
     def __init__(self, app, op_key="two_way"):
@@ -1792,7 +1813,8 @@ class TwoWayDialog(tk.Toplevel):
         ttk.Label(frame, text="Overlay:").grid(row=0, column=0, sticky=tk.W,
                                                padx=(0, 6), pady=1)
         ttk.Combobox(frame, textvariable=self.overlay_style,
-                     values=["blend", "anaglyph", "corr map", "decision"],
+                     values=["blend", "anaglyph", "corr map", "decision",
+                             "stripes"],
                      state="readonly",
                      width=12).grid(row=0, column=1, sticky=tk.W, pady=1)
         ttk.Label(frame, text="Bwd opacity:").grid(row=1, column=0, sticky=tk.W,
@@ -1978,16 +2000,34 @@ class TwoWayDialog(tk.Toplevel):
         per-pixel decision (averaged / forward kept / backward kept)."""
         style = self.overlay_style.get()
         res = self.result
-        if style in ("corr map", "decision"):
-            if getattr(res, "corr_map", None) is None:
-                ax.text(0.5, 0.5, "set Combine = 'correlation'\n"
-                        "to see the correlation views",
+        if style in ("corr map", "decision", "stripes"):
+            needed = {"corr map": ("corr_map", "set Combine = 'correlation'"),
+                      "decision": ("corr_decision",
+                                   "set Combine = 'correlation' or 'stripes'"),
+                      "stripes": ("stripe_mask_fwd",
+                                  "set Combine = 'stripes'")}[style]
+            if getattr(res, needed[0], None) is None:
+                ax.text(0.5, 0.5, f"{needed[1]}\nto see this view",
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=9)
                 ax.set_axis_off()
                 return
             margin = float((self._last_params or {}).get("corr_margin", 0.7))
-            extent = self._extent_of(res.corr_map)
+            extent = self._extent_of(res.merged)
+            if style == "stripes":
+                overlay = (res.stripe_mask_fwd.astype(float)
+                           + 2.0 * res.stripe_mask_bwd)
+                im = ax.imshow(overlay, origin="upper", cmap="viridis",
+                               extent=extent, aspect="equal", vmin=0, vmax=3)
+                self.figure.colorbar(im, ax=ax, fraction=0.046,
+                                     ticks=[0, 1, 2, 3]).set_label(
+                    "0 none / 1 fwd / 2 bwd / 3 both")
+                ax.set_title(
+                    f"Stripe artifacts: "
+                    f"fwd {100 * res.stripe_mask_fwd.mean():.2f}%, "
+                    f"bwd {100 * res.stripe_mask_bwd.mean():.2f}%",
+                    fontsize=9)
+                return
             if style == "corr map":
                 im = ax.imshow(res.corr_map, origin="upper", cmap="viridis",
                                extent=extent, aspect="equal", vmin=-1, vmax=1)

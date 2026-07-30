@@ -873,6 +873,89 @@ def correlation_select(fwd, bwd, aux_pairs=(), margin=0.7, window=11,
 
 
 # --------------------------------------------------------------------------- #
+#  Stripe-gated merge (average where clean, prefer the scan without stripes)
+# --------------------------------------------------------------------------- #
+def _prune_short_runs(mask, min_length):
+    """Keep only runs of at least `min_length` consecutive True pixels along
+    each row; shorter runs (single noisy pixels) are dropped."""
+    m = np.asarray(mask, dtype=bool)
+    if min_length <= 1:
+        return m.copy()
+    out = np.zeros_like(m)
+    for i in range(m.shape[0]):
+        d = np.diff(np.concatenate(([0], m[i].astype(np.int8), [0])))
+        starts = np.nonzero(d == 1)[0]
+        ends = np.nonzero(d == -1)[0]
+        for s, e in zip(starts, ends):
+            if e - s >= min_length:
+                out[i, s:e] = True
+    return out
+
+
+def detect_line_artifacts(image, thresh=3.0, min_length=3):
+    """Mask of line (stripe / scratch) artifact pixels in a single scan.
+
+    A scan-line artifact makes a pixel jut out from BOTH vertical neighbours
+    in the same direction - unlike real topography, which continues into the
+    neighbouring scan lines. A pixel is a candidate when its differences to
+    the row above and the row below agree in sign and both exceed ``thresh``
+    robust sigmas (MAD of the image's vertical pixel differences).
+    Candidates are kept only in runs of at least ``min_length`` consecutive
+    pixels along the scan line - so a stripe does not need to span the full
+    line (a few pixels are enough), but isolated noisy pixels are ignored."""
+    z = np.asarray(image, dtype=float)
+    ny = z.shape[0]
+    if ny < 3:
+        return np.zeros(z.shape, bool)
+    dv = np.diff(z, axis=0)
+    sigma = (1.4826 * float(np.median(np.abs(dv)))
+             or float(np.std(dv)) or 1.0)
+    t = float(thresh) * sigma
+    d_up = z[1:-1] - z[:-2]
+    d_dn = z[1:-1] - z[2:]
+    cand = np.zeros(z.shape, bool)
+    cand[1:-1] = (d_up * d_dn > 0) & (np.abs(d_up) > t) & (np.abs(d_dn) > t)
+    return _prune_short_runs(cand, int(min_length))
+
+
+def stripe_select(fwd, bwd, thresh=3.0, min_length=3, pref=1.0, weight=0.5,
+                  shared=None):
+    """Stripe-gated merge of two aligned scans.
+
+    Line artifacts are detected independently in each scan
+    (:func:`detect_line_artifacts`). Where neither scan is flagged, the
+    pixels are combined (``shared`` - any :func:`combine_scans` output - or
+    the plain weighted average). Where exactly one scan carries a stripe,
+    the clean scan gets weight ``pref`` (1 = take it outright, 0.5 = plain
+    average). Where both scans are flagged the combined value is kept - the
+    two artifacts are independent, so their average is still the best guess.
+
+    Returns ``(merged, mask_fwd, mask_bwd, decision)`` with ``decision``
+    0 = combined, 1 = forward preferred (backward striped), 2 = backward
+    preferred (forward striped)."""
+    fwd = np.asarray(fwd, dtype=float)
+    bwd = np.asarray(bwd, dtype=float)
+    if shared is None:
+        w = float(np.clip(weight, 0.0, 1.0))
+        shared = w * fwd + (1.0 - w) * bwd
+    else:
+        shared = np.asarray(shared, dtype=float)
+    mask_f = detect_line_artifacts(fwd, thresh, min_length)
+    mask_b = detect_line_artifacts(bwd, thresh, min_length)
+
+    p = float(np.clip(pref, 0.0, 1.0))
+    only_f = mask_f & ~mask_b        # forward striped -> lean on backward
+    only_b = mask_b & ~mask_f        # backward striped -> lean on forward
+    merged = shared.copy()
+    merged[only_f] = p * bwd[only_f] + (1.0 - p) * fwd[only_f]
+    merged[only_b] = p * fwd[only_b] + (1.0 - p) * bwd[only_b]
+    decision = np.zeros(fwd.shape, np.uint8)
+    decision[only_b] = 1
+    decision[only_f] = 2
+    return merged, mask_f, mask_b, decision
+
+
+# --------------------------------------------------------------------------- #
 #  Full pipeline
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -892,6 +975,8 @@ class TwoWayResult:
     corr_score_fwd: np.ndarray = field(repr=False, default=None)
     corr_score_bwd: np.ndarray = field(repr=False, default=None)
     corr_aux_refs: list = field(repr=False, default=None)
+    stripe_mask_fwd: np.ndarray = field(repr=False, default=None)
+    stripe_mask_bwd: np.ndarray = field(repr=False, default=None)
 
     @property
     def removed(self):
@@ -942,8 +1027,12 @@ DEFAULTS = dict(
     both_flagged="paper",
     corr_margin=0.7,     # combine='correlation': shared-feature threshold
     corr_window=11,      # ... local correlation window (px)
-    corr_combine="average",  # ... how the shared pixels are combined
-                             # (any combine_scans mode, e.g. 'softmin')
+    corr_combine="average",  # combine='correlation'/'stripes': how the
+                             # clean/shared pixels are combined (any
+                             # combine_scans mode, e.g. 'softmin')
+    stripe_thresh=3.0,   # combine='stripes': jump threshold (robust sigmas)
+    stripe_min_len=3,    # ... minimum artifact run length (px)
+    stripe_pref=1.0,     # ... weight of the clean scan on striped pixels
     # -- output
     crop=True,           # trim edge columns not imaged in both directions
 )
@@ -1026,7 +1115,18 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
 
     # ---- 3. merge -------------------------------------------------------- #
     corr_map = corr_decision = corr_scores = None
-    if p["combine"] == "correlation":
+    stripe_f = stripe_b = None
+    if p["combine"] == "stripes":
+        shared = combine_scans(a_fwd, a_bwd, p["corr_combine"], p["weight"],
+                               p["beta"], p["slope_gain"],
+                               p["consensus_size"])
+        merged, stripe_f, stripe_b, corr_decision = stripe_select(
+            a_fwd, a_bwd, thresh=p["stripe_thresh"],
+            min_length=p["stripe_min_len"], pref=p["stripe_pref"],
+            weight=p["weight"], shared=shared)
+        merged = _replace_flagged(merged, a_fwd, a_bwd, mask_f, mask_b,
+                                  p["both_flagged"])
+    elif p["combine"] == "correlation":
         pairs = [(apply_alignment(alignment, af, "fwd", p["interp"]),
                   apply_alignment(alignment, ab, "bwd", p["interp"]))
                  for af, ab in (aux_pairs or [])]
@@ -1055,6 +1155,11 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
             a_bwd = a_bwd[:, c0:c1]
             mask_f = mask_f[:, c0:c1]
             mask_b = mask_b[:, c0:c1]
+            if stripe_f is not None:
+                stripe_f = stripe_f[:, c0:c1]
+                stripe_b = stripe_b[:, c0:c1]
+            if corr_decision is not None and corr_map is None:
+                corr_decision = corr_decision[:, c0:c1]
             if corr_map is not None:
                 corr_map = corr_map[:, c0:c1]
                 corr_decision = corr_decision[:, c0:c1]
@@ -1077,6 +1182,7 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
         corr_score_fwd=corr_scores.get("score_fwd"),
         corr_score_bwd=corr_scores.get("score_bwd"),
         corr_aux_refs=corr_scores.get("aux_refs"),
+        stripe_mask_fwd=stripe_f, stripe_mask_bwd=stripe_b,
     )
 
 

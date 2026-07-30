@@ -97,6 +97,15 @@ two-way scanning data", in three independently tunable stages:
     pattern and the direction with the highest |correlation| keeps the pixel.
     The dialog's Overlay selector gains `corr map` and `decision` views for
     tuning the margin.
+  * `stripes` (`stripe_select`, `detect_line_artifacts`) — stripe/scratch-gated
+    merge: line artifacts are detected independently in each scan from the
+    vertical neighbours (a pixel that juts out from BOTH the row above and the
+    row below by more than `stripe_thresh` robust sigmas, in runs of at least
+    `stripe_min_len` px along the line — partial-line segments count). Clean
+    pixels are combined with `corr_combine`; where exactly one scan is striped
+    the clean scan gets weight `stripe_pref` (1 = taken outright). The Overlay
+    selector's `stripes` view shows the detected artifacts per scan and
+    `decision` shows the outcome.
   * `softmin` — the paper's corrected soft-minimum with parameter `beta`;
     `beta = 0` degenerates to the plain mean, large `beta` to a hard minimum.
   * `min`, `max`, `forward`, `backward`.
