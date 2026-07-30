@@ -65,6 +65,13 @@ two-way scanning data", in three independently tunable stages:
   follow. The decision line `dz = -(slope*delta + offset)` is chosen from the
   `H(delta, dz)` histogram, as in the paper. A symmetric histogram with no sharp
   lower border means there is no parachuting to remove.
+* **Background correction** (`pre_plane`, `pre_rows` + `pre_rows_order`, both
+  off by default): optionally remove each scan's own fitted plane and/or
+  per-row polynomial background *before* the hysteresis is found and the scans
+  are merged. Unlike `match_level` (a matching aid that never touches the
+  output) this changes the data: it puts both scans on one common zero
+  background, so a pixel replaced from the opposite scan sits flush with its
+  neighbours instead of jumping by the background difference.
 * **Merge** (`combine_scans`, `merge_two_way`): flagged pixels are replaced by
   the opposite scan; elsewhere the two scans are combined according to
   `combine`:

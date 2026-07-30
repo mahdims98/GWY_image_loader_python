@@ -139,6 +139,9 @@ def twoway_kwargs(params, detect=False):
     flip = {"auto": "auto", "yes": True, "no": False}[g("flip_backward", "auto")]
     manual = g("slope_mode", "manual") == "manual"
     return dict(
+        pre_plane=bool(g("pre_plane", False)),
+        pre_rows=bool(g("pre_rows", False)),
+        pre_rows_order=int(g("pre_rows_order", 2)),
         mapping=g("mapping", "xcorr"),
         warp=g("warp", "bwd_to_fwd"),
         poly_order=int(g("poly_order", 2)),
@@ -176,6 +179,8 @@ def twoway_param_relevant(name, p):
     corr_combine = g("corr_combine", "average") if corr else None
     measured = mapping in ("xcorr", "model_scaled", "measured")
     rules = {
+        # preprocessing
+        "pre_rows_order": bool(g("pre_rows", False)),
         # alignment
         "poly_order": mapping == "xcorr",
         "n_blocks": measured,
@@ -288,8 +293,20 @@ def _describe_combine(params):
     return combine
 
 
+def _describe_pre_level(params):
+    parts = []
+    if params.get("pre_plane"):
+        parts.append("plane")
+    if params.get("pre_rows"):
+        parts.append(f"rows p{params.get('pre_rows_order', 2)}")
+    return "pre-level " + "+".join(parts) if parts else None
+
+
 def _describe_two_way(params):
     parts = [f"map={params['mapping']}"]
+    pre = _describe_pre_level(params)
+    if pre:
+        parts.insert(0, pre)
     if params["mapping"] == "xcorr":
         parts.append(f"order={params['poly_order']}")
     parts.append(f"warp={params['warp']}")
@@ -309,6 +326,9 @@ def _describe_parachute(params):
         f"max delta={params['max_delta']}",
         _describe_combine(params),
     ]
+    pre = _describe_pre_level(params)
+    if pre:
+        parts.insert(0, pre)
     if params.get("crop", True):
         parts.append("cropped")
     return ", ".join(parts)
@@ -499,6 +519,13 @@ OPERATIONS = {
         "needs_pair": True,
         "channel_suffix": "[Merged]",
         "params": [
+            # -- background correction of both scans (real preprocessing)
+            {"name": "pre_plane", "label": "Plane removal", "type": "bool",
+             "default": False},
+            {"name": "pre_rows", "label": "Row align (poly)", "type": "bool",
+             "default": False},
+            {"name": "pre_rows_order", "label": "Row poly order", "type": "int",
+             "default": 2, "min": 0, "max": 10},
             # -- hysteresis / lag alignment
             {"name": "mapping", "label": "Shift model", "type": "choice",
              "default": "xcorr",
@@ -555,6 +582,13 @@ OPERATIONS = {
         "needs_pair": True,
         "channel_suffix": "[Deparachuted]",
         "params": [
+            # -- background correction of both scans (real preprocessing)
+            {"name": "pre_plane", "label": "Plane removal", "type": "bool",
+             "default": False},
+            {"name": "pre_rows", "label": "Row align (poly)", "type": "bool",
+             "default": False},
+            {"name": "pre_rows_order", "label": "Row poly order", "type": "int",
+             "default": 2, "min": 0, "max": 10},
             # -- alignment (kept minimal; tune it in the two-way merge dialog)
             {"name": "mapping", "label": "Shift model", "type": "choice",
              "default": "xcorr",
@@ -1638,6 +1672,8 @@ class TwoWayDialog(tk.Toplevel):
 
     # parameter names grouped into the panels of the dialog
     GROUPS = [
+        ("Preprocess (both scans)",
+         ["pre_plane", "pre_rows", "pre_rows_order"]),
         ("Alignment (hysteresis + lag)",
          ["mapping", "poly_order", "n_blocks", "max_lag", "match_level",
           "match_poly_order", "warp", "flip_backward", "crop"]),
@@ -2323,6 +2359,8 @@ class ParachuteDialog(TwoWayDialog):
     DETECT = True
 
     GROUPS = [
+        ("Preprocess (both scans)",
+         ["pre_plane", "pre_rows", "pre_rows_order"]),
         ("Alignment",
          ["mapping", "poly_order", "crop"]),
         ("Parachuting detection",

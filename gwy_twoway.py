@@ -901,6 +901,13 @@ class TwoWayResult:
 
 #: Defaults for every tunable, shared by the GUI and the batch pipeline.
 DEFAULTS = dict(
+    # -- preprocessing applied to BOTH scans before anything else. Unlike
+    #    match_level (a matching aid) this changes the output data: it puts
+    #    the two scans on one common background, so pixels replaced from the
+    #    opposite scan sit flush with their neighbours.
+    pre_plane=False,     # subtract each scan's own fitted plane
+    pre_rows=False,      # per-row polynomial alignment of each scan
+    pre_rows_order=2,    # ... polynomial degree
     # -- alignment
     align=True,
     mapping="xcorr",
@@ -966,6 +973,17 @@ def process_two_way(fwd, bwd, hysteresis_result=None, aux_pairs=None,
 
     fwd = np.asarray(fwd, dtype=float)
     bwd = np.asarray(bwd, dtype=float)
+
+    # ---- 0. background correction of both scans -------------------------- #
+    # Optional and applied to the DATA (each scan levelled by its own fit),
+    # before the hysteresis is found: with a common zero background, a pixel
+    # replaced from the opposite scan fits its neighbours.
+    if p["pre_plane"]:
+        fwd = remove_plane(fwd)
+        bwd = remove_plane(bwd)
+    if p["pre_rows"]:
+        fwd = align_rows_poly(fwd, p["pre_rows_order"])
+        bwd = align_rows_poly(bwd, p["pre_rows_order"])
 
     # ---- 1. hysteresis alignment ---------------------------------------- #
     if p["align"] and p["mapping"] != "none":
