@@ -1,7 +1,7 @@
 """
-Multidirectional stripe removal (MDSR).
+Stripe removal: MDSR (Fourier filtering) and GSR (variational).
 
-Implements the destriping method of
+`mdsr` implements the destriping method of
 
     X. Liang, Y. Zang, D. Dong, L. Zhang, M. Fang, X. Yang, A. Arranz,
     J. Ripoll, H. Hui, J. Tian, "Stripe artifact elimination based on
@@ -47,6 +47,31 @@ value of w is 0"), and the reference implementation, both put the groove on
 the stripe frequencies themselves. That is what is implemented here: the
 damped coordinate is the frequency component *along* the stripes,
 `u cos(theta0) + v sin(theta0)`.
+
+`gsr` implements the general stripe remover of
+
+    N. Rottmayer, C. Redenbach, F. O. Fahrbach, "A universal and effective
+    variational method for destriping: application to light-sheet
+    microscopy, FIB-SEM, and remote sensing images", Opt. Express 33(3),
+    5800 (2025),
+
+ported from the same project's `Python-Stripe-Removal/
+GeneralStripeRemover.py` (PyTorch) to numpy, for the 2D case. It splits the
+image into a clean part u and a stripe part s with u + s = u0 by minimizing
+
+    mu1*||grad u||_{2,1} + i_[0,1](u) + ||grad_theta s||_1 + mu2*||s||_1
+
+with the primal-dual hybrid gradient method (extrapolated dual, PDHGMp).
+The first term says a clean image has few strong edges, the box indicator
+keeps u in the value range of the input, the third says stripes vary little
+*along* their own direction, and the last says only a small part of the
+image is struck by stripes. mu1 sets the strength of the removal, mu2 the
+caution about touching real structure.
+
+Since the box indicator constrains u to [0, 1], the image is normalized to
+that range before the iteration and mapped back afterwards - AFM heights
+are in nanometres and would otherwise be clipped to nothing. The
+recommended parameters therefore transfer directly.
 """
 
 import numpy as np
@@ -62,6 +87,15 @@ import numpy as np
 # watching the preview if stripes survive.
 DEFAULTS = dict(angle=0.0, directions=8, levels=5, sigma=5.0,
                 sigma_a=0.3, max_angle=45.0)
+
+# GSR defaults from the paper's Supplement section 2: mu1 = 1/3 and
+# mu2 = 1/300 are "a good starting point", and the intervals
+# mu1 in [0.1, 0.5], mu2 in [0.0016, 0.017] "were never exceeded". The
+# supplement recommends 10000 iterations for a fully converged result and
+# notes 5000 often suffice; the default here is lower so that the preview
+# stays interactive - raise it before applying if the result still moves.
+GSR_DEFAULTS = dict(angle=0.0, mu1=1.0 / 3.0, mu2=1.0 / 300.0,
+                    iterations=600)
 
 
 def _freq_grids(shape):
@@ -241,3 +275,224 @@ def mdsr(data, angle=0.0, directions=8, levels=5, sigma=5.0, sigma_a=0.3,
     if pad:
         out = out[ny // 2:ny // 2 + ny, nx // 2:nx // 2 + nx]
     return out
+
+
+# ---------------------------------------------------------------------------
+# GSR - general stripe remover (variational)
+# ---------------------------------------------------------------------------
+
+# Stripe directions the difference operator supports, as (row, col) pixel
+# steps: straight, 1-in-2 and diagonal. Any angle is mapped onto the
+# closest of these by flipping and transposing the image, exactly as the
+# reference implementation does.
+GSR_STEPS = ((1, 0), (2, 1), (1, 1))
+
+
+def _shift_diff(v, a, b):
+    """Forward difference along the (a, b) pixel step: v[i+a, j+b] - v[i, j],
+    zero where the step leaves the image."""
+    ny, nx = v.shape
+    out = np.zeros_like(v)
+    if a < ny and b < nx:
+        out[:ny - a, :nx - b] = v[a:, b:] - v[:ny - a, :nx - b]
+    return out
+
+
+def _shift_diff_t(w, a, b):
+    """Adjoint of `_shift_diff` (its transpose as a matrix)."""
+    ny, nx = w.shape
+    out = np.zeros_like(w)
+    if a < ny and b < nx:
+        out[a:, b:] += w[:ny - a, :nx - b]
+        out[:ny - a, :nx - b] -= w[:ny - a, :nx - b]
+    return out
+
+
+def _acc_shift_diff_t(out, w, a, b, scale, buf):
+    """out += scale * (adjoint of `_shift_diff`) applied to w, without
+    allocating (`buf` is scratch of the same shape)."""
+    ny, nx = w.shape
+    if a >= ny or b >= nx:
+        return
+    inner = (slice(0, ny - a), slice(0, nx - b))
+    np.multiply(w[inner], scale, out=buf[inner])
+    out[a:, b:] += buf[inner]
+    out[inner] -= buf[inner]
+
+
+def _gsr_orientation(angle):
+    """Map a stripe angle onto a supported difference step.
+
+    Returns (step, flip_rows, flip_cols, transpose): apply the flips and the
+    transpose to the image, run with `step`, then undo them.
+    """
+    theta = np.deg2rad(angle)
+    # stripe direction in array axes: (rows, cols) = (y, x)
+    d = np.array([np.sin(theta), np.cos(theta)])
+    flip_rows, flip_cols = d[0] < 0, d[1] < 0
+    d = np.abs(d)
+    transpose = d[1] > d[0]
+    if transpose:
+        d = d[::-1]
+    steps = np.array(GSR_STEPS, dtype=float)
+    steps /= np.linalg.norm(steps, axis=1)[:, None]
+    step = GSR_STEPS[int(np.argmin(np.linalg.norm(steps - d[None, :], axis=1)))]
+    return step, bool(flip_rows), bool(flip_cols), bool(transpose)
+
+
+def _soft(x, threshold):
+    """Soft shrinkage: sign(x) * max(|x| - threshold, 0)."""
+    return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
+
+
+def gsr_split(data, angle=0.0, mu1=1.0 / 3.0, mu2=1.0 / 300.0,
+              iterations=600, proj=True):
+    """
+    Split `data` into (clean image, stripes) with the general stripe remover.
+
+    The two add up to the input exactly. See the module docstring for the
+    objective function.
+
+    Args:
+        angle: direction of the stripes in degrees, 0 = horizontal scan
+            lines. The difference operator supports steps of 0, 26.6 and 45
+            degrees (plus every flip and transpose of those), so other
+            angles are snapped to the nearest one - as in the reference
+            implementation.
+        mu1: strength of the stripe removal. Larger removes more, and
+            starts to smooth and to eat stripe-like structures.
+        mu2: caution about touching real structure: larger keeps the stripe
+            image sparser, so less is removed. The ratio of the two matters
+            more than either alone.
+        iterations: primal-dual steps. The result keeps improving with
+            more; the paper recommends 10000 for a converged solution.
+        proj: keep the clean image inside the value range of the input.
+
+    Returns:
+        (clean, stripes), both in the units of `data`.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    lo, hi = float(np.min(data)), float(np.max(data))
+    span = hi - lo
+    if span <= 0:                       # flat image: nothing to destripe
+        return data.copy(), np.zeros_like(data)
+
+    step, flip_rows, flip_cols, transpose = _gsr_orientation(angle)
+    f = (data - lo) / span              # the box constraint needs [0, 1]
+    if flip_rows:
+        f = f[::-1, :]
+    if flip_cols:
+        f = f[:, ::-1]
+    if transpose:
+        f = f.T
+    f = np.ascontiguousarray(f)
+
+    u, s = _gsr_core(f, step, mu1, mu2, int(iterations), proj)
+
+    if transpose:
+        u = u.T
+    if flip_cols:
+        u = u[:, ::-1]
+    if flip_rows:
+        u = u[::-1, :]
+    clean = np.ascontiguousarray(u) * span + lo
+    # The iteration keeps u + s = f, but only to single precision; taking
+    # the stripes as the remainder makes the split exact in the units of
+    # the data, and it is the same quantity the previews show.
+    return clean, data - clean
+
+
+def _gsr_core(f, step, mu1, mu2, iterations, proj):
+    """PDHGMp iteration on an image already normalized to [0, 1] and
+    oriented so that the stripes run along `step`.
+
+    Written with preallocated buffers and in single precision (as the
+    reference implementation's torch tensors are), because the iteration
+    count makes this the only expensive part of the module.
+
+    Two simplifications of the dual updates, both exact:
+    `p - soft(p, t)` is `clip(p, -t, t)`, and the coupled shrinkage
+    `p * max(|p| - t, 0) / |p|` subtracted from p is the projection of the
+    gradient vector onto the disc of radius t.
+    """
+    tau = 0.35
+    sigma = tau
+    ts = np.float32(tau * sigma)
+    a, b = step
+    t1 = np.float32(mu1 / sigma)         # radius for the gradient dual
+    t2 = np.float32(1.0 / sigma)         # for the stripe difference
+    t3 = np.float32(mu2 / sigma)         # for the stripe image
+    half = np.float32(0.5)
+    two = np.float32(2.0)
+
+    f = np.ascontiguousarray(f, dtype=np.float32)
+    ny, nx = f.shape
+
+    # dual variables: b1x/b1y for the total variation of u, b2 for the
+    # difference of s along the stripes, b3 for the sparsity of s
+    b1x, b1y = np.zeros_like(f), np.zeros_like(f)
+    b2, b3 = np.zeros_like(f), np.zeros_like(f)
+    b1xbar, b1ybar = np.zeros_like(f), np.zeros_like(f)
+    b2bar, b3bar = np.zeros_like(f), np.zeros_like(f)
+    old1x, old1y = np.empty_like(f), np.empty_like(f)
+    old2, old3 = np.empty_like(f), np.empty_like(f)
+
+    u = f.copy()
+    s = np.zeros_like(f)
+    tmp, buf, norm = (np.empty_like(f) for _ in range(3))
+    inner = (slice(0, ny - a), slice(0, nx - b))
+
+    for _ in range(iterations):
+        # primal step
+        _acc_shift_diff_t(u, b1xbar, 1, 0, -ts, buf)
+        _acc_shift_diff_t(u, b1ybar, 0, 1, -ts, buf)
+        _acc_shift_diff_t(s, b2bar, a, b, -ts, buf)
+        s -= ts * b3bar
+
+        # back onto the constraint u + s = f, then into the value range
+        np.subtract(f, s, out=tmp)
+        tmp -= u
+        tmp *= half
+        u += tmp
+        s += tmp
+        if proj:
+            np.minimum(u, 0.0, out=tmp)
+            s += tmp
+            np.subtract(u, 1.0, out=tmp)
+            np.maximum(tmp, 0.0, out=tmp)
+            s += tmp
+            np.clip(u, 0.0, 1.0, out=u)
+
+        old1x[...], old1y[...] = b1x, b1y
+        old2[...], old3[...] = b2, b3
+
+        # dual step: the gradient dual, projected onto the disc of radius t1
+        b1x += _shift_diff(u, 1, 0)
+        b1y += _shift_diff(u, 0, 1)
+        np.hypot(b1x, b1y, out=norm)
+        np.maximum(norm, t1, out=norm)
+        np.divide(t1, norm, out=norm)
+        b1x *= norm
+        b1y *= norm
+        # the stripe difference along the stripes, and the stripe image
+        b2[...] = 0.0
+        b2[inner] = s[a:, b:] - s[inner]
+        b2 += old2
+        np.clip(b2, -t2, t2, out=b2)
+        np.add(old3, s, out=b3)
+        np.clip(b3, -t3, t3, out=b3)
+
+        # extrapolation of the dual variables
+        for new, old, bar in ((b1x, old1x, b1xbar), (b1y, old1y, b1ybar),
+                              (b2, old2, b2bar), (b3, old3, b3bar)):
+            np.multiply(new, two, out=bar)
+            bar -= old
+
+    return u.astype(np.float64), s.astype(np.float64)
+
+
+def gsr(data, angle=0.0, mu1=1.0 / 3.0, mu2=1.0 / 300.0, iterations=600,
+        proj=True):
+    """The destriped image; see `gsr_split` for the parameters."""
+    return gsr_split(data, angle=angle, mu1=mu1, mu2=mu2,
+                     iterations=iterations, proj=proj)[0]

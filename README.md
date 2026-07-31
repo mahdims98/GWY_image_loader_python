@@ -9,7 +9,7 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * **`gwy_loader.py`**: A pure Python module for parsing and reading `.gwy` files. It extracts data fields, metadata, physical dimensions, and SI units.
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
-* **`gwy_destripe.py`**: Multidirectional stripe removal (MDSR) — the contourlet-domain destriping method of Liang et al. (2016).
+* **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016) and the variational method of Rottmayer et al. (2025).
 * **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, and batch folder processing.
 
 ## Requirements
@@ -41,12 +41,54 @@ environment variable to point elsewhere.
 
 ### Stripe Removal (`gwy_destripe.py`)
 
-`mdsr` implements the **multidirectional stripe remover** of X. Liang et al.,
+Two methods, both from the
+[General-Stripe-Removal](https://github.com/NiklasRottmayer/General-Stripe-Removal)
+project, selected from the **Method** dropdown of the GUI's *Stripe removal*
+window (which shows only the chosen method's parameters). Both take the
+stripe direction in degrees, 0° = horizontal scan lines.
+
+#### GSR — general stripe remover (variational)
+
+`gsr` implements the method of N. Rottmayer, C. Redenbach and F. O. Fahrbach,
+*"A universal and effective variational method for destriping: application to
+light-sheet microscopy, FIB-SEM, and remote sensing images"*, Opt. Express
+**33**(3), 5800 (2025), ported from that project's
+`Python-Stripe-Removal/GeneralStripeRemover.py` (PyTorch) to numpy for the 2D
+case. It splits the image into a clean part `u` and a stripe part `s` with
+`u + s = u0` by minimizing
+
+```
+mu1*||grad u||_2,1 + i_[0,1](u) + ||grad_theta s||_1 + mu2*||s||_1
+```
+
+with the primal-dual hybrid gradient method (extrapolated dual, PDHGMp): a
+clean image has few strong edges, `u` stays in the value range of the input,
+stripes vary little *along* their own direction, and only a small part of the
+image is struck by stripes.
+
+* `mu1` — strength of the removal; `mu2` — caution about touching real
+  structure. Paper defaults `mu1 = 1/3`, `mu2 = 1/300`, never outside
+  `mu1 ∈ [0.1, 0.5]`, `mu2 ∈ [0.0016, 0.017]`. Their ratio matters more than
+  either alone.
+* `iterations` — the paper recommends 10000 for a fully converged result and
+  notes 5000 usually suffice. The numpy port runs ~1.8 ms/iteration on a
+  512×256 scan, so the default is lower to keep the preview interactive; raise
+  it before applying.
+* The box constraint needs values in [0, 1], so the image is normalized to
+  that range internally and mapped back afterwards — AFM heights in nanometres
+  would otherwise be clipped away. The published parameters therefore transfer
+  directly.
+* The difference operator supports stripe steps of 0°, 26.6° and 45° (plus
+  every flip and transpose), so other angles snap to the nearest — as in the
+  reference implementation.
+
+#### MDSR — multidirectional stripe remover (Fourier filtering)
+
+`mdsr` implements the method of X. Liang et al.,
 *"Stripe artifact elimination based on nonsubsampled contourlet transform for
 light sheet fluorescence microscopy"*, J. Biomed. Opt. **21**(10), 106005
 (2016), following the reference implementation in
-[General-Stripe-Removal](https://github.com/NiklasRottmayer/General-Stripe-Removal)
-(`Matlab-Stripe-Removal/Algorithms/MDSR.m`). The image is decomposed into
+`Matlab-Stripe-Removal/Algorithms/MDSR.m`. The image is decomposed into
 shift-invariant subbands of different scale and direction (a nonsubsampled
 contourlet transform), the frequencies carrying stripes of the given
 direction are damped in every high-pass subband — with a groove that narrows
@@ -86,7 +128,8 @@ Two things follow from the method itself and are worth knowing: the exact
 zero-frequency line along the stripes is damped to zero at any σ, so MDSR
 always removes the per-line offsets (the overall mean height is kept); and a
 plane tilt across the slow axis is itself a set of line offsets, so **level
-the image before destriping** or the filter will eat the tilt.
+the image before destriping** — with either method — or the filter will eat
+the tilt.
 
 ### Two-Way Scan Processing (`gwy_twoway.py`)
 

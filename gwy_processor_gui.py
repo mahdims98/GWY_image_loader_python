@@ -17,9 +17,10 @@ Provides an interactive Tkinter application to:
         with a large interactive spectrum (click to place cutoff/notches,
         drag to notch a rectangle), optional smooth mask edges and a
         zoom window comparing the image before and after the filter
-      * Stripe removal (gwy_destripe.mdsr): the multidirectional stripe
-        remover of Liang et al. (2016), with the composite frequency
-        mask shown next to the result
+      * Stripe removal (gwy_destripe): the multidirectional stripe
+        remover of Liang et al. (2016) or the variational general
+        stripe remover of Rottmayer et al. (2025), selected in the
+        dialog, which shows only the chosen method's parameters
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
       * Two-way merge of the forward and backward scans (gwy_twoway):
@@ -108,7 +109,20 @@ def _mdsr_kwargs(params):
     )
 
 
-def _op_mdsr(data, params, dx, dy):
+def _gsr_kwargs(params):
+    """GSR parameters as gwy_destripe keywords."""
+    return dict(
+        angle=float(params.get("angle", 0.0)),
+        mu1=float(params.get("mu1", gd.GSR_DEFAULTS["mu1"])),
+        mu2=float(params.get("mu2", gd.GSR_DEFAULTS["mu2"])),
+        iterations=int(params.get("iterations", gd.GSR_DEFAULTS["iterations"])),
+    )
+
+
+def _op_destripe(data, params, dx, dy):
+    """Stripe removal by either of the two methods; `method` selects."""
+    if str(params.get("method", "MDSR")).upper() == "GSR":
+        return gd.gsr(data, **_gsr_kwargs(params))
     return gd.mdsr(data, pad=bool(params.get("pad", False)),
                    **_mdsr_kwargs(params))
 
@@ -416,7 +430,13 @@ def _validate_percentile(params):
     return None
 
 
-def _validate_mdsr(params):
+def _validate_destripe(params):
+    if str(params.get("method", "MDSR")).upper() == "GSR":
+        if params["mu1"] <= 0 or params["mu2"] <= 0:
+            return "mu1 and mu2 must be positive"
+        if params["iterations"] < 1:
+            return "There must be at least one iteration"
+        return None
     if params["sigma"] <= 0:
         return "Damping width must be positive"
     if params["sigma_a"] <= 0:
@@ -430,9 +450,13 @@ def _validate_mdsr(params):
     return None
 
 
-def _describe_mdsr(params):
-    return (f"{params.get('angle', 0.0):g} deg, "
-            f"sigma={params.get('sigma', 0.0):g}, "
+def _describe_destripe(params):
+    angle = f"{params.get('angle', 0.0):g} deg"
+    if str(params.get("method", "MDSR")).upper() == "GSR":
+        return (f"GSR, {angle}, mu1={params.get('mu1', 0.0):.4g}, "
+                f"mu2={params.get('mu2', 0.0):.4g}, "
+                f"{params.get('iterations', 0)} iterations")
+    return (f"MDSR, {angle}, sigma={params.get('sigma', 0.0):g}, "
             f"{params.get('directions', 8)} dirs, "
             f"{params.get('levels', 5)} scales"
             + (", mirrored edges" if params.get("pad") else ""))
@@ -530,12 +554,17 @@ OPERATIONS = {
         "removed_label": "Clipped values (difference)",
         "validate": _validate_percentile,
     },
-    "mdsr": {
-        "label": "Stripe removal (MDSR)",
-        "func": _op_mdsr,
+    "destripe": {
+        "label": "Stripe removal",
+        "func": _op_destripe,
+        # `method` picks which of the two algorithms runs; the dialog shows
+        # only the parameters that belong to the selected one.
         "params": [
+            {"name": "method", "label": "Method", "type": "choice",
+             "default": "MDSR", "values": ["MDSR", "GSR"]},
             {"name": "angle", "label": "Stripe angle (deg)", "type": "float",
              "default": 0.0, "min": -180.0, "max": 180.0},
+            # --- MDSR (Fourier filtering in the contourlet domain)
             {"name": "sigma", "label": "Damping width (bins)", "type": "float",
              "default": gd.DEFAULTS["sigma"], "min": 0.0, "max": 1e4},
             {"name": "directions", "label": "Directions", "type": "choice",
@@ -548,10 +577,17 @@ OPERATIONS = {
              "default": gd.DEFAULTS["max_angle"], "min": 0.0, "max": 90.0},
             {"name": "pad", "label": "Mirror edges", "type": "bool",
              "default": False},
+            # --- GSR (variational)
+            {"name": "mu1", "label": "mu1 (removal)", "type": "float",
+             "default": gd.GSR_DEFAULTS["mu1"], "min": 0.0, "max": 100.0},
+            {"name": "mu2", "label": "mu2 (retention)", "type": "float",
+             "default": gd.GSR_DEFAULTS["mu2"], "min": 0.0, "max": 100.0},
+            {"name": "iterations", "label": "Iterations", "type": "int",
+             "default": gd.GSR_DEFAULTS["iterations"], "min": 1, "max": 100000},
         ],
         "removed_label": "Removed stripes",
-        "validate": _validate_mdsr,
-        "describe": _describe_mdsr,
+        "validate": _validate_destripe,
+        "describe": _describe_destripe,
     },
     "fft_filter": {
         "label": "FFT filter",
@@ -729,7 +765,7 @@ OPERATION_ROWS = [
     ("plane_level", "polynomial"),
     ("align_rows",),
     ("fft_filter",),
-    ("mdsr",),
+    ("destripe",),
     ("remove_scars",),
     ("@fft_spectrum",),
     ("zero_baseline",),
@@ -1178,12 +1214,15 @@ class OperationDialog(tk.Toplevel):
         frame.pack(side=tk.TOP, fill=tk.X)
         self.params_frame = frame
         self.param_widgets = {}
+        self.param_labels = {}
 
         if not self.spec["params"]:
             ttk.Label(frame, text="No parameters for this operation.").pack(side=tk.LEFT)
 
         for p in self.spec["params"]:
-            ttk.Label(frame, text=p["label"] + ":").pack(side=tk.LEFT, padx=(8, 2))
+            label = ttk.Label(frame, text=p["label"] + ":")
+            label.pack(side=tk.LEFT, padx=(8, 2))
+            self.param_labels[p["name"]] = label
             if p["type"] == "int":
                 var = tk.IntVar(value=p["default"])
                 widget = ttk.Spinbox(
@@ -1211,9 +1250,22 @@ class OperationDialog(tk.Toplevel):
             self.param_widgets[p["name"]] = widget
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.status_var, foreground="red").pack(
-            side=tk.RIGHT, padx=8
-        )
+        self._status_label = ttk.Label(frame, textvariable=self.status_var,
+                                       foreground="red")
+        self._status_label.pack(side=tk.RIGHT, padx=8)
+
+    def _show_params(self, names):
+        """Show only these parameter widgets, keeping the declared order.
+        Used by dialogs whose parameters depend on a selected method."""
+        for name, label in self.param_labels.items():
+            label.pack_forget()
+            self.param_widgets[name].pack_forget()
+        self._status_label.pack_forget()
+        for p in self.spec["params"]:
+            if p["name"] in names:
+                self.param_labels[p["name"]].pack(side=tk.LEFT, padx=(8, 2))
+                self.param_widgets[p["name"]].pack(side=tk.LEFT)
+        self._status_label.pack(side=tk.RIGHT, padx=8)
 
     def _build_figure(self):
         self.figure = Figure(figsize=(10, 4.2), dpi=100)
@@ -1687,22 +1739,28 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
         self._update_zoom_window()
 
 
-class MDSRDialog(ZoomAreaMixin, OperationDialog):
+class DestripeDialog(ZoomAreaMixin, OperationDialog):
     """
-    Multidirectional stripe remover (MDSR), the method of Liang et al.
-    (2016) implemented in gwy_destripe.
+    Stripe removal, with the method chosen from the 'Method' selector. Only
+    the parameters of the selected method are shown.
 
-    The image is split into shift-invariant subbands of different scale and
-    direction (a nonsubsampled contourlet transform), the frequencies that
-    carry stripes running in the given direction are damped in each of
-    them - the more so the closer the subband's own orientation is to the
-    stripes - and the image is put back together.
+    MDSR - the multidirectional stripe remover of Liang et al. (2016).
+    Fourier filtering: the image is split into shift-invariant subbands of
+    different scale and direction (a nonsubsampled contourlet transform),
+    the frequencies carrying stripes of the given direction are damped in
+    each of them, and the image is put back together. The bottom right
+    panel shows the resulting composite frequency mask - black is removed,
+    yellow is kept. The groove along the stripe frequencies is what takes
+    the stripes out; its width is 'Damping width' and its waist at the
+    center is the low-pass residual, which is never filtered (add scales to
+    narrow that waist and reach coarser stripes).
 
-    The left panel shows the resulting composite frequency mask: black is
-    removed, yellow is kept. The groove along the stripe frequencies is
-    what takes the stripes out; its width is set by 'Damping width' and its
-    waist at the center is the low-pass residual, which is never filtered
-    (add scales to narrow that waist and reach coarser stripes).
+    GSR - the general stripe remover of Rottmayer et al. (2025). It splits
+    the image into a clean part and a stripe part by minimizing an energy
+    that wants few strong edges in the clean image and wants the stripe
+    part to be sparse and constant along the stripes. 'mu1' sets how hard
+    the stripes are pushed out, 'mu2' how carefully real structure is kept;
+    the result improves with 'Iterations' until it converges.
 
     'Zoom window...' - or dragging on the result panel - opens the image
     before and after the filter side by side, which is the honest way to
@@ -1710,8 +1768,16 @@ class MDSRDialog(ZoomAreaMixin, OperationDialog):
     """
 
     ZOOM_SOURCE = "result"
+    PREVIEW_DEBOUNCE_MS = 700          # GSR runs an iteration for each pixel
 
-    def __init__(self, app, op_key="mdsr"):
+    # Which parameters belong to which method
+    METHOD_PARAMS = {
+        "MDSR": ["method", "angle", "sigma", "directions", "levels",
+                 "sigma_a", "max_angle", "pad"],
+        "GSR": ["method", "angle", "mu1", "mu2", "iterations"],
+    }
+
+    def __init__(self, app, op_key="destripe"):
         self._last_result = None
         self._init_zoom()
         super().__init__(app, op_key)
@@ -1719,15 +1785,33 @@ class MDSRDialog(ZoomAreaMixin, OperationDialog):
 
     def _build_params(self):
         super()._build_params()
+        self.vars["method"].trace_add("write", lambda *a: self._sync_method())
+        self._sync_method()
         btns = ttk.Frame(self, padding=(8, 0, 8, 4))
         btns.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(btns, text="Zoom window...",
                    command=self.open_zoom_window).pack(side=tk.LEFT, padx=2)
-        ttk.Label(
-            btns,
-            text="Stripe angle: 0 = horizontal scan lines, 90 = vertical  |  "
-                 "Drag on the result panel to pick the zoom area",
-        ).pack(side=tk.LEFT, padx=12)
+        self.hint_var = tk.StringVar(value="")
+        ttk.Label(btns, textvariable=self.hint_var).pack(side=tk.LEFT, padx=12)
+
+    def _method(self):
+        try:
+            return str(self.vars["method"].get()).upper()
+        except tk.TclError:
+            return "MDSR"
+
+    def _sync_method(self):
+        """Show only the parameters of the selected method."""
+        method = self._method()
+        self._show_params(self.METHOD_PARAMS.get(method,
+                                                 self.METHOD_PARAMS["MDSR"]))
+        if hasattr(self, "hint_var"):
+            self.hint_var.set(
+                "Stripe angle: 0 = horizontal scan lines, 90 = vertical  |  "
+                "Drag on the result panel to pick the zoom area"
+                + ("  |  GSR: more iterations = better converged, slower"
+                   if method == "GSR" else "")
+            )
 
     # ---- zoom on a selected area (see ZoomAreaMixin) ----
 
@@ -1748,54 +1832,77 @@ class MDSRDialog(ZoomAreaMixin, OperationDialog):
         app = self.app
         self._last_result = result
         data = self._base_data()
-        ny, nx = data.shape
         extent = (0, app.x_real, 0, app.y_real)
-
         params = self.get_params() or {}
+
+        self.figure.clf()
+        # The result gets the large panel - it is what the parameters are
+        # judged on; the removed stripes and a method-specific panel share
+        # the right column.
+        gs = self.figure.add_gridspec(2, 2, width_ratios=[1.5, 1.0])
+        ax0 = self.figure.add_subplot(gs[:, 0])
+        ax1 = self.figure.add_subplot(gs[0, 1])
+        ax2 = self.figure.add_subplot(gs[1, 1])
+
+        im0 = ax0.imshow(result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+                         extent=extent, aspect="equal")
+        ax0.set_title(f"Preview: {self._method()} result  "
+                      f"(drag = area to zoom)")
+        ax0.set_xlabel(f"x ({app.spatial_units})")
+        ax0.set_ylabel(f"y ({app.spatial_units})")
+        self.figure.colorbar(im0, ax=ax0, fraction=0.046).set_label(app.z_units)
+
+        im1 = ax1.imshow(removed, origin="upper", cmap="viridis",
+                         extent=extent, aspect="equal")
+        ax1.set_title(self.spec["removed_label"])
+        ax1.set_xlabel(f"x ({app.spatial_units})")
+        ax1.set_ylabel(f"y ({app.spatial_units})")
+        self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
+
+        if self._method() == "GSR":
+            self._draw_input_panel(ax2, data, extent)
+        else:
+            self._draw_mask_panel(ax2, data, params)
+
+        self._mark_zoom_rect(ax0, ax1)
+        self.figure.tight_layout()
+        self._attach_zoom_selector(ax0)
+        self.canvas.draw()
+        self._update_zoom_window()
+
+    def _draw_input_panel(self, ax, data, extent):
+        """GSR has no filter to show, so the input goes here for comparison
+        (on the same color scale as the result would be hard to read, so it
+        gets its own)."""
+        app = self.app
+        im = ax.imshow(data, origin="upper", cmap=gp.get_gwyddion_cmap(),
+                       extent=extent, aspect="equal")
+        ax.set_title("Input (before)")
+        ax.set_xlabel(f"x ({app.spatial_units})")
+        self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(app.z_units)
+
+    def _draw_mask_panel(self, ax, data, params):
+        """The composite MDSR frequency mask, on the same physical frequency
+        axes as the FFT filter dialog."""
+        app = self.app
+        ny, nx = data.shape
         mask = gd.mdsr_mask(data.shape, **_mdsr_kwargs(params))
-        # frequency axes in physical units, on the bin edges
         freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=app.dx))
         freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=app.dy))
         hx, hy = 0.5 / (nx * app.dx), 0.5 / (ny * app.dy)
         freq_extent = [freq_x[0] - hx, freq_x[-1] + hx,
                        freq_y[-1] + hy, freq_y[0] - hy]
-
-        self.figure.clf()
-        gs = self.figure.add_gridspec(2, 2, width_ratios=[1.6, 1.0])
-        ax0 = self.figure.add_subplot(gs[:, 0])
-        ax1 = self.figure.add_subplot(gs[0, 1])
-        ax2 = self.figure.add_subplot(gs[1, 1])
-
-        im0 = ax0.imshow(mask, origin="upper", cmap="viridis",
-                         extent=freq_extent, aspect="equal", vmin=0, vmax=1)
+        im = ax.imshow(mask, origin="upper", cmap="viridis",
+                       extent=freq_extent, aspect="equal", vmin=0, vmax=1)
         # the groove reaches about 2.5 sigma bins, so it takes out
         # stripe-parallel structure longer than this
         sigma = float(params.get("sigma", gd.DEFAULTS["sigma"])) or 1.0
         reach = nx * app.dx / (2.5 * sigma)
-        ax0.set_title(f"MDSR mask (0 = removed) - takes out stripe-parallel\n"
-                      f"structure longer than ~{reach:.2f} {app.spatial_units}")
-        ax0.set_xlabel(f"fx (1/{app.spatial_units})")
-        ax0.set_ylabel(f"fy (1/{app.spatial_units})")
-        self.figure.colorbar(im0, ax=ax0, fraction=0.046).set_label("kept")
-
-        im1 = ax1.imshow(result, origin="upper", cmap=gp.get_gwyddion_cmap(),
-                         extent=extent, aspect="equal")
-        ax1.set_title("Preview: result  (drag = area to zoom)")
-        ax1.set_xlabel(f"x ({app.spatial_units})")
-        ax1.set_ylabel(f"y ({app.spatial_units})")
-        self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
-
-        im2 = ax2.imshow(removed, origin="upper", cmap="viridis",
-                         extent=extent, aspect="equal")
-        ax2.set_title(self.spec["removed_label"])
-        ax2.set_xlabel(f"x ({app.spatial_units})")
-        self.figure.colorbar(im2, ax=ax2, fraction=0.046).set_label(app.z_units)
-
-        self._mark_zoom_rect(ax1, ax2)
-        self.figure.tight_layout()
-        self._attach_zoom_selector(ax1)
-        self.canvas.draw()
-        self._update_zoom_window()
+        ax.set_title(f"MDSR mask (0 = removed): takes out stripe-parallel\n"
+                     f"structure longer than ~{reach:.2f} {app.spatial_units}")
+        ax.set_xlabel(f"fx (1/{app.spatial_units})")
+        ax.set_ylabel(f"fy (1/{app.spatial_units})")
+        self.figure.colorbar(im, ax=ax, fraction=0.046).set_label("kept")
 
 
 class CropDialog(OperationDialog):
@@ -2033,7 +2140,7 @@ DIALOG_CLASSES = {
     "crop": CropDialog,
     "polynomial": PolynomialDialog,
     "fft_filter": FFTFilterDialog,
-    "mdsr": MDSRDialog,
+    "destripe": DestripeDialog,
     "percentile": PercentileDialog,
 }
 
