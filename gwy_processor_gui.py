@@ -17,6 +17,9 @@ Provides an interactive Tkinter application to:
         with a large interactive spectrum (click to place cutoff/notches,
         drag to notch a rectangle), optional smooth mask edges and a
         zoom window comparing the image before and after the filter
+      * Stripe removal (gwy_destripe.mdsr): the multidirectional stripe
+        remover of Liang et al. (2016), with the composite frequency
+        mask shown next to the result
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
       * Two-way merge of the forward and backward scans (gwy_twoway):
@@ -56,6 +59,7 @@ from matplotlib.widgets import RectangleSelector, SpanSelector
 
 import gwy_loader
 import gwy_processing as gp
+import gwy_destripe as gd
 import gwy_twoway as gtw
 
 
@@ -89,6 +93,24 @@ def _op_percentile(data, params, dx, dy):
     return gp.filter_by_percentile(
         data, min_percentile=params["min"], max_percentile=params["max"]
     )
+
+
+def _mdsr_kwargs(params):
+    """MDSR parameters as gwy_destripe keywords ('directions' comes from a
+    combobox, so it arrives as a string)."""
+    return dict(
+        angle=float(params.get("angle", 0.0)),
+        directions=int(params.get("directions", gd.DEFAULTS["directions"])),
+        levels=int(params.get("levels", gd.DEFAULTS["levels"])),
+        sigma=float(params.get("sigma", gd.DEFAULTS["sigma"])),
+        sigma_a=float(params.get("sigma_a", gd.DEFAULTS["sigma_a"])),
+        max_angle=float(params.get("max_angle", gd.DEFAULTS["max_angle"])),
+    )
+
+
+def _op_mdsr(data, params, dx, dy):
+    return gd.mdsr(data, pad=bool(params.get("pad", False)),
+                   **_mdsr_kwargs(params))
 
 
 def _fft_auto_items(data, params, dx, dy):
@@ -394,6 +416,28 @@ def _validate_percentile(params):
     return None
 
 
+def _validate_mdsr(params):
+    if params["sigma"] <= 0:
+        return "Damping width must be positive"
+    if params["sigma_a"] <= 0:
+        return "Angular falloff must be positive"
+    if params["levels"] < 1:
+        return "There must be at least one scale"
+    if int(params.get("directions", 8)) & (int(params.get("directions", 8)) - 1):
+        return "Directions must be a power of two"
+    if params["max_angle"] < 0:
+        return "Max direction cannot be negative"
+    return None
+
+
+def _describe_mdsr(params):
+    return (f"{params.get('angle', 0.0):g} deg, "
+            f"sigma={params.get('sigma', 0.0):g}, "
+            f"{params.get('directions', 8)} dirs, "
+            f"{params.get('levels', 5)} scales"
+            + (", mirrored edges" if params.get("pad") else ""))
+
+
 def _validate_fft(params):
     if params.get("mode", "none") in ("lowpass", "highpass") and params["cutoff"] <= 0:
         return "Cutoff frequency must be positive"
@@ -485,6 +529,29 @@ OPERATIONS = {
         ],
         "removed_label": "Clipped values (difference)",
         "validate": _validate_percentile,
+    },
+    "mdsr": {
+        "label": "Stripe removal (MDSR)",
+        "func": _op_mdsr,
+        "params": [
+            {"name": "angle", "label": "Stripe angle (deg)", "type": "float",
+             "default": 0.0, "min": -180.0, "max": 180.0},
+            {"name": "sigma", "label": "Damping width (bins)", "type": "float",
+             "default": gd.DEFAULTS["sigma"], "min": 0.0, "max": 1e4},
+            {"name": "directions", "label": "Directions", "type": "choice",
+             "default": "8", "values": ["4", "8", "16", "32"]},
+            {"name": "levels", "label": "Scales", "type": "int",
+             "default": gd.DEFAULTS["levels"], "min": 1, "max": 10},
+            {"name": "sigma_a", "label": "Angular falloff (rad)", "type": "float",
+             "default": gd.DEFAULTS["sigma_a"], "min": 0.0, "max": 10.0},
+            {"name": "max_angle", "label": "Max direction (deg)", "type": "float",
+             "default": gd.DEFAULTS["max_angle"], "min": 0.0, "max": 90.0},
+            {"name": "pad", "label": "Mirror edges", "type": "bool",
+             "default": False},
+        ],
+        "removed_label": "Removed stripes",
+        "validate": _validate_mdsr,
+        "describe": _describe_mdsr,
     },
     "fft_filter": {
         "label": "FFT filter",
@@ -662,6 +729,7 @@ OPERATION_ROWS = [
     ("plane_level", "polynomial"),
     ("align_rows",),
     ("fft_filter",),
+    ("mdsr",),
     ("remove_scars",),
     ("@fft_spectrum",),
     ("zero_baseline",),
@@ -1619,6 +1687,117 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
         self._update_zoom_window()
 
 
+class MDSRDialog(ZoomAreaMixin, OperationDialog):
+    """
+    Multidirectional stripe remover (MDSR), the method of Liang et al.
+    (2016) implemented in gwy_destripe.
+
+    The image is split into shift-invariant subbands of different scale and
+    direction (a nonsubsampled contourlet transform), the frequencies that
+    carry stripes running in the given direction are damped in each of
+    them - the more so the closer the subband's own orientation is to the
+    stripes - and the image is put back together.
+
+    The left panel shows the resulting composite frequency mask: black is
+    removed, yellow is kept. The groove along the stripe frequencies is
+    what takes the stripes out; its width is set by 'Damping width' and its
+    waist at the center is the low-pass residual, which is never filtered
+    (add scales to narrow that waist and reach coarser stripes).
+
+    'Zoom window...' - or dragging on the result panel - opens the image
+    before and after the filter side by side, which is the honest way to
+    check that only stripes were removed.
+    """
+
+    ZOOM_SOURCE = "result"
+
+    def __init__(self, app, op_key="mdsr"):
+        self._last_result = None
+        self._init_zoom()
+        super().__init__(app, op_key)
+        self.geometry("1500x850")
+
+    def _build_params(self):
+        super()._build_params()
+        btns = ttk.Frame(self, padding=(8, 0, 8, 4))
+        btns.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(btns, text="Zoom window...",
+                   command=self.open_zoom_window).pack(side=tk.LEFT, padx=2)
+        ttk.Label(
+            btns,
+            text="Stripe angle: 0 = horizontal scan lines, 90 = vertical  |  "
+                 "Drag on the result panel to pick the zoom area",
+        ).pack(side=tk.LEFT, padx=12)
+
+    # ---- zoom on a selected area (see ZoomAreaMixin) ----
+
+    def _zoom_panels(self):
+        if self._last_result is None:
+            return None
+        params = self.get_params()
+        tag = f" - {describe_step(self.op_key, params)}" if params else ""
+        return ([("Before destriping", self._base_data()),
+                 ("After destriping", self._last_result)], tag)
+
+    def _redraw_zoom_source(self):
+        self.update_preview()
+
+    # ---- drawing ----
+
+    def _draw(self, result, removed):
+        app = self.app
+        self._last_result = result
+        data = self._base_data()
+        ny, nx = data.shape
+        extent = (0, app.x_real, 0, app.y_real)
+
+        params = self.get_params() or {}
+        mask = gd.mdsr_mask(data.shape, **_mdsr_kwargs(params))
+        # frequency axes in physical units, on the bin edges
+        freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=app.dx))
+        freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=app.dy))
+        hx, hy = 0.5 / (nx * app.dx), 0.5 / (ny * app.dy)
+        freq_extent = [freq_x[0] - hx, freq_x[-1] + hx,
+                       freq_y[-1] + hy, freq_y[0] - hy]
+
+        self.figure.clf()
+        gs = self.figure.add_gridspec(2, 2, width_ratios=[1.6, 1.0])
+        ax0 = self.figure.add_subplot(gs[:, 0])
+        ax1 = self.figure.add_subplot(gs[0, 1])
+        ax2 = self.figure.add_subplot(gs[1, 1])
+
+        im0 = ax0.imshow(mask, origin="upper", cmap="viridis",
+                         extent=freq_extent, aspect="equal", vmin=0, vmax=1)
+        # the groove reaches about 2.5 sigma bins, so it takes out
+        # stripe-parallel structure longer than this
+        sigma = float(params.get("sigma", gd.DEFAULTS["sigma"])) or 1.0
+        reach = nx * app.dx / (2.5 * sigma)
+        ax0.set_title(f"MDSR mask (0 = removed) - takes out stripe-parallel\n"
+                      f"structure longer than ~{reach:.2f} {app.spatial_units}")
+        ax0.set_xlabel(f"fx (1/{app.spatial_units})")
+        ax0.set_ylabel(f"fy (1/{app.spatial_units})")
+        self.figure.colorbar(im0, ax=ax0, fraction=0.046).set_label("kept")
+
+        im1 = ax1.imshow(result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+                         extent=extent, aspect="equal")
+        ax1.set_title("Preview: result  (drag = area to zoom)")
+        ax1.set_xlabel(f"x ({app.spatial_units})")
+        ax1.set_ylabel(f"y ({app.spatial_units})")
+        self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
+
+        im2 = ax2.imshow(removed, origin="upper", cmap="viridis",
+                         extent=extent, aspect="equal")
+        ax2.set_title(self.spec["removed_label"])
+        ax2.set_xlabel(f"x ({app.spatial_units})")
+        self.figure.colorbar(im2, ax=ax2, fraction=0.046).set_label(app.z_units)
+
+        self._mark_zoom_rect(ax1, ax2)
+        self.figure.tight_layout()
+        self._attach_zoom_selector(ax1)
+        self.canvas.draw()
+        self._update_zoom_window()
+
+
 class CropDialog(OperationDialog):
     """
     Crop dialog: drag a rectangle on the full image to select the region,
@@ -1854,6 +2033,7 @@ DIALOG_CLASSES = {
     "crop": CropDialog,
     "polynomial": PolynomialDialog,
     "fft_filter": FFTFilterDialog,
+    "mdsr": MDSRDialog,
     "percentile": PercentileDialog,
 }
 

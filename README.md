@@ -9,6 +9,7 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * **`gwy_loader.py`**: A pure Python module for parsing and reading `.gwy` files. It extracts data fields, metadata, physical dimensions, and SI units.
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
+* **`gwy_destripe.py`**: Multidirectional stripe removal (MDSR) — the contourlet-domain destriping method of Liang et al. (2016).
 * **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, and batch folder processing.
 
 ## Requirements
@@ -33,10 +34,59 @@ environment variable to point elsewhere.
 
 ### Image Processing (`gwy_processing.py`)
 * **Plane Leveling** (`level_by_plane_fit`): Subtracts a fitted background plane to remove large-scale sample tilt.
-* **Scar Removal** (`remove_scars`): Detects and interpolates horizontal line defects (strokes) introduced during scanning.
+* **Scar Removal** (`remove_scars`): Detects and interpolates horizontal line defects (strokes) introduced during scanning. For stripes that run the whole width of the scan rather than isolated strokes, see the MDSR destriper below.
 * **Baseline Adjustment** (`set_baseline_to_zero`): Shifts the minimum data point to a base of zero.
 * **Outlier Filtering** (`filter_by_percentile`): Clips extreme values (spikes) based on a designated percentile range. In the GUI the clip is *re-editable*: reopening the dialog right after a clip edits that same step, so the histogram still shows the full unclipped distribution and the limits can be widened again instead of only narrowed.
 * **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft_mask`): 2D FFT analysis (no windowing - the displayed spectrum is exactly the one being filtered, normalized so the DC bin is the image mean) and frequency-domain filtering through a single mask that can combine a radial lowpass/highpass (`build_pass_mask`), circular notches (`build_notch_mask`), rectangular patches (`build_rect_mask`), and straight bands (`build_band_mask`). Noise is auto-detected systematically (`detect_fft_noise`) on the *excess* spectrum - the dB magnitude above the local radial background (`fft_excess_db`), so the falloff of the real topography never triggers it: streak columns/rows (median excess along the axis), coherent interference peaks sitting on the fx/fy axes, and off-axis regions each get their own statistically matched test. The whole mask can be given a smooth Gaussian roll-off (`smooth_fft_mask`) instead of hard edges. The GUI exposes all of these in one FFT-filter dialog with a large interactive spectrum (click to place cutoff/notches/bands, drag to notch a rectangle) and a *Zoom window* that shows the image before and after the filter side by side on one color scale, cropped to an area dragged on the result panel - so it can be checked close up that the filter took out the noise and not the topography.
+
+### Stripe Removal (`gwy_destripe.py`)
+
+`mdsr` implements the **multidirectional stripe remover** of X. Liang et al.,
+*"Stripe artifact elimination based on nonsubsampled contourlet transform for
+light sheet fluorescence microscopy"*, J. Biomed. Opt. **21**(10), 106005
+(2016), following the reference implementation in
+[General-Stripe-Removal](https://github.com/NiklasRottmayer/General-Stripe-Removal)
+(`Matlab-Stripe-Removal/Algorithms/MDSR.m`). The image is decomposed into
+shift-invariant subbands of different scale and direction (a nonsubsampled
+contourlet transform), the frequencies carrying stripes of the given
+direction are damped in every high-pass subband — with a groove that narrows
+as the subband's own orientation moves away from the stripes — and the image
+is reconstructed.
+
+Both stages of the NSCT are nonsubsampled, i.e. plain linear shift-invariant
+filters, and the damping is a frequency-domain multiplication, so the whole
+method is a single linear filter. It is implemented as one: the analysis
+filters, dampings and synthesis filters are accumulated into one frequency
+mask (`mdsr_mask`) applied in a single FFT round trip. That is exact, not an
+approximation of the subband loop, and it makes the filter fast enough for a
+live preview. The filter bank itself is built directly in the frequency
+domain — raised-cosine rings and angular wedges that sum to exactly one, so
+reconstruction is perfect — instead of the `maxflat`/`dmaxflat7` filter banks
+of Cunha's NSCT toolbox that the reference implementation calls; the method,
+the damping equations and the parameters are the paper's, the filter-bank
+transfer functions are not bit-identical.
+
+Parameters (`angle`, `sigma`, `directions`, `levels`, `sigma_a`, `max_angle`):
+
+* `angle` — direction of the stripes, 0° = horizontal scan lines (the usual
+  AFM artifact), 90° = vertical.
+* `sigma` — width of the damping groove **in frequency bins**, as in the
+  reference implementation. It trades stripe removal against real structure
+  that is itself elongated along the scan lines: the groove reaches about
+  2.5·σ bins, so it removes stripe-parallel features longer than roughly
+  `nx/(2.5σ)` pixels. The reference recommends 5–25 for ~1000 px light-sheet
+  images; on a 512 px AFM scan that is aggressive, hence the lower default.
+* `levels` — number of scales. The low-pass residual is never filtered, so
+  raise this until no stripes are left in it.
+* `directions`, `sigma_a`, `max_angle` — subbands per scale, how fast the
+  damping narrows with angular deviation, and the deviation beyond which a
+  subband is left alone.
+
+Two things follow from the method itself and are worth knowing: the exact
+zero-frequency line along the stripes is damped to zero at any σ, so MDSR
+always removes the per-line offsets (the overall mean height is kept); and a
+plane tilt across the slow axis is itself a set of line offsets, so **level
+the image before destriping** or the filter will eat the tilt.
 
 ### Two-Way Scan Processing (`gwy_twoway.py`)
 
