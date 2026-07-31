@@ -69,6 +69,10 @@ along the given direction, and leaves a clean image behind — and **DeStripe**
 answers statistically, from the image's own spectrum, which is why it needs
 no direction and no parameters at all.
 
+> The sections below describe how each method works. For **which one to use
+> and how to set its parameters**, with measured comparisons on data whose
+> answer is known, see [STRIPE_REMOVAL_GUIDE.md](STRIPE_REMOVAL_GUIDE.md).
+
 #### MDSR — multidirectional stripe remover (Fourier filtering)
 
 `mdsr` implements the method of Liang et al. [[1]](#stripe-references),
