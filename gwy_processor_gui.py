@@ -9,7 +9,9 @@ Provides an interactive Tkinter application to:
       * Polynomial background removal with separate x/y orders
         (level_by_polynomial_xy)
       * Align rows: median of differences / polynomial (align_rows)
-      * Percentile range clipping (filter_by_percentile)
+      * Percentile range clipping (filter_by_percentile), re-editable:
+        a clip opened right after another one edits that same step, so
+        the range can be widened again and not only narrowed
       * FFT filtering (filter_by_2d_fft_mask): lowpass/highpass, circular
         notches, rectangles and straight bands combined in one dialog,
         with a large interactive spectrum (click to place cutoff/notches,
@@ -21,7 +23,7 @@ Provides an interactive Tkinter application to:
         scanner lag / hysteresis alignment, parachuting-artifact
         detection and soft-min merging
   - Keep a log of every change applied to the image
-  - Undo changes step by step (or reset to the original data)
+  - Undo and redo changes step by step (or reset to the original data)
   - Batch-process every .gwy file in a folder by replaying the
     current processing pipeline on the selected channel
   - Save the result as an image or back into a .gwy file, next to
@@ -451,7 +453,7 @@ OPERATIONS = {
         "removed_label": "Removed plane",
     },
     "polynomial": {
-        "label": "Polynomial background",
+        "label": "Poly background",   # short: shares a button row with Plane level
         "func": _op_polynomial,
         "params": [
             {"name": "x_order", "label": "X order", "type": "int",
@@ -525,10 +527,10 @@ OPERATIONS = {
         "removed_label": "Subtracted offset",
         "instant": True,  # applied directly, no preview dialog
     },
-    # Two-way (forward/backward) operations. Not in OPERATION_ORDER: they need
-    # a channel *pair* rather than the single current image, so they get their
-    # own buttons and dialogs, and `needs_pair` tells apply_pipeline to hand
-    # them the forward/backward context.
+    # Two-way (forward/backward) operations: they need a channel *pair*
+    # rather than the single current image, so they get their own dialogs,
+    # and `needs_pair` tells apply_pipeline to hand them the forward/backward
+    # context.
     "two_way": {
         "label": "Two-way merge (Fwd/Bwd)",
         "func": _op_two_way,
@@ -649,16 +651,28 @@ OPERATIONS = {
     },
 }
 
-# Order in which operation buttons appear in the main window
+# Layout of the operation buttons in the main window: one entry per row,
+# several keys in a row put the buttons side by side. The order follows the
+# way the steps are normally used on a scan, not the order OPERATIONS
+# happens to declare them. "@fft_spectrum" is the view-only spectrum window,
+# not an operation.
+OPERATION_ROWS = [
+    ("two_way",),
+    ("parachute",),
+    ("plane_level", "polynomial"),
+    ("align_rows",),
+    ("fft_filter",),
+    ("remove_scars",),
+    ("@fft_spectrum",),
+    ("zero_baseline",),
+    ("crop",),
+    ("percentile",),
+]
+
+# Flat list of the single-image operations, in button order
 OPERATION_ORDER = [
-    "crop",
-    "plane_level",
-    "polynomial",
-    "align_rows",
-    "percentile",
-    "fft_filter",
-    "remove_scars",
-    "zero_baseline",
+    key for row in OPERATION_ROWS for key in row
+    if not key.startswith("@") and not OPERATIONS[key].get("needs_pair")
 ]
 
 
@@ -1166,9 +1180,16 @@ class OperationDialog(tk.Toplevel):
             self.after_cancel(self._after_id)
         self._after_id = self.after(self.PREVIEW_DEBOUNCE_MS, self.update_preview)
 
+    def _base_data(self):
+        """The image the operation is previewed on. Normally the current
+        data; a dialog that re-edits its own last step overrides this with
+        the image from before that step."""
+        return self.app.data
+
     def _compute(self, params):
-        """Run the operation on the app's current data."""
-        return self.spec["func"](self.app.data, params, self.app.dx, self.app.dy)
+        """Run the operation on the base image."""
+        return self.spec["func"](self._base_data(), params,
+                                 self.app.dx, self.app.dy)
 
     def _validated_params(self, show_error=False):
         params = self.get_params()
@@ -1198,7 +1219,7 @@ class OperationDialog(tk.Toplevel):
         except Exception as e:
             self.status_var.set(str(e))
             return
-        removed = self.app.data - result
+        removed = self._base_data() - result
         self._draw(result, removed)
 
     def _draw(self, result, removed):
@@ -1396,7 +1417,7 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
             return None
         params = self.get_params()
         tag = f" - {describe_step(self.op_key, params)}" if params else ""
-        return ([("Before filtering", self.app.data),
+        return ([("Before filtering", self._base_data()),
                  ("After filtering", self._last_result)], tag)
 
     def _redraw_zoom_source(self):
@@ -1701,14 +1722,47 @@ class PercentileDialog(OperationDialog):
     on the plot, the clipped result, and the difference.
 
     The min/max percentile entries stay in sync with the dragged range.
+
+    Clipping is RE-EDITABLE: when the previous step was itself a clip, this
+    dialog edits that step instead of clipping the already-clipped data. So
+    the histogram keeps showing the full range of the unclipped image and
+    the limits can be widened again - clipping on top of a clip could only
+    ever narrow the range, and the values outside it are already gone.
     """
 
     def __init__(self, app, op_key="percentile"):
+        self._reedit = bool(app.pipeline and app.undo_stack
+                            and app.pipeline[-1][0] == op_key)
+        self._base = app.undo_stack[-1][0] if self._reedit else app.data
         # Sorted copy of the data for fast value <-> percentile conversion
-        self._sorted = np.sort(app.data.ravel())
+        self._sorted = np.sort(self._base.ravel())
         self._span = None
         super().__init__(app, op_key)
         self.geometry("1350x560")
+        if self._reedit:
+            self.status_var.set("Editing the previous clip - full range shown")
+
+    def _base_data(self):
+        return self._base
+
+    def _build_params(self):
+        super()._build_params()
+        if self._reedit:
+            # start from the limits of the clip being edited
+            prev = self.app.pipeline[-1][1]
+            for name in ("min", "max"):
+                if name in prev:
+                    self.vars[name].set(prev[name])
+
+    def apply(self):
+        params = self._validated_params(show_error=True)
+        if params is None:
+            return
+        if self._reedit:
+            self.app.reapply_last_operation(self.op_key, params)
+        else:
+            self.app.apply_operation(self.op_key, params)
+        self.destroy()
 
     # ---- value <-> percentile conversion ----
 
@@ -1738,11 +1792,14 @@ class PercentileDialog(OperationDialog):
         self.figure.clf()
         ax0, ax1, ax2 = self.figure.subplots(1, 3)
 
-        # Histogram of the current data distribution (log counts so the
+        # Histogram of the data the clip is computed from - the unclipped
+        # image when a previous clip is being re-edited (log counts so the
         # outlier tails are visible)
-        ax0.hist(app.data.ravel(), bins=200, color="steelblue")
+        base = self._base
+        ax0.hist(base.ravel(), bins=200, color="steelblue")
         ax0.set_yscale("log")
-        ax0.set_title("Distribution (drag to select range)")
+        ax0.set_title("Distribution before the clip (drag to select range)"
+                      if self._reedit else "Distribution (drag to select range)")
         ax0.set_xlabel(f"value ({app.z_units})")
         ax0.set_ylabel("count")
 
@@ -1750,8 +1807,8 @@ class PercentileDialog(OperationDialog):
         try:
             lo = self.vars["min"].get()
             hi = self.vars["max"].get()
-            vmin = np.percentile(app.data, lo)
-            vmax = np.percentile(app.data, hi)
+            vmin = np.percentile(base, lo)
+            vmax = np.percentile(base, hi)
             ax0.axvline(vmin, color="red", linewidth=1.5)
             ax0.axvline(vmax, color="red", linewidth=1.5)
             ax0.axvspan(vmin, vmax, color="red", alpha=0.08)
@@ -2785,7 +2842,8 @@ class GwyProcessorGUI(tk.Tk):
         self.field = None           # currently selected GwyDataField
         self.original_data = None   # data as loaded (display units)
         self.data = None            # current processed data (display units)
-        self.undo_stack = []        # list of np.ndarray snapshots
+        self.undo_stack = []        # list of state snapshots (see _snapshot)
+        self.redo_stack = []        # snapshots popped by undo, for redo
         self.pipeline = []          # list of (op_key, params) applied in order
         self.log_entries = []       # list of log strings (with timestamps)
         self.x_real = self.y_real = 1.0
@@ -2828,29 +2886,30 @@ class GwyProcessorGUI(tk.Tk):
         proc = ttk.LabelFrame(left, text="Operations", padding=6)
         proc.pack(fill=tk.X, pady=(0, 6))
 
-        for key in OPERATION_ORDER:
-            suffix = "" if OPERATIONS[key].get("instant") else "..."
-            ttk.Button(
-                proc,
-                text=OPERATIONS[key]["label"] + suffix,
-                command=lambda k=key: self.open_operation(k),
-            ).pack(fill=tk.X, pady=1)
-
-        for i, key in enumerate(("two_way", "parachute")):
-            ttk.Button(
-                proc,
-                text=OPERATIONS[key]["label"] + "...",
-                command=lambda k=key: self.open_operation(k),
-            ).pack(fill=tk.X, pady=(6 if i == 0 else 1, 1))
-
-        ttk.Button(proc, text="View FFT spectrum", command=self.show_fft).pack(
-            fill=tk.X, pady=(6, 1)
-        )
+        for row in OPERATION_ROWS:
+            line = ttk.Frame(proc)
+            line.pack(fill=tk.X, pady=1)
+            for i, key in enumerate(row):
+                if key == "@fft_spectrum":
+                    btn = ttk.Button(line, text="View FFT spectrum",
+                                     command=self.show_fft)
+                else:
+                    suffix = "" if OPERATIONS[key].get("instant") else "..."
+                    btn = ttk.Button(
+                        line,
+                        text=OPERATIONS[key]["label"] + suffix,
+                        command=lambda k=key: self.open_operation(k),
+                    )
+                btn.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                         padx=(0, 2) if i < len(row) - 1 else 0)
 
         # ---- Undo / reset ----
         hist = ttk.Frame(left)
         hist.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(hist, text="Undo", command=self.undo).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2)
+        )
+        ttk.Button(hist, text="Redo", command=self.redo).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2)
         )
         ttk.Button(hist, text="Reset to original", command=self.reset).pack(
@@ -2954,6 +3013,7 @@ class GwyProcessorGUI(tk.Tk):
         self._orig_extent = (self.x_real, self.y_real)
         self.data = data
         self.undo_stack = []
+        self.redo_stack = []
         self.pipeline = []
         self.log_entries = []
         self.log_list.delete(0, tk.END)
@@ -3058,7 +3118,7 @@ class GwyProcessorGUI(tk.Tk):
                 "Processing error", f"{describe_step(op_key, params)} failed:\n{e}"
             )
             return
-        self.undo_stack.append((self.data, self.x_real, self.y_real))
+        self._push_undo()
         self.data = new_data
         # Operations like crop change the image dimensions; keep the
         # physical extents consistent (pixel size dx/dy never changes).
@@ -3068,6 +3128,21 @@ class GwyProcessorGUI(tk.Tk):
         self.pipeline.append((op_key, params))
         self._log(describe_step(op_key, params))
         self.redraw()
+
+    def reapply_last_operation(self, op_key, params):
+        """Replace the last pipeline step with a new parameter set: the image
+        goes back to the state before that step and the operation is applied
+        again. Used by dialogs that re-edit their own last step (the range
+        clip) instead of stacking a second one on top of it, which for a
+        clip could only ever narrow the range further."""
+        if not (self.pipeline and self.undo_stack
+                and self.pipeline[-1][0] == op_key):
+            self.apply_operation(op_key, params)
+            return
+        old = self.pipeline[-1]
+        self._restore(self.undo_stack.pop())
+        self._log(f"UNDO (re-edit): {describe_step(*old)}")
+        self.apply_operation(op_key, params)
 
     def show_fft(self):
         """Open a window showing the current FFT magnitude spectrum."""
@@ -3088,15 +3163,45 @@ class GwyProcessorGUI(tk.Tk):
         NavigationToolbar2Tk(canvas, win).update()
         canvas.draw()
 
-    # ------------------------------------------------------- Undo / logging --
+    # ------------------------------------------------ Undo / redo / logging --
+
+    def _snapshot(self):
+        """The whole editing state, so undo/redo restore the pipeline too and
+        not just the pixels (Reset clears the pipeline, for instance)."""
+        return (self.data, self.x_real, self.y_real, list(self.pipeline))
+
+    def _restore(self, snapshot):
+        self.data, self.x_real, self.y_real, pipeline = snapshot
+        self.pipeline = list(pipeline)
+
+    def _push_undo(self):
+        """Remember the current state before changing it. A new change makes
+        whatever was undone unreachable, so the redo stack is dropped."""
+        self.undo_stack.append(self._snapshot())
+        self.redo_stack.clear()
 
     def undo(self):
         if not self.undo_stack:
             self.status_var.set("Nothing to undo")
             return
-        self.data, self.x_real, self.y_real = self.undo_stack.pop()
-        undone = self.pipeline.pop()
-        self._log(f"UNDO: {describe_step(*undone)}")
+        target = self.undo_stack.pop()
+        undone = (describe_step(*self.pipeline[-1])
+                  if len(self.pipeline) > len(target[3]) else "previous state")
+        self.redo_stack.append(self._snapshot())
+        self._restore(target)
+        self._log(f"UNDO: {undone}")
+        self.redraw()
+
+    def redo(self):
+        if not self.redo_stack:
+            self.status_var.set("Nothing to redo")
+            return
+        target = self.redo_stack.pop()
+        redone = (describe_step(*target[3][-1])
+                  if len(target[3]) > len(self.pipeline) else "next state")
+        self.undo_stack.append(self._snapshot())
+        self._restore(target)
+        self._log(f"REDO: {redone}")
         self.redraw()
 
     def reset(self):
@@ -3104,7 +3209,7 @@ class GwyProcessorGUI(tk.Tk):
             return
         if not self.pipeline and not self.undo_stack:
             return
-        self.undo_stack.append((self.data, self.x_real, self.y_real))
+        self._push_undo()
         self.data = self.original_data.copy()
         self.x_real, self.y_real = self._orig_extent
         self.pipeline = []
