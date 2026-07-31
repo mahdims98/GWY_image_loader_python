@@ -228,6 +228,19 @@ that range internally and mapped back afterwards. AFM heights in nanometres
 would otherwise be clipped away entirely, and this way the published
 parameters transfer unchanged.
 
+**Parameter sweep.** Since the two gains are best judged by eye and against
+each other, the GSR mode has a *Parameter sweep...* button that runs a grid
+of pairs and shows the results side by side — 3×3 by default, rows stepping
+`mu1` and columns stepping `mu2`. Both axes use the *same* step factor around
+the values currently in the dialog, so with factor 2 the rows are `mu1/2,
+mu1, 2·mu1` and the columns `mu2/2, mu2, 2·mu2`; the diagonal is then the
+"scale both together" direction the paper describes. Every cell is computed
+on the whole image and only then cropped, so the zoom area picked in the
+dialog (drag on the result panel, then *Zoom area only*) changes what you see
+and never what is computed. All cells share one color scale, the panels are
+linked for toolbar zooming, and clicking a cell copies its pair back into the
+dialog.
+
 #### Choosing between them, and two shared caveats
 
 MDSR is a single linear filter: fast, predictable, and easy to reason about
