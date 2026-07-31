@@ -10,7 +10,8 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
 * **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
-* **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, and batch folder processing.
+* **`gwy_colormaps.py`**: Gwyddion's false-colour gradients (`Gray`, `Sky`, `Body`, `Rainbow2`, `Viridis`, ... 60 in all) as matplotlib colormaps, plus the application-wide selection used by the GUI.
+* **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, a folder quick view, and batch folder processing.
 
 ## Requirements
 
@@ -563,8 +564,60 @@ Both windows offer two ways to commit the result:
   appends: the originals already in it are not written twice, and a repeated
   save of the same channel gets a numbered title (`... (processed) 2`).
 
+### Quick view (folder browser)
+
+The GUI has two tabs. *Processing* is the workbench described above; **Quick
+view** is for looking through a measurement session without deciding anything.
+
+* **Select folder...** lists every `.gwy` file in it, in natural order
+  (`_2` before `_10`).
+* Each image is shown with the same two steps applied — a fitted plane
+  subtracted, then rows aligned with a **second-order polynomial** — which is
+  what makes a raw scan readable. Nothing is written, and nothing carries over
+  to the processing tab.
+* **Next** / **Back** step through the folder, with the position (`7 / 17`) and
+  the file name above the image. Click the image once and the left/right arrow
+  keys do the same.
+* The **Channel** box works like the one in the main window and keeps your
+  choice as you step; a file that does not have that channel falls back to one
+  whose name starts the same way, then to a Height channel.
+* Results are cached per file and channel, so stepping back is instant. The
+  cache holds the last 32 images and then drops the oldest.
+
+### Colour maps
+
+The **Display** box in the main window selects the false-colour gradient, with a
+strip underneath showing what it looks like. The choice applies to the main
+image, to every dialog preview drawn from then on, and to saved images, so what
+you export is what you saw.
+
+The list holds all 60 of Gwyddion's gradients. They are not look-alikes: each
+one is the stop table from Gwyddion's own `share/gwyddion/gradients` resource
+files, transcribed into `gwy_colormaps.GRADIENTS` and rebuilt with
+`LinearSegmentedColormap.from_list`, which interpolates between stops exactly as
+Gwyddion does. The dozen most used ones (`Gray`, `Gwyddion.net`, `Gold`, `Body`,
+`Sky`, `Spring`, `Cold`, `Warm`, `Rainbow1`, `Rainbow2`, `Viridis`, `Spectral`,
+`BW1`, `Gray-inverted`) are listed first, then the rest alphabetically. The
+default is `Gwyddion.net`, the black → dark red → yellow → white palette this
+project has always drawn with — it was previously an approximation built in
+`gwy_processing.get_gwyddion_cmap()` and is now the exact gradient (the colours
+moved by less than 0.5 %).
+
+Outside the GUI:
+
+```python
+import gwy_colormaps as gcm
+
+gcm.names()             # every gradient, common ones first
+cmap = gcm.get("Sky")   # a matplotlib colormap
+gcm.set_current("Sky")  # what gcm.current() returns from now on
+```
+
+`get()` also accepts matplotlib names (`"viridis"`) and falls back to the
+default instead of raising, so a stale name cannot stop a window from drawing.
+
 ### Visualization
-* Offers a custom colormap approximating the default Gwyddion "Gwy" palette (`get_gwyddion_cmap`).
+* `get_gwyddion_cmap()` returns Gwyddion's default palette; `gwy_colormaps.current()` returns whichever gradient the user has selected.
 * Convenient wrapper functions for drawing plots with real-world scaled dimensions (`plot_image`, `plot_2d_fft`).
 
 ## Quick Start Example

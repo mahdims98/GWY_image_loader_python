@@ -28,6 +28,12 @@ Provides an interactive Tkinter application to:
       * Two-way merge of the forward and backward scans (gwy_twoway):
         scanner lag / hysteresis alignment, parachuting-artifact
         detection and soft-min merging
+  - Draw with any of Gwyddion's false-colour gradients (gwy_colormaps),
+    chosen in the main window and followed by every preview and every
+    saved image
+  - Flip through a whole folder in the 'Quick view' tab: each .gwy file
+    is shown with a plane subtracted and rows aligned (polynomial,
+    order 2), one Next/Back step at a time
   - Keep a log of every change applied to the image
   - Undo and redo changes step by step (or reset to the original data)
   - Batch-process every .gwy file in a folder by replaying the
@@ -62,6 +68,7 @@ from matplotlib.widgets import RectangleSelector, SpanSelector
 
 import gwy_loader
 import gwy_processing as gp
+import gwy_colormaps as gcm
 import gwy_destripe as gd
 import gwy_twoway as gtw
 
@@ -924,7 +931,7 @@ def render_annotated_figure(data, x_real, y_real, title, spatial_units, z_units,
     fig = Figure(figsize=(7, 6), dpi=dpi)
     ax = fig.add_subplot(111)
     im = ax.imshow(
-        data, origin="upper", cmap=gp.get_gwyddion_cmap(),
+        data, origin="upper", cmap=gcm.current(),
         extent=(0, x_real, 0, y_real), aspect="equal",
     )
     ax.set_title(title)
@@ -973,7 +980,7 @@ def save_pure_image(data, path, x_real=None, y_real=None):
     square region)."""
     if x_real and y_real:
         data = _resample_to_square_pixels(data, x_real, y_real)
-    mpimage.imsave(path, data, cmap=gp.get_gwyddion_cmap(), origin="upper")
+    mpimage.imsave(path, data, cmap=gcm.current(), origin="upper")
 
 
 def _gwy_channel_titles(container):
@@ -1079,7 +1086,7 @@ class ZoomWindow(tk.Toplevel):
         v0, v1 = np.percentile(allv, [0.5, 99.5])
         if v1 <= v0:
             v1 = v0 + 1.0
-        cmap = gp.get_gwyddion_cmap()
+        cmap = gcm.current()
         im = None
         for ax, (title, img) in zip(axes, panels):
             im = ax.imshow(img, origin="upper", cmap=cmap, extent=extent,
@@ -1454,7 +1461,7 @@ class DestripeSweepWindow(tk.Toplevel):
             # display only, so the zoom area cannot change the result
             result = op["func"](self._data, params, self.app.dx, self.app.dy)
             ax.imshow(self._crop(result), origin="upper",
-                      cmap=gp.get_gwyddion_cmap(), extent=self._extent(),
+                      cmap=gcm.current(), extent=self._extent(),
                       aspect="equal", vmin=self._vlim[0], vmax=self._vlim[1])
         self.canvas.draw()
         self._after_id = self.after(1, self._step)
@@ -1806,7 +1813,7 @@ class OperationDialog(tk.Toplevel):
         ax1, ax2 = self.figure.subplots(1, 2)
 
         im1 = ax1.imshow(
-            result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+            result, origin="upper", cmap=gcm.current(),
             extent=extent, aspect="equal",
         )
         ax1.set_title("Preview: result")
@@ -2172,7 +2179,7 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
                 ax0.axhspan(-c - radius, -c + radius, color="red", alpha=0.15)
 
         im1 = ax1.imshow(
-            result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+            result, origin="upper", cmap=gcm.current(),
             extent=extent, aspect="equal",
         )
         ax1.set_title("Preview: result  (drag = area to zoom)")
@@ -2345,7 +2352,7 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         ax1 = self.figure.add_subplot(gs[0, 1])
         ax2 = self.figure.add_subplot(gs[1, 1])
 
-        im0 = ax0.imshow(result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+        im0 = ax0.imshow(result, origin="upper", cmap=gcm.current(),
                          extent=extent, aspect="equal")
         ax0.set_title(f"Preview: {params.get('method', 'MDSR')} result  "
                       f"(drag = area to zoom)")
@@ -2379,7 +2386,7 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         (on the same color scale as the result would be hard to read, so it
         gets its own)."""
         app = self.app
-        im = ax.imshow(data, origin="upper", cmap=gp.get_gwyddion_cmap(),
+        im = ax.imshow(data, origin="upper", cmap=gcm.current(),
                        extent=extent, aspect="equal")
         ax.set_title("Input (before)")
         ax.set_xlabel(f"x ({app.spatial_units})")
@@ -2481,7 +2488,7 @@ class CropDialog(OperationDialog):
         ax1, ax2 = self.figure.subplots(1, 2)
 
         im1 = ax1.imshow(
-            app.data, origin="upper", cmap=gp.get_gwyddion_cmap(),
+            app.data, origin="upper", cmap=gcm.current(),
             extent=(0, app.x_real, 0, app.y_real), aspect="equal",
         )
         ax1.set_title("Drag to select crop region")
@@ -2516,7 +2523,7 @@ class CropDialog(OperationDialog):
 
         cy, cx = result.shape
         im2 = ax2.imshow(
-            result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+            result, origin="upper", cmap=gcm.current(),
             extent=(0, cx * app.dx, 0, cy * app.dy), aspect="equal",
         )
         ax2.set_title(f"Cropped preview ({cx}x{cy} px)")
@@ -2641,7 +2648,7 @@ class PercentileDialog(OperationDialog):
             )
 
         im1 = ax1.imshow(
-            result, origin="upper", cmap=gp.get_gwyddion_cmap(),
+            result, origin="upper", cmap=gcm.current(),
             extent=extent, aspect="equal",
         )
         ax1.set_title("Preview: result")
@@ -2739,7 +2746,7 @@ class CorrelationWindow(tk.Toplevel):
         ax = axes[1, 0]
         v0, v1 = np.percentile(merged_d, [0.5, 99.5])
         im = ax.imshow(merged_d, origin="upper",
-                       cmap=gp.get_gwyddion_cmap(), extent=extent,
+                       cmap=gcm.current(), extent=extent,
                        aspect="equal", vmin=v0, vmax=v1)
         fig.colorbar(im, ax=ax, fraction=0.046).set_label(z_units)
         ax.set_title(f"Merged result{tag}", fontsize=9)
@@ -2835,7 +2842,7 @@ class StripeWindow(tk.Toplevel):
         ax = axes[1, 1]
         v0, v1 = np.percentile(merged_d, [0.5, 99.5])
         im = ax.imshow(merged_d, origin="upper",
-                       cmap=gp.get_gwyddion_cmap(), extent=extent,
+                       cmap=gcm.current(), extent=extent,
                        aspect="equal", vmin=v0, vmax=v1)
         fig.colorbar(im, ax=ax, fraction=0.046).set_label(z_units)
         ax.set_title(f"Merged result{tag}", fontsize=9)
@@ -3168,7 +3175,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         else:
             v0, v1 = np.percentile(img, [0.5, 99.5])
             im = ax.imshow(img, origin="upper",
-                           cmap=cm or gp.get_gwyddion_cmap(), extent=extent,
+                           cmap=cm or gcm.current(), extent=extent,
                            aspect="equal", vmin=v0, vmax=v1)
         ax.set_title(title, fontsize=9)
         self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(app.z_units)
@@ -3243,7 +3250,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
             comp = np.dstack([nf, nb, nb])
             title = "Overlay - anaglyph (fwd red / bwd cyan)"
         else:
-            base = gp.get_gwyddion_cmap()(nf)
+            base = gcm.current()(nf)
             over = matplotlib.colormaps["gray"](nb)
             comp = (1.0 - alpha) * base + alpha * over
             title = f"Overlay - bwd at {alpha:.0%} opacity over fwd"
@@ -3643,11 +3650,245 @@ DIALOG_CLASSES["two_way"] = TwoWayDialog
 DIALOG_CLASSES["parachute"] = ParachuteDialog
 
 
+def channel_view(field):
+    """Everything needed to display one channel: the data converted to
+    display units, the physical size in those units, and the unit labels.
+
+    Shared by the main window and the quick view so both read a channel the
+    same way."""
+    xy_unit = _unit_of(field, "si_unit_xy")
+    z_unit = _unit_of(field, "si_unit_z")
+    xy_factor, spatial_units = spatial_scale(xy_unit)
+    z_factor, z_units = z_scale(z_unit)
+    data = field.data.astype(np.float64) * z_factor
+    ny, nx = data.shape
+    return {
+        "data": data,
+        "x_real": (field.xreal or nx) * xy_factor,
+        "y_real": (field.yreal or ny) * xy_factor,
+        "spatial_units": spatial_units,
+        "z_units": z_units,
+        "z_factor": z_factor,
+        "unit_xy_str": xy_unit,
+        "unit_z_str": z_unit,
+    }
+
+
+def _natural_key(name):
+    """Sort key that orders file_2 before file_10."""
+    return [int(t) if t.isdigit() else t.lower()
+            for t in re.split(r"(\d+)", name)]
+
+
+class QuickViewTab(ttk.Frame):
+    """Flip through a folder of .gwy files, minimally preprocessed.
+
+    Every image gets the same two steps - a fitted plane subtracted, then
+    rows aligned with a second-order polynomial - which is what makes a raw
+    scan readable without deciding anything about it. Nothing here is
+    applied to the processing tab; this is for looking, to find the scans
+    worth working on.
+
+    Results are cached per (file, channel) so stepping back is instant; the
+    cache is bounded because a folder can hold more images than fit in
+    memory.
+    """
+
+    CACHE_LIMIT = 32
+
+    def __init__(self, master, app):
+        super().__init__(master, padding=8)
+        self.app = app
+        self.folder = None
+        self.files = []          # full paths, natural order
+        self.index = -1
+        self._cache = {}         # (path, channel) -> processed view dict
+        self._cache_order = []   # keys, oldest first
+        self._build()
+
+    # ------------------------------------------------------------- layout --
+
+    def _build(self):
+        bar = ttk.Frame(self)
+        bar.pack(fill=tk.X)
+
+        ttk.Button(bar, text="Select folder...",
+                   command=self.select_folder).pack(side=tk.LEFT)
+        self.folder_label = ttk.Label(bar, text="No folder selected")
+        self.folder_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        nav = ttk.Frame(bar)
+        nav.pack(side=tk.RIGHT)
+        ttk.Label(nav, text="Channel:").pack(side=tk.LEFT)
+        self.channel_var = tk.StringVar()
+        self.channel_combo = ttk.Combobox(
+            nav, textvariable=self.channel_var, state="readonly", width=22)
+        self.channel_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.channel_combo.bind("<<ComboboxSelected>>",
+                                lambda e: self.show(self.index))
+        self.prev_btn = ttk.Button(nav, text="< Back",
+                                   command=lambda: self.step(-1))
+        self.prev_btn.pack(side=tk.LEFT)
+        self.count_label = ttk.Label(nav, text="0 / 0", width=10,
+                                     anchor=tk.CENTER)
+        self.count_label.pack(side=tk.LEFT, padx=4)
+        self.next_btn = ttk.Button(nav, text="Next >",
+                                   command=lambda: self.step(1))
+        self.next_btn.pack(side=tk.LEFT)
+
+        self.name_label = ttk.Label(self, text="", anchor=tk.CENTER,
+                                    font=("TkDefaultFont", 11, "bold"))
+        self.name_label.pack(fill=tk.X, pady=(6, 0))
+
+        self.figure = Figure(figsize=(7, 6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+        self.status_var = tk.StringVar(
+            value="Select a folder of .gwy files. Each one is shown with a "
+                  "plane subtracted and rows aligned (polynomial, order 2).")
+        ttk.Label(self, textvariable=self.status_var,
+                  wraplength=900).pack(fill=tk.X, pady=(4, 0))
+
+        # Arrow keys step through the folder once the image has the focus,
+        # which a click on it gives. They are bound to the canvas and not to
+        # the application, so they never fight with an entry field elsewhere.
+        plot = self.canvas.get_tk_widget()
+        plot.bind("<Button-1>", lambda e: plot.focus_set())
+        for key, delta in (("<Left>", -1), ("<Right>", 1),
+                           ("<Prior>", -1), ("<Next>", 1)):
+            plot.bind(key, lambda e, d=delta: self.step(d))
+        self._update_nav()
+
+    # -------------------------------------------------------------- files --
+
+    def select_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select a folder of .gwy files",
+            initialdir=os.path.dirname(self.app.filename or "") or ".")
+        if not folder:
+            return
+        names = sorted((f for f in os.listdir(folder)
+                        if f.lower().endswith(".gwy")), key=_natural_key)
+        if not names:
+            messagebox.showinfo(
+                "No files", "No .gwy files found in the selected folder.")
+            return
+        self.folder = folder
+        self.files = [os.path.join(folder, n) for n in names]
+        self._cache.clear()
+        self._cache_order.clear()
+        self.folder_label.config(
+            text=f"{os.path.basename(folder)}  ({len(self.files)} files)")
+        self.index = -1
+        self.show(0)
+
+    def step(self, delta):
+        if not self.files:
+            return
+        self.show(min(max(self.index + delta, 0), len(self.files) - 1))
+
+    def _update_nav(self):
+        n = len(self.files)
+        self.count_label.config(
+            text=f"{self.index + 1} / {n}" if n else "0 / 0")
+        for btn, ok in ((self.prev_btn, self.index > 0),
+                        (self.next_btn, 0 <= self.index < n - 1)):
+            btn.state(["!disabled"] if ok else ["disabled"])
+
+    # ------------------------------------------------------------ display --
+
+    def show(self, index):
+        """Load, preprocess and draw the file at `index`."""
+        if not self.files or not 0 <= index < len(self.files):
+            return
+        path = self.files[index]
+        name = os.path.basename(path)
+        self.index = index
+        self._update_nav()
+        self.name_label.config(text=f"{index + 1}/{len(self.files)}  -  {name}")
+
+        try:
+            channels = gwy_loader.load_gwy(path)
+        except Exception as e:
+            self._draw_message(f"Could not read {name}:\n{e}")
+            self.status_var.set(f"{name}: {e}")
+            return
+        if not channels:
+            self._draw_message(f"{name} has no data channels.")
+            return
+
+        names = list(channels)
+        self.channel_combo["values"] = names
+        channel = self.channel_var.get()
+        if channel not in channels:
+            # First file, or this one names its channels differently: keep
+            # the choice if a channel matches loosely, else prefer Height.
+            match = None
+            if channel:
+                prefix = channel.split(" ")[0]
+                match = next((n for n in names if n.startswith(prefix)), None)
+            channel = match or next((n for n in names if "Height" in n), names[0])
+            self.channel_var.set(channel)
+
+        view = self._processed(path, channel, channels[channel])
+        self._draw(view, name, channel)
+        self.status_var.set(
+            f"{name} - {channel}: plane subtracted, rows aligned "
+            f"(polynomial, order 2)")
+
+    def _processed(self, path, channel, field):
+        key = (path, channel)
+        if key in self._cache:
+            return self._cache[key]
+        view = channel_view(field)
+        data = gp.level_by_plane_fit(view["data"])
+        view["data"] = gp.align_rows(data, method="polynomial", order=2)
+        self._cache[key] = view
+        self._cache_order.append(key)
+        while len(self._cache_order) > self.CACHE_LIMIT:
+            self._cache.pop(self._cache_order.pop(0), None)
+        return view
+
+    def refresh_display(self):
+        """Redraw with the current colour map (nothing is recomputed)."""
+        if 0 <= self.index < len(self.files):
+            path = self.files[self.index]
+            key = (path, self.channel_var.get())
+            if key in self._cache:
+                self._draw(self._cache[key], os.path.basename(path), key[1])
+
+    def _draw(self, view, name, channel):
+        self.figure.clf()
+        ax = self.figure.add_subplot(111)
+        im = ax.imshow(
+            view["data"], origin="upper", cmap=gcm.current(),
+            extent=(0, view["x_real"], 0, view["y_real"]), aspect="equal",
+        )
+        ax.set_title(channel)
+        ax.set_xlabel(f"x ({view['spatial_units']})")
+        ax.set_ylabel(f"y ({view['spatial_units']})")
+        self.figure.colorbar(im, ax=ax, pad=0.05,
+                             fraction=0.046).set_label(view["z_units"])
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _draw_message(self, text):
+        self.figure.clf()
+        ax = self.figure.add_subplot(111)
+        ax.text(0.5, 0.5, text, ha="center", va="center",
+                transform=ax.transAxes, wrap=True)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas.draw()
+
+
 class GwyProcessorGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("GWY Processor")
-        self.geometry("1250x780")
+        self.geometry("1250x880")
 
         # --- State ---
         self.filename = None
@@ -3670,11 +3911,17 @@ class GwyProcessorGUI(tk.Tk):
     # ------------------------------------------------------------------ UI --
 
     def _build_layout(self):
+        # Two tabs: the processing workbench and the folder quick view.
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill=tk.BOTH, expand=True)
+        main_tab = ttk.Frame(self.tabs)
+        self.tabs.add(main_tab, text="Processing")
+
         # Left: controls, Right: plot
-        left = ttk.Frame(self, padding=8)
+        left = ttk.Frame(main_tab, padding=8)
         left.pack(side=tk.LEFT, fill=tk.Y)
 
-        right = ttk.Frame(self)
+        right = ttk.Frame(main_tab)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         # ---- File / channel section ----
@@ -3694,6 +3941,24 @@ class GwyProcessorGUI(tk.Tk):
         )
         self.channel_combo.pack(fill=tk.X)
         self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self.select_channel())
+
+        # ---- Display section: false-colour gradient ----
+        disp = ttk.LabelFrame(left, text="Display", padding=6)
+        disp.pack(fill=tk.X, pady=(0, 6))
+        row = ttk.Frame(disp)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Colour map:").pack(side=tk.LEFT)
+        self.cmap_var = tk.StringVar(value=gcm.current_name())
+        self.cmap_combo = ttk.Combobox(
+            row, textvariable=self.cmap_var, state="readonly",
+            values=gcm.names(), height=20,
+        )
+        self.cmap_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self.cmap_combo.bind("<<ComboboxSelected>>", lambda e: self.select_cmap())
+        self.cmap_strip = tk.Canvas(disp, height=16, highlightthickness=1,
+                                    highlightbackground="#909090")
+        self.cmap_strip.pack(fill=tk.X, pady=(4, 0))
+        self.cmap_strip.bind("<Configure>", lambda e: self._draw_cmap_strip())
 
         # ---- Operations section: one button per dialog ----
         proc = ttk.LabelFrame(left, text="Operations", padding=6)
@@ -3729,19 +3994,17 @@ class GwyProcessorGUI(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True
         )
 
-        # ---- Log section ----
-        log_frame = ttk.LabelFrame(left, text="Processing log", padding=6)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-
-        self.log_list = tk.Listbox(log_frame, height=8)
-        self.log_list.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(log_frame, text="Save log...", command=self.save_log).pack(
-            fill=tk.X, pady=(4, 0)
+        # The status line and the output buttons are anchored to the bottom
+        # and claimed before the log, so a short window shrinks the log
+        # instead of pushing the buttons off the screen.
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(left, textvariable=self.status_var, wraplength=260).pack(
+            side=tk.BOTTOM, fill=tk.X, pady=(6, 0)
         )
 
         # ---- Save / batch ----
         out = ttk.LabelFrame(left, text="Output", padding=6)
-        out.pack(fill=tk.X)
+        out.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Button(out, text="Save processed image...", command=self.save_image).pack(
             fill=tk.X, pady=1
         )
@@ -3752,9 +4015,14 @@ class GwyProcessorGUI(tk.Tk):
             fill=tk.X, pady=1
         )
 
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(left, textvariable=self.status_var, wraplength=260).pack(
-            fill=tk.X, pady=(6, 0)
+        # ---- Log section ----
+        log_frame = ttk.LabelFrame(left, text="Processing log", padding=6)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        self.log_list = tk.Listbox(log_frame, height=6)
+        self.log_list.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(log_frame, text="Save log...", command=self.save_log).pack(
+            fill=tk.X, pady=(4, 0)
         )
 
         # ---- Plot area ----
@@ -3764,6 +4032,38 @@ class GwyProcessorGUI(tk.Tk):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         toolbar = NavigationToolbar2Tk(self.canvas, right)
         toolbar.update()
+
+        # ---- Quick view tab ----
+        self.quick = QuickViewTab(self.tabs, self)
+        self.tabs.add(self.quick, text="Quick view")
+
+    # ------------------------------------------------------------- Colour --
+
+    def select_cmap(self):
+        """Switch the false-colour gradient used for topography everywhere."""
+        name = gcm.set_current(self.cmap_var.get())
+        self.cmap_var.set(name)
+        self._draw_cmap_strip()
+        if self.data is not None:
+            self.redraw()
+        self.quick.refresh_display()
+        self.status_var.set(f"Colour map: {name}")
+
+    def _draw_cmap_strip(self):
+        """Paint the selected gradient as a strip under the combo box."""
+        canvas = self.cmap_strip
+        canvas.delete("all")
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width < 2:
+            return
+        cmap = gcm.current()
+        for x in range(width):
+            r, g, b, _ = cmap(x / max(width - 1, 1))
+            canvas.create_line(
+                x, 0, x, height,
+                fill=f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}",
+            )
 
     # ------------------------------------------------------------- Loading --
 
@@ -3807,18 +4107,17 @@ class GwyProcessorGUI(tk.Tk):
 
         self.field = self.channels[name]
 
-        xy_unit = _unit_of(self.field, "si_unit_xy")
-        z_unit = _unit_of(self.field, "si_unit_z")
-        xy_factor, self.spatial_units = spatial_scale(xy_unit)
-        z_factor, self.z_units = z_scale(z_unit)
-        self.z_factor = z_factor          # display units -> SI conversion
-        self.unit_xy_str = xy_unit        # original SI unit strings, kept
-        self.unit_z_str = z_unit          # for .gwy export
+        view = channel_view(self.field)
+        self.spatial_units = view["spatial_units"]
+        self.z_units = view["z_units"]
+        self.z_factor = view["z_factor"]        # display units -> SI
+        self.unit_xy_str = view["unit_xy_str"]  # original SI unit strings,
+        self.unit_z_str = view["unit_z_str"]    # kept for .gwy export
 
-        data = self.field.data.astype(np.float64) * z_factor
+        data = view["data"]
         ny, nx = data.shape
-        self.x_real = (self.field.xreal or nx) * xy_factor
-        self.y_real = (self.field.yreal or ny) * xy_factor
+        self.x_real = view["x_real"]
+        self.y_real = view["y_real"]
         self.dx = self.x_real / nx
         self.dy = self.y_real / ny
 
@@ -4071,7 +4370,7 @@ class GwyProcessorGUI(tk.Tk):
         im = self.ax.imshow(
             self.data,
             origin="upper",
-            cmap=gp.get_gwyddion_cmap(),
+            cmap=gcm.current(),
             extent=(0, self.x_real, 0, self.y_real),
             aspect="equal",
         )

@@ -1,3 +1,4 @@
+import gwy_colormaps
 import gwy_loader
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -826,24 +827,18 @@ def detect_fft_noise(data, dx=1.0, dy=1.0, protect_radius=0.0,
 
 def get_gwyddion_cmap():
     """
-    Creates a custom colormap that approximates the default Gwyddion 'Gwy' style.
-    (Black -> Red -> Yellow -> White)
+    The default Gwyddion colormap (black -> dark red -> yellow -> white).
+
+    This used to be an approximation built here; it now comes from
+    gwy_colormaps, which holds the stop tables of every Gwyddion gradient,
+    so the colours are Gwyddion's own rather than a look-alike. Use
+    gwy_colormaps.current() instead when the user's choice should be
+    followed.
 
     Returns:
-        matplotlib.colors.LinearSegmentedColormap: The custom colormap.
+        matplotlib.colors.Colormap: The 'Gwyddion.net' gradient.
     """
-    colors = (
-        np.array(
-            [
-                (0, 0, 0),  # Black
-                (168, 40, 15),  # Dark Red
-                (243, 194, 93),  # Yellow
-                (255, 255, 255),  # White
-            ]
-        )
-        / 255
-    )
-    return mcolors.LinearSegmentedColormap.from_list("gwyddion_fake", colors)
+    return gwy_colormaps.get(gwy_colormaps.DEFAULT)
 
 
 def load_channel(filename, channel_name, fallback_to_height=False):
