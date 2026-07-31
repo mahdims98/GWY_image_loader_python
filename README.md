@@ -34,102 +34,267 @@ environment variable to point elsewhere.
 
 ### Image Processing (`gwy_processing.py`)
 * **Plane Leveling** (`level_by_plane_fit`): Subtracts a fitted background plane to remove large-scale sample tilt.
-* **Scar Removal** (`remove_scars`): Detects and interpolates horizontal line defects (strokes) introduced during scanning. For stripes that run the whole width of the scan rather than isolated strokes, see the MDSR destriper below.
+* **Scar Removal** (`remove_scars`): Detects and interpolates horizontal line defects (strokes) introduced during scanning. For stripes that run the whole width of the scan rather than isolated strokes, see [Stripe Removal](#stripe-removal-gwy_destripepy) below.
 * **Baseline Adjustment** (`set_baseline_to_zero`): Shifts the minimum data point to a base of zero.
 * **Outlier Filtering** (`filter_by_percentile`): Clips extreme values (spikes) based on a designated percentile range. In the GUI the clip is *re-editable*: reopening the dialog right after a clip edits that same step, so the histogram still shows the full unclipped distribution and the limits can be widened again instead of only narrowed.
 * **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft_mask`): 2D FFT analysis (no windowing - the displayed spectrum is exactly the one being filtered, normalized so the DC bin is the image mean) and frequency-domain filtering through a single mask that can combine a radial lowpass/highpass (`build_pass_mask`), circular notches (`build_notch_mask`), rectangular patches (`build_rect_mask`), and straight bands (`build_band_mask`). Noise is auto-detected systematically (`detect_fft_noise`) on the *excess* spectrum - the dB magnitude above the local radial background (`fft_excess_db`), so the falloff of the real topography never triggers it: streak columns/rows (median excess along the axis), coherent interference peaks sitting on the fx/fy axes, and off-axis regions each get their own statistically matched test. The whole mask can be given a smooth Gaussian roll-off (`smooth_fft_mask`) instead of hard edges. The GUI exposes all of these in one FFT-filter dialog with a large interactive spectrum (click to place cutoff/notches/bands, drag to notch a rectangle) and a *Zoom window* that shows the image before and after the filter side by side on one color scale, cropped to an area dragged on the result panel - so it can be checked close up that the filter took out the noise and not the topography.
 
 ### Stripe Removal (`gwy_destripe.py`)
 
-Two methods, both from the
+Stripe artifacts are elongated, roughly parallel corruptions that share one
+direction. In AFM they appear as scan-line offsets: a line, or a run of
+lines, sits at the wrong height because the feedback settled badly, the tip
+picked something up, or the drift jumped. The same artifact class is called
+*curtaining* in FIB-SEM, *striping* in light-sheet microscopy and remote
+sensing, and the literature is largely shared.
+
+Two methods are implemented, both taken from the
 [General-Stripe-Removal](https://github.com/NiklasRottmayer/General-Stripe-Removal)
-project, selected from the **Method** dropdown of the GUI's *Stripe removal*
-window (which shows only the chosen method's parameters). Both take the
-stripe direction in degrees, 0° = horizontal scan lines.
-
-#### GSR — general stripe remover (variational)
-
-`gsr` implements the method of N. Rottmayer, C. Redenbach and F. O. Fahrbach,
-*"A universal and effective variational method for destriping: application to
-light-sheet microscopy, FIB-SEM, and remote sensing images"*, Opt. Express
-**33**(3), 5800 (2025), ported from that project's
-`Python-Stripe-Removal/GeneralStripeRemover.py` (PyTorch) to numpy for the 2D
-case. It splits the image into a clean part `u` and a stripe part `s` with
-`u + s = u0` by minimizing
+project [[5]](#stripe-references) and selected from the **Method** dropdown of
+the GUI's *Stripe removal* window, which shows only the chosen method's
+parameters. Both assume the same decomposition of the recorded image,
 
 ```
-mu1*||grad u||_2,1 + i_[0,1](u) + ||grad_theta s||_1 + mu2*||s||_1
+u0 = u + s          u = the clean image,  s = the stripes
 ```
 
-with the primal-dual hybrid gradient method (extrapolated dual, PDHGMp): a
-clean image has few strong edges, `u` stays in the value range of the input,
-stripes vary little *along* their own direction, and only a small part of the
-image is struck by stripes.
-
-* `mu1` — strength of the removal; `mu2` — caution about touching real
-  structure. Paper defaults `mu1 = 1/3`, `mu2 = 1/300`, never outside
-  `mu1 ∈ [0.1, 0.5]`, `mu2 ∈ [0.0016, 0.017]`. Their ratio matters more than
-  either alone.
-* `iterations` — the paper recommends 10000 for a fully converged result and
-  notes 5000 usually suffice. The numpy port runs ~1.8 ms/iteration on a
-  512×256 scan, so the default is lower to keep the preview interactive; raise
-  it before applying.
-* The box constraint needs values in [0, 1], so the image is normalized to
-  that range internally and mapped back afterwards — AFM heights in nanometres
-  would otherwise be clipped away. The published parameters therefore transfer
-  directly.
-* The difference operator supports stripe steps of 0°, 26.6° and 45° (plus
-  every flip and transpose), so other angles snap to the nearest — as in the
-  reference implementation.
+and both take the stripe direction in degrees, `angle`, with **0° = horizontal
+scan lines** (the usual AFM case) and 90° = vertical. What separates them is
+*how they decide which part of the image is `s`*: **MDSR** answers in the
+frequency domain — stripes are a narrow band of frequencies — while **GSR**
+answers by optimization — stripes are whatever is sparse, elongated along the
+given direction, and leaves a clean image behind.
 
 #### MDSR — multidirectional stripe remover (Fourier filtering)
 
-`mdsr` implements the method of X. Liang et al.,
-*"Stripe artifact elimination based on nonsubsampled contourlet transform for
-light sheet fluorescence microscopy"*, J. Biomed. Opt. **21**(10), 106005
-(2016), following the reference implementation in
-`Matlab-Stripe-Removal/Algorithms/MDSR.m`. The image is decomposed into
-shift-invariant subbands of different scale and direction (a nonsubsampled
-contourlet transform), the frequencies carrying stripes of the given
-direction are damped in every high-pass subband — with a groove that narrows
-as the subband's own orientation moves away from the stripes — and the image
-is reconstructed.
+`mdsr` implements the method of Liang et al. [[1]](#stripe-references),
+following the reference implementation
+`Matlab-Stripe-Removal/Algorithms/MDSR.m` in [[5]](#stripe-references). The
+paper's three steps are:
 
-Both stages of the NSCT are nonsubsampled, i.e. plain linear shift-invariant
-filters, and the damping is a frequency-domain multiplication, so the whole
-method is a single linear filter. It is implemented as one: the analysis
-filters, dampings and synthesis filters are accumulated into one frequency
-mask (`mdsr_mask`) applied in a single FFT round trip. That is exact, not an
-approximation of the subband loop, and it makes the filter fast enough for a
-live preview. The filter bank itself is built directly in the frequency
-domain — raised-cosine rings and angular wedges that sum to exactly one, so
-reconstruction is perfect — instead of the `maxflat`/`dmaxflat7` filter banks
-of Cunha's NSCT toolbox that the reference implementation calls; the method,
-the damping equations and the parameters are the paper's, the filter-bank
-transfer functions are not bit-identical.
+**1. Decompose.** The image is split by a *nonsubsampled contourlet
+transform* (NSCT, Cunha et al. [[4]](#stripe-references)) into subbands of
+different scale and direction. The NSCT has two stages: a nonsubsampled
+pyramid, which separates octave-wide bands of spatial frequency (scale), and
+a nonsubsampled directional filter bank, which cuts each of those into
+angular wedges (direction). "Nonsubsampled" means nothing is decimated, so
+the transform is shift-invariant — an artifact does not change character
+depending on where it happens to sit, and the pseudo-Gibbs ringing of
+decimated wavelet transforms is largely avoided. The paper uses 5 scales × 8
+directions.
 
-Parameters (`angle`, `sigma`, `directions`, `levels`, `sigma_a`, `max_angle`):
+**2. Damp.** Stripes running in direction θ₀ are nearly constant along
+themselves and vary across, so their energy in the Fourier plane collapses
+onto the line through the origin *perpendicular* to θ₀. Every high-pass
+subband is multiplied by a groove that is zero on that line and rises to one
+away from it:
 
-* `angle` — direction of the stripes, 0° = horizontal scan lines (the usual
-  AFM artifact), 90° = vertical.
-* `sigma` — width of the damping groove **in frequency bins**, as in the
-  reference implementation. It trades stripe removal against real structure
-  that is itself elongated along the scan lines: the groove reaches about
-  2.5·σ bins, so it removes stripe-parallel features longer than roughly
-  `nx/(2.5σ)` pixels. The reference recommends 5–25 for ~1000 px light-sheet
-  images; on a 512 px AFM scan that is aggressive, hence the lower default.
-* `levels` — number of scales. The low-pass residual is never filtered, so
-  raise this until no stripes are left in it.
-* `directions`, `sigma_a`, `max_angle` — subbands per scale, how fast the
-  damping narrows with angular deviation, and the deviation beyond which a
-  subband is left alone.
+```
+w(f) = 1 − exp( −t² / (2·σ̄ᵢ²) ),      t = f·(cos θ₀, sin θ₀)
+σ̄ᵢ = σ · exp( −θᵢ² / (2·σ_a²) )
+```
 
-Two things follow from the method itself and are worth knowing: the exact
-zero-frequency line along the stripes is damped to zero at any σ, so MDSR
-always removes the per-line offsets (the overall mean height is kept); and a
-plane tilt across the slow axis is itself a set of line offsets, so **level
-the image before destriping** — with either method — or the filter will eat
-the tilt.
+`t` is the frequency component *along* the stripes — the coordinate that
+crosses the ridge of stripe energy — and `θᵢ` is the angle between subband
+*i*'s own orientation and the stripes. So the subband aligned with the
+stripes gets the full groove `σ`, and subbands pointing elsewhere get a
+groove that narrows exponentially and barely touches them. Following
+Rottmayer et al.'s **MDSR+** variant [[2]](#stripe-references), subbands
+deviating by more than `max_angle` are skipped entirely, which they show
+reduces artifacting. The low-pass residual is never filtered.
+
+**3. Reconstruct** by summing the subbands back together.
+
+**How it is implemented here.** Both NSCT stages are nonsubsampled, i.e.
+plain linear shift-invariant filters, and the damping is a multiplication in
+the frequency domain. The whole method is therefore *one linear filter*, and
+it is implemented as one: the analysis filters, the dampings and the
+synthesis filters are accumulated into a single frequency mask (`mdsr_mask`)
+applied in one FFT round trip. This is exact — not an approximation of the
+subband loop — and it is why the preview is instant where the paper reports
+seconds per image. The GUI shows that mask, which is the most direct picture
+of what the method does.
+
+The filter bank itself is built directly in the frequency domain, as
+raised-cosine rings and angular wedges that sum to exactly one (so
+reconstruction is perfect), rather than with the `maxflat`/`dmaxflat7` filter
+banks of Cunha's NSCT toolbox that the reference implementation calls. The
+structure of the method, the damping equations and the parameters are the
+paper's; the transfer functions of the filter bank are not bit-identical.
+
+One correction: Eq. (1) of [[1]](#stripe-references) writes the damping
+coordinate as `u·cos(π/2+θ₀) + v·sin(π/2+θ₀)`, which places the zero of the
+groove on the line *perpendicular* to the stripe frequencies — the wrong
+axis. The surrounding text ("the bottom is the line with angle π/2 + θ₀ …
+where the value of w is 0") and the reference code both place it on the
+stripe frequencies. The latter is what is implemented.
+
+Parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `angle` | Stripe direction, 0° = horizontal scan lines. |
+| `sigma` | Width of the damping groove, **in frequency bins** (as in the reference). The groove reaches about 2.5·σ bins, so it removes stripe-parallel structure longer than roughly `nx/(2.5σ)` pixels. |
+| `levels` | Number of scales. The low-pass residual is never filtered, so raise this until no stripes are left in it. |
+| `directions` | Angular wedges per scale (a power of two; 8 is the paper's choice). |
+| `sigma_a` | How fast the groove narrows with angular deviation, in radians. 0.3 in the reference, 0.8 in the paper; raise it only if the stripe direction is uncertain. |
+| `max_angle` | Deviation beyond which a subband is left alone (the MDSR+ restriction). |
+| `pad` | Mirror the image before filtering, to keep the FFT's periodic wrap-around from ringing along the notch. Off by default, which is the reference behaviour. |
+
+`sigma` is the only parameter that normally needs tuning, and it trades
+stripe removal against real structure that is itself elongated along the scan
+lines. The reference recommends 5–25 for the ~1000 px light-sheet images it
+was tuned on; the same bin count is a 2–4× wider notch on a 512 px AFM scan,
+hence the lower default here. The dialog prints the equivalent length scale
+next to the mask.
+
+#### GSR — general stripe remover (variational)
+
+`gsr` implements the method of Rottmayer, Redenbach and Fahrbach
+[[2]](#stripe-references), ported from that project's
+`Python-Stripe-Removal/GeneralStripeRemover.py` (PyTorch) to numpy for the 2D
+case. Instead of deciding in advance which frequencies are stripes, it states
+what a clean image and a stripe image *look like* and lets an optimizer find
+the split. It minimizes, over all splits with `u + s = u0`,
+
+```
+μ1·‖∇u‖₂,₁  +  ι[0,1](u)  +  ‖∇_θ s‖₁  +  μ2·‖s‖₁
+```
+
+Term by term:
+
+* `μ1·‖∇u‖₂,₁` — the total variation of the clean image. It says a clean
+  image is made of smooth regions separated by few strong edges, so anything
+  that adds gradient without adding structure is pushed out of `u`.
+* `ι[0,1](u)` — an indicator that is 0 inside the value range and ∞ outside,
+  keeping the clean image within the range of the input. No brightness
+  correction is needed afterwards.
+* `‖∇_θ s‖₁` — the derivative of the stripe image *along* the stripe
+  direction. Penalizing it forces `s` to be nearly constant along θ, i.e.
+  actually stripe-shaped.
+* `μ2·‖s‖₁` — sparsity of the stripe image: only a small part of the image is
+  struck by artifacts, so `s` should be zero nearly everywhere.
+
+The objective builds on the directional-difference model of Fitschen et al.
+[[6]](#stripe-references); a similar functional was explored by Liu et al.
+[[7]](#stripe-references) for oblique stripes in remote sensing.
+
+**How it is solved.** With the primal–dual hybrid gradient method with
+extrapolation of the dual variable (PDHGMp; Chambolle & Pock
+[[8]](#stripe-references), Burger et al. [[9]](#stripe-references)). Each of
+the three non-smooth penalties gets a dual variable, and one iteration is:
+
+```
+u ← u − τσ·divergence(b₁)                 descend using the current duals
+s ← s − τσ·(D_θᵀ b₂ + b₃)
+t ← ½(u0 − u − s);  u ← u + t;  s ← s + t   back onto the constraint u + s = u0
+clip u into [0,1], moving what was clipped into s
+b₁ ← project(b₁ + ∇u,   onto the disc of radius μ1/σ)     dual of the TV term
+b₂ ← clip(b₂ + D_θ s,   ±1/σ)                             dual of ‖∇_θ s‖₁
+b₃ ← clip(b₃ + s,       ±μ2/σ)                            dual of μ2‖s‖₁
+b̄ ← 2b − b_old                            extrapolation of the duals
+```
+
+with step sizes τ = σ = 0.35 (this σ is the optimizer's step size, unrelated
+to MDSR's damping width). The sequence provably converges to the minimizer
+[[8]](#stripe-references); in practice the result stops moving well before
+the recommended iteration count.
+
+`D_θ` is a forward difference along a whole-pixel step. Steps of 0°, 26.6°
+(2:1) and 45° (1:1) are supported, and every flip and transpose of them, so
+an arbitrary `angle` snaps to the nearest — that is the reference
+implementation's limitation, not the port's.
+
+Parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `angle` | Stripe direction, 0° = horizontal scan lines. |
+| `mu1` | Strength of the removal. Larger removes more, but starts to smooth and to eat structures that look like stripes. |
+| `mu2` | Caution about touching real structure: larger keeps `s` sparser, so less is removed. |
+| `iterations` | Primal–dual steps. |
+
+The paper's defaults are `μ1 = 1/3` and `μ2 = 1/300`, with the intervals
+`μ1 ∈ [0.1, 0.5]` and `μ2 ∈ [0.0016, 0.017]` never exceeded across all their
+data; the *ratio* matters more than either value alone, and scaling both
+together adjusts how far the method strays from ideal stripes. Their
+supplement recommends 10 000 iterations for a fully converged result and
+notes 5 000 usually suffice; this port runs at about 1.8 ms/iteration on a
+512×256 scan (10 000 ≈ 18 s), so the default is lower to keep the preview
+interactive — raise it before applying.
+
+Because the indicator constrains `u` to [0, 1], the image is normalized to
+that range internally and mapped back afterwards. AFM heights in nanometres
+would otherwise be clipped away entirely, and this way the published
+parameters transfer unchanged.
+
+#### Choosing between them, and two shared caveats
+
+MDSR is a single linear filter: fast, predictable, and easy to reason about
+because the mask is visible. It suits regular stripes of roughly constant
+width. Its cost is intrinsic — it removes *everything* inside a frequency
+band, including real structure elongated along the scan lines.
+
+GSR is an optimization and adapts to the image, which is why
+[[2]](#stripe-references) reports it outperforming both MDSR+ and the
+variational VSNR [[3]](#stripe-references) on light-sheet, FIB-SEM and remote
+sensing data (PSNR, MS-SSIM, curtaining metric, line profiles), particularly
+on irregular stripes of varying width and on short trails. It is the slower
+of the two here, and its own documented limitation is that image structures
+aligned with the stripe direction get reduced along with the stripes.
+
+Two things apply to both:
+
+* **Level the image first.** A plane tilt across the slow axis *is* a set of
+  line offsets, and neither method can tell it from an artifact — it will be
+  removed along with the stripes.
+* **Per-line offsets always go.** For MDSR this is exact: the zero-frequency
+  line along the stripes is damped to zero at any σ (the overall mean height
+  is preserved separately). This is the part of the topography that is
+  genuinely indistinguishable from a stripe, so if your surface really has
+  height information that is constant along each scan line, destriping will
+  take some of it.
+
+<a name="stripe-references"></a>
+
+**References**
+
+1. X. Liang, Y. Zang, D. Dong, L. Zhang, M. Fang, X. Yang, A. Arranz,
+   J. Ripoll, H. Hui and J. Tian, "Stripe artifact elimination based on
+   nonsubsampled contourlet transform for light sheet fluorescence
+   microscopy", *J. Biomed. Opt.* **21**(10), 106005 (2016).
+   [doi:10.1117/1.JBO.21.10.106005](https://doi.org/10.1117/1.JBO.21.10.106005)
+2. N. Rottmayer, C. Redenbach and F. O. Fahrbach, "A universal and effective
+   variational method for destriping: application to light-sheet microscopy,
+   FIB-SEM, and remote sensing images", *Opt. Express* **33**(3), 5800
+   (2025). [doi:10.1364/OE.542868](https://doi.org/10.1364/OE.542868)
+   (with Supplement 1, [doi:10.6084/m9.figshare.28022984](https://doi.org/10.6084/m9.figshare.28022984),
+   which contains the parameter guidance and the MDSR+ definition)
+3. J. Fehrenbach, P. Weiss and C. Lorenzo, "Variational algorithms to remove
+   stationary noise: applications to microscopy imaging", *IEEE Trans. Image
+   Process.* **21**(10), 4420–4430 (2012). — VSNR, the variational method
+   both papers above compare against.
+4. A. L. da Cunha, J. Zhou and M. N. Do, "The nonsubsampled contourlet
+   transform: theory, design, and applications", *IEEE Trans. Image Process.*
+   **15**(10), 3089–3101 (2006). — the transform MDSR decomposes with.
+5. N. Rottmayer, "General stripe removal",
+   <https://github.com/NiklasRottmayer/General-Stripe-Removal> (2024). — the
+   reference implementations of both methods.
+6. J. H. Fitschen, J. Ma and S. Schuff, "Removal of curtaining effects by a
+   variational model with directional forward differences", *Computer Vision
+   and Image Understanding* **155**, 24–32 (2017). — the model GSR builds on.
+7. X. Liu, X. Lu, H. Shen et al., "Oblique stripe removal in remote sensing
+   images via oriented variation", arXiv (2018).
+8. A. Chambolle and T. Pock, "A first-order primal-dual algorithm for convex
+   problems with applications to imaging", *J. Math. Imaging Vis.* **40**(1),
+   120–145 (2011). — the optimizer.
+9. M. Burger, A. Sawatzky and G. Steidl, "First order algorithms in
+   variational image processing", in *Splitting Methods in Communication,
+   Imaging, Science, and Engineering* (Springer, 2016), pp. 345–407.
+10. B. Münch, P. Trtik, F. Marone and M. Stampanoni, "Stripe and ring artifact
+    removal with combined wavelet — Fourier filtering", *Opt. Express*
+    **17**(10), 8567–8591 (2009). — the wavelet-Fourier ancestor of MDSR's
+    damping step.
 
 ### Two-Way Scan Processing (`gwy_twoway.py`)
 
