@@ -1044,35 +1044,57 @@ class ZoomWindow(tk.Toplevel):
         self.canvas.draw()
 
 
-class GSRSweepWindow(tk.Toplevel):
+class DestripeSweepWindow(tk.Toplevel):
     """
-    A grid of GSR results over a range of mu1 and mu2, for picking the pair
-    that removes the stripes without eating the structures.
+    A grid of stripe-removal results over two chosen parameters, for finding
+    the setting that takes the stripes out without eating the structures.
 
-    Both parameters are stepped by the same factor around the values
-    currently set in the dialog, so the grid is geometric: with factor 2 and
-    a 3x3 grid the rows are mu1/2, mu1, 2*mu1 and the columns mu2/2, mu2,
-    2*mu2. That matches how the paper describes them - what matters is the
-    ratio of the two, and scaling both together changes how far the method
-    strays from ideal stripes.
+    Each axis sweeps one parameter of the current method around the value
+    set in the dialog. Gains are stepped by a factor (geometric: with factor
+    2 and a 3x3 grid the rows are mu1/2, mu1, 2*mu1), counts and angles by an
+    increment - 'Same rate' keeps both axes on the same step, which for GSR's
+    mu1/mu2 makes the diagonal the "scale both together" direction the paper
+    describes.
 
-    The cells are computed one at a time so the window fills in visibly
-    instead of freezing. Every cell is computed on the WHOLE image and only
-    then cropped for display, so the zoom area does not change the result.
-    Clicking a cell copies its pair back into the dialog.
+    Nothing runs until 'Run' is pressed. The cells are then computed one at a
+    time so the window fills in visibly instead of freezing. Every cell is
+    computed on the WHOLE image and only then cropped for display, so the
+    zoom area does not change the result. Clicking a cell copies its two
+    values back into the dialog.
     """
+
+    # Sweepable parameters: how to step them, and the default step.
+    # "mul" multiplies (gains, widths - they span orders of magnitude),
+    # "add" adds (angles and counts, where a factor makes no sense).
+    SWEEP_STEPS = {
+        "angle":      ("add", 5.0, "float"),
+        "sigma":      ("mul", 2.0, "float"),
+        "directions": ("mul", 2.0, "pow2"),
+        "levels":     ("add", 1.0, "int"),
+        "sigma_a":    ("mul", 1.5, "float"),
+        "max_angle":  ("add", 15.0, "float"),
+        "mu1":        ("mul", 2.0, "float"),
+        "mu2":        ("mul", 2.0, "float"),
+        "iterations": ("mul", 2.0, "int"),
+    }
+    DEFAULT_AXES = {"GSR": ("mu1", "mu2"), "MDSR": ("sigma", "levels")}
 
     def __init__(self, dialog):
         super().__init__(dialog)
         self.dialog = dialog
         self.app = dialog.app
-        self.title("GSR parameter sweep - click a cell to use its mu1/mu2")
+        self.title("Stripe removal parameter sweep - "
+                   "click a cell to use its values")
         self.geometry("1250x900")
 
         self._after_id = None
         self._tasks = []
-        self._cells = {}            # axes -> (mu1, mu2)
+        self._cells = {}            # axes -> ((name, value), (name, value))
         self._vlim = None
+        self._method = None
+        self._syncing = False
+        self._specs = {p["name"]: p
+                       for p in OPERATIONS[dialog.op_key]["params"]}
 
         self._build_controls()
         self.figure = Figure(figsize=(12, 8), dpi=100)
@@ -1080,66 +1102,227 @@ class GSRSweepWindow(tk.Toplevel):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         NavigationToolbar2Tk(self.canvas, self).update()
         self.canvas.mpl_connect("button_press_event", self._on_click)
-        self.run()
+        self.sync_method()
+        self.status_var.set("Press Run to compute the grid")
 
     # ---- controls ----
 
     def _build_controls(self):
-        frame = ttk.Frame(self, padding=8)
-        frame.pack(side=tk.TOP, fill=tk.X)
+        top = ttk.Frame(self, padding=(8, 8, 8, 0))
+        top.pack(side=tk.TOP, fill=tk.X)
+        bottom = ttk.Frame(self, padding=(8, 4, 8, 6))
+        bottom.pack(side=tk.TOP, fill=tk.X)
 
+        self.row_var = tk.StringVar()
+        self.col_var = tk.StringVar()
+        self.row_step_var = tk.DoubleVar(value=2.0)
+        self.col_step_var = tk.DoubleVar(value=2.0)
+        self.row_mode_var = tk.StringVar(value="x")
+        self.col_mode_var = tk.StringVar(value="x")
+        self.link_var = tk.BooleanVar(value=True)
         self.size_var = tk.IntVar(value=3)
-        self.factor_var = tk.DoubleVar(value=2.0)
+        self.zoom_var = tk.BooleanVar(value=True)
         try:
             iters = int(self.dialog.vars["iterations"].get())
         except (tk.TclError, KeyError):
             iters = gd.GSR_DEFAULTS["iterations"]
         self.iter_var = tk.IntVar(value=iters)
-        self.zoom_var = tk.BooleanVar(value=True)
 
-        ttk.Label(frame, text="Grid:").pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Spinbox(frame, from_=2, to=5, width=3,
+        ttk.Label(top, text="Rows:").pack(side=tk.LEFT)
+        self.row_combo = ttk.Combobox(top, textvariable=self.row_var, width=20,
+                                      state="readonly")
+        self.row_combo.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(top, text="step").pack(side=tk.LEFT)
+        ttk.Label(top, textvariable=self.row_mode_var,
+                  width=2).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Entry(top, textvariable=self.row_step_var,
+                  width=6).pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Label(top, text="Columns:").pack(side=tk.LEFT)
+        self.col_combo = ttk.Combobox(top, textvariable=self.col_var, width=20,
+                                      state="readonly")
+        self.col_combo.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(top, text="step").pack(side=tk.LEFT)
+        ttk.Label(top, textvariable=self.col_mode_var,
+                  width=2).pack(side=tk.LEFT, padx=(4, 0))
+        self.col_step_entry = ttk.Entry(top, textvariable=self.col_step_var,
+                                        width=6)
+        self.col_step_entry.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(top, text="Same rate", variable=self.link_var,
+                        command=self._sync_link).pack(side=tk.LEFT)
+
+        ttk.Label(bottom, text="Grid:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Spinbox(bottom, from_=2, to=5, width=3,
                     textvariable=self.size_var).pack(side=tk.LEFT)
-        ttk.Label(frame, text="Step factor:").pack(side=tk.LEFT, padx=(12, 2))
-        ttk.Entry(frame, textvariable=self.factor_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(frame, text="Iterations:").pack(side=tk.LEFT, padx=(12, 2))
-        ttk.Entry(frame, textvariable=self.iter_var, width=7).pack(side=tk.LEFT)
-        ttk.Checkbutton(frame, text="Zoom area only",
-                        variable=self.zoom_var).pack(side=tk.LEFT, padx=12)
-        ttk.Button(frame, text="Run", command=self.run).pack(side=tk.LEFT)
+        self._iter_frame = ttk.Frame(bottom)
+        ttk.Label(self._iter_frame, text="Iterations:").pack(side=tk.LEFT,
+                                                             padx=(12, 2))
+        ttk.Entry(self._iter_frame, textvariable=self.iter_var,
+                  width=7).pack(side=tk.LEFT)
+        self._zoom_check = ttk.Checkbutton(bottom, text="Zoom area only",
+                                           variable=self.zoom_var)
+        self._zoom_check.pack(side=tk.LEFT, padx=12)
+        ttk.Button(bottom, text="Run", command=self.run).pack(side=tk.LEFT)
         self.status_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
+        ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT,
+                                                             padx=12)
+
+        self.row_var.trace_add("write", lambda *a: self._on_axis_change("row"))
+        self.col_var.trace_add("write", lambda *a: self._on_axis_change("col"))
+        self.row_step_var.trace_add("write", lambda *a: self._mirror_step())
+
+    def _label(self, name):
+        return self._specs.get(name, {}).get("label", name)
+
+    def sync_method(self):
+        """Offer the parameters of the method the dialog is set to. Returns
+        True when the method changed and the axes were reset."""
+        method = self.dialog._method()
+        if method == self._method:
+            return False
+        self._method = method
+        names = [n for n in DestripeDialog.METHOD_PARAMS.get(method, ())
+                 if n in self.SWEEP_STEPS]
+        self._names = {self._label(n): n for n in names}
+        row, col = self.DEFAULT_AXES.get(method, tuple(names[:2]))
+        self._syncing = True
+        try:
+            self.row_combo["values"] = list(self._names)
+            self.col_combo["values"] = list(self._names)
+            self.row_var.set(self._label(row))
+            self.col_var.set(self._label(col))
+            self.link_var.set(True)     # _sync_link drops it if it cannot hold
+        finally:
+            self._syncing = False
+        self._on_axis_change("row")
+        self._on_axis_change("col")
+
+        # only GSR has an iteration count, and it is worth lowering for a
+        # sweep without disturbing the dialog
+        self._iter_frame.pack_forget()
+        if method == "GSR":
+            self._iter_frame.pack(side=tk.LEFT, before=self._zoom_check)
+            try:                        # start from the dialog's count
+                self.iter_var.set(int(self.dialog.vars["iterations"].get()))
+            except (tk.TclError, KeyError):
+                pass
+        return True
+
+    def _on_axis_change(self, which):
+        """A different parameter on an axis brings its own kind of step."""
+        if self._syncing:
+            return
+        var = self.row_var if which == "row" else self.col_var
+        name = getattr(self, "_names", {}).get(var.get())
+        if name is None:
+            return
+        mode, step, _ = self.SWEEP_STEPS[name]
+        self._syncing = True
+        try:
+            if which == "row":
+                self.row_mode_var.set("x" if mode == "mul" else "+")
+                self.row_step_var.set(step)
+            else:
+                self.col_mode_var.set("x" if mode == "mul" else "+")
+                self.col_step_var.set(step)
+        finally:
+            self._syncing = False
+        self._sync_link()
+
+    def _modes_match(self):
+        row = getattr(self, "_names", {}).get(self.row_var.get())
+        col = getattr(self, "_names", {}).get(self.col_var.get())
+        if row is None or col is None:
+            return False
+        return self.SWEEP_STEPS[row][0] == self.SWEEP_STEPS[col][0]
+
+    def _sync_link(self):
+        """'Same rate' only means something when both axes step the same
+        way; otherwise the column keeps its own step."""
+        same = self._modes_match()
+        if not same:
+            self.link_var.set(False)
+        linked = same and self.link_var.get()
+        self.col_step_entry.state(["disabled"] if linked else ["!disabled"])
+        self._mirror_step()
+
+    def _mirror_step(self):
+        if self._syncing or not self.link_var.get() or not self._modes_match():
+            return
+        self._syncing = True
+        try:
+            self.col_step_var.set(self.row_step_var.get())
+        except tk.TclError:
+            pass
+        finally:
+            self._syncing = False
 
     # ---- the sweep ----
 
-    def _values(self, center, count, factor):
-        """`count` values around `center`, each `factor` apart."""
+    def _values(self, center, count, step, name):
+        """`count` values around `center`, one step apart."""
         start = -(count - 1) / 2.0
-        return [center * factor ** (start + k) for k in range(count)]
+        mode = self.SWEEP_STEPS[name][0]
+        return [self._cast(center * step ** (start + k) if mode == "mul"
+                           else center + step * (start + k), name)
+                for k in range(count)]
+
+    def _cast(self, value, name):
+        """Round to what the parameter accepts and keep it in range."""
+        kind = self.SWEEP_STEPS[name][2]
+        if kind == "pow2":
+            value = 2.0 ** max(0, int(round(np.log2(max(value, 1.0)))))
+        if kind in ("int", "pow2"):
+            value = int(round(value))
+        spec = self._specs.get(name, {})
+        if spec.get("min") is not None:
+            value = max(value, spec["min"])
+        if spec.get("max") is not None:
+            value = min(value, spec["max"])
+        return int(value) if kind in ("int", "pow2") else float(value)
 
     def run(self):
         """(Re)start the sweep with the current settings."""
         if self._after_id is not None:
             self.after_cancel(self._after_id)
             self._after_id = None
+        self.sync_method()
         params = self.dialog.get_params()
         if params is None:
             self.status_var.set("Fix the dialog parameters first")
             return
+        row = self._names.get(self.row_var.get())
+        col = self._names.get(self.col_var.get())
+        if row is None or col is None:
+            self.status_var.set("Pick a parameter for each axis")
+            return
+        if row == col:
+            self.status_var.set("Pick two different parameters")
+            return
         try:
             n = max(2, min(5, int(self.size_var.get())))
-            factor = float(self.factor_var.get())
-            iterations = max(1, int(self.iter_var.get()))
+            steps = {row: float(self.row_step_var.get()),
+                     col: float(self.col_step_var.get())}
         except tk.TclError:
             return
-        if factor <= 1.0:
-            self.status_var.set("The step factor must be larger than 1")
-            return
+        for name, step in steps.items():
+            if self.SWEEP_STEPS[name][0] == "mul" and step <= 1.0:
+                self.status_var.set(f"The step factor for {name} must be "
+                                    f"larger than 1")
+                return
+            if step <= 0:
+                self.status_var.set(f"The step for {name} must be positive")
+                return
+        if self._method == "GSR":
+            try:
+                params["iterations"] = max(1, int(self.iter_var.get()))
+            except tk.TclError:
+                pass
 
-        self._mu1s = self._values(float(params["mu1"]), n, factor)
-        self._mu2s = self._values(float(params["mu2"]), n, factor)
-        self._angle = float(params["angle"])
-        self._iterations = iterations
+        self._row, self._col = row, col
+        self._params = params
+        self._row_values = self._values(float(params[row]), n, steps[row], row)
+        self._col_values = self._values(float(params[col]), n, steps[col], col)
 
         data = self.dialog._base_data()
         self._slices = (self.dialog._zoom_slices(data.shape)
@@ -1155,15 +1338,21 @@ class GSRSweepWindow(tk.Toplevel):
         for i in range(n):
             for j in range(n):
                 ax = axes[i, j]
-                ax.set_title(f"mu1={self._mu1s[i]:.4g}, mu2={self._mu2s[j]:.4g}",
-                             fontsize=8)
+                ax.set_title(f"{row}={self._row_values[i]:.4g}, "
+                             f"{col}={self._col_values[j]:.4g}", fontsize=8)
                 ax.tick_params(labelsize=7)
-                self._cells[ax] = (self._mu1s[i], self._mu2s[j])
+                self._cells[ax] = ((row, self._row_values[i]),
+                                   (col, self._col_values[j]))
         where = "zoom area" if self._slices is not None else "full image"
+        sym = {"mul": "x", "add": "+"}
         self.figure.suptitle(
-            f"GSR sweep - {where}, {iterations} iterations, "
-            f"stripe angle {self._angle:g} deg   "
-            f"(rows: mu1 x{factor:g}, columns: mu2 x{factor:g})", fontsize=10)
+            f"{self._method} sweep - {where}, "
+            f"stripe angle {float(params.get('angle', 0.0)):g} deg"
+            + (f", {params['iterations']} iterations"
+               if self._method == "GSR" else "")
+            + f"   (rows: {row} {sym[self.SWEEP_STEPS[row][0]]}{steps[row]:g}, "
+              f"columns: {col} {sym[self.SWEEP_STEPS[col][0]]}{steps[col]:g})",
+            fontsize=10)
         self.canvas.draw()
 
         self._axes = axes
@@ -1181,22 +1370,29 @@ class GSRSweepWindow(tk.Toplevel):
         """Compute and draw one cell, then queue the next."""
         self._after_id = None
         if not self._tasks:
-            self.status_var.set("Done - click a cell to use its mu1/mu2")
+            self.status_var.set("Done - click a cell to use its values")
             return
         i, j = self._tasks.pop(0)
-        total = len(self._mu1s) * len(self._mu2s)
+        total = len(self._row_values) * len(self._col_values)
         self.status_var.set(f"Computing {total - len(self._tasks)}/{total} ...")
         self.update_idletasks()
 
-        # the whole image goes through the method; the crop is for display
-        # only, so that the zoom area cannot change the result
-        result = gd.gsr(self._data, angle=self._angle, mu1=self._mu1s[i],
-                        mu2=self._mu2s[j], iterations=self._iterations)
+        op = OPERATIONS[self.dialog.op_key]
+        params = dict(self._params)
+        params[self._row] = self._row_values[i]
+        params[self._col] = self._col_values[j]
         ax = self._axes[i, j]
-        extent = self._extent()
-        ax.imshow(self._crop(result), origin="upper",
-                  cmap=gp.get_gwyddion_cmap(), extent=extent, aspect="equal",
-                  vmin=self._vlim[0], vmax=self._vlim[1])
+        error = op["validate"](params) if op.get("validate") else None
+        if error:
+            ax.text(0.5, 0.5, error, ha="center", va="center", fontsize=8,
+                    transform=ax.transAxes)
+        else:
+            # the whole image goes through the method; the crop is for
+            # display only, so the zoom area cannot change the result
+            result = op["func"](self._data, params, self.app.dx, self.app.dy)
+            ax.imshow(self._crop(result), origin="upper",
+                      cmap=gp.get_gwyddion_cmap(), extent=self._extent(),
+                      aspect="equal", vmin=self._vlim[0], vmax=self._vlim[1])
         self.canvas.draw()
         self._after_id = self.after(1, self._step)
 
@@ -1209,22 +1405,31 @@ class GSRSweepWindow(tk.Toplevel):
         return (cols.start * app.dx, cols.stop * app.dx,
                 (ny - rows.stop) * app.dy, (ny - rows.start) * app.dy)
 
-    # ---- picking a pair ----
+    # ---- picking a cell ----
 
     def _on_click(self, event):
-        pair = self._cells.get(event.inaxes)
-        if pair is None:
+        cell = self._cells.get(event.inaxes)
+        if cell is None:
             return
         toolbar = getattr(self.canvas, "toolbar", None)
         if toolbar is not None and getattr(toolbar, "mode", ""):
             return                      # pan/zoom tool active
-        mu1, mu2 = pair
         try:
-            self.dialog.vars["mu1"].set(round(mu1, 6))
-            self.dialog.vars["mu2"].set(round(mu2, 6))
+            for name, value in cell:
+                var = self.dialog.vars.get(name)
+                if var is None:
+                    continue
+                spec = self._specs.get(name, {})
+                if spec.get("type") == "choice":
+                    var.set(str(int(value)))
+                elif spec.get("type") == "int":
+                    var.set(int(value))
+                else:
+                    var.set(round(float(value), 6))
         except tk.TclError:
             return
-        self.status_var.set(f"Using mu1={mu1:.4g}, mu2={mu2:.4g}")
+        self.status_var.set("Using " + ", ".join(f"{n}={v:.4g}"
+                                                 for n, v in cell))
 
     def destroy(self):
         if self._after_id is not None:
@@ -1953,8 +2158,9 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
 
     'Zoom window...' - or dragging on the result panel - opens the image
     before and after the filter side by side, which is the honest way to
-    check that only stripes were removed. 'Parameter sweep...' (GSR only)
-    runs a grid of mu1/mu2 pairs and shows the results side by side.
+    check that only stripes were removed. 'Parameter sweep...' runs a grid
+    over two parameters of the current method and shows the results side by
+    side.
     """
 
     ZOOM_SOURCE = "result"
@@ -1989,15 +2195,13 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         self._sync_method()
 
     def open_sweep_window(self):
-        """Open (or raise) the mu1/mu2 sweep - GSR only."""
-        if self._method() != "GSR":
-            self.status_var.set("The parameter sweep belongs to GSR")
-            return
+        """Open (or raise) the parameter sweep. It does not compute anything
+        until its 'Run' is pressed."""
         if self._sweep_win is None or not self._sweep_win.winfo_exists():
-            self._sweep_win = GSRSweepWindow(self)
+            self._sweep_win = DestripeSweepWindow(self)
         else:
             self._sweep_win.lift()
-            self._sweep_win.run()
+            self._sweep_win.sync_method()
 
     def _method(self):
         try:
@@ -2010,9 +2214,9 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         method = self._method()
         self._show_params(self.METHOD_PARAMS.get(method,
                                                  self.METHOD_PARAMS["MDSR"]))
-        if hasattr(self, "_sweep_btn"):
-            self._sweep_btn.state(["!disabled"] if method == "GSR"
-                                  else ["disabled"])
+        win = getattr(self, "_sweep_win", None)
+        if win is not None and win.winfo_exists():
+            win.sync_method()          # offer the new method's parameters
         if hasattr(self, "hint_var"):
             self.hint_var.set(
                 "Stripe angle: 0 = horizontal scan lines, 90 = vertical  |  "

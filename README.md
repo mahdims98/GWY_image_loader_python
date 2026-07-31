@@ -228,18 +228,33 @@ that range internally and mapped back afterwards. AFM heights in nanometres
 would otherwise be clipped away entirely, and this way the published
 parameters transfer unchanged.
 
-**Parameter sweep.** Since the two gains are best judged by eye and against
-each other, the GSR mode has a *Parameter sweep...* button that runs a grid
-of pairs and shows the results side by side — 3×3 by default, rows stepping
-`mu1` and columns stepping `mu2`. Both axes use the *same* step factor around
-the values currently in the dialog, so with factor 2 the rows are `mu1/2,
-mu1, 2·mu1` and the columns `mu2/2, mu2, 2·mu2`; the diagonal is then the
-"scale both together" direction the paper describes. Every cell is computed
-on the whole image and only then cropped, so the zoom area picked in the
-dialog (drag on the result panel, then *Zoom area only*) changes what you see
-and never what is computed. All cells share one color scale, the panels are
-linked for toolbar zooming, and clicking a cell copies its pair back into the
-dialog.
+#### Parameter sweep (both methods)
+
+Parameters like these are best judged by eye and against
+each other, so *Parameter sweep...* runs a grid over **two parameters you
+pick** in that window and shows the results side by side — 3×3 by default,
+one parameter down the rows and one across the columns. Nothing is computed
+until *Run* is pressed; the cells then fill in one at a time so the window
+stays responsive.
+
+The window offers the parameters of whichever method the dialog is set to,
+and each axis steps around the value currently in the dialog in the way that
+suits it: gains and widths are *multiplied* (`mu1`, `mu2`, `sigma`,
+`directions`, iterations — they span orders of magnitude), while counts and
+angles are *incremented* (`levels`, `angle`, `max_angle`). GSR opens on
+`mu1` × `mu2` with *Same rate* ticked, which keeps both axes on one step
+factor: with factor 2 the rows are `mu1/2, mu1, 2·mu1` and the columns
+`mu2/2, mu2, 2·mu2`, and the diagonal is then the "scale both together"
+direction the paper describes. MDSR opens on `sigma` × `levels`; there the
+two steps are independent, because multiplying a scale count makes no sense.
+Values that would leave a parameter's allowed range are clamped to it, and
+`directions` stays on powers of two.
+
+Every cell is computed on the whole image and only then cropped, so the zoom
+area picked in the dialog (drag on the result panel, then *Zoom area only*)
+changes what you see and never what is computed. All cells share one color
+scale, the panels are linked for toolbar zooming, and clicking a cell copies
+both of its values back into the dialog.
 
 #### Choosing between them, and two shared caveats
 
