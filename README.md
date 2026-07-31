@@ -9,7 +9,7 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * **`gwy_loader.py`**: A pure Python module for parsing and reading `.gwy` files. It extracts data fields, metadata, physical dimensions, and SI units.
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
-* **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016) and the variational method of Rottmayer et al. (2025).
+* **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
 * **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, and batch folder processing.
 
 ## Requirements
@@ -48,22 +48,26 @@ picked something up, or the drift jumped. The same artifact class is called
 *curtaining* in FIB-SEM, *striping* in light-sheet microscopy and remote
 sensing, and the literature is largely shared.
 
-Two methods are implemented, both taken from the
+Three methods are implemented, selected from the **Method** dropdown of the
+GUI's *Stripe removal* window, which shows only the chosen method's
+parameters. Two of them, **MDSR** and **GSR**, come from the
 [General-Stripe-Removal](https://github.com/NiklasRottmayer/General-Stripe-Removal)
-project [[5]](#stripe-references) and selected from the **Method** dropdown of
-the GUI's *Stripe removal* window, which shows only the chosen method's
-parameters. Both assume the same decomposition of the recorded image,
+project [[5]](#stripe-references); the third, **DeStripe**, was written for
+AFM specifically. All three assume the same decomposition of the recorded
+image,
 
 ```
 u0 = u + s          u = the clean image,  s = the stripes
 ```
 
-and both take the stripe direction in degrees, `angle`, with **0° = horizontal
-scan lines** (the usual AFM case) and 90° = vertical. What separates them is
-*how they decide which part of the image is `s`*: **MDSR** answers in the
-frequency domain — stripes are a narrow band of frequencies — while **GSR**
-answers by optimization — stripes are whatever is sparse, elongated along the
-given direction, and leaves a clean image behind.
+and the first two take the stripe direction in degrees, `angle`, with **0° =
+horizontal scan lines** (the usual AFM case) and 90° = vertical. What
+separates them is *how they decide which part of the image is `s`*: **MDSR**
+answers in the frequency domain — stripes are a narrow band of frequencies —
+**GSR** answers by optimization — stripes are whatever is sparse, elongated
+along the given direction, and leaves a clean image behind — and **DeStripe**
+answers statistically, from the image's own spectrum, which is why it needs
+no direction and no parameters at all.
 
 #### MDSR — multidirectional stripe remover (Fourier filtering)
 
@@ -228,7 +232,115 @@ that range internally and mapped back afterwards. AFM heights in nanometres
 would otherwise be clipped away entirely, and this way the published
 parameters transfer unchanged.
 
-#### Parameter sweep (both methods)
+#### DeStripe — noisy pixels of the spectrum (Chen & Pellequer)
+
+`destripe_chen` implements the method of Chen and Pellequer
+[[11]](#stripe-references), the only one of the three written for AFM, and
+the only one that needs nothing from you at all — not even the stripe
+direction. Where MDSR decides what a stripe is from a model of the frequency
+plane and GSR from an energy, DeStripe decides it from the image's own
+spectrum: in `LogF = log|FFT(image)|` the stripes appear as a few abnormally
+bright pixels arranged in lines, and the method finds those pixels
+statistically and pulls them down to the level of their neighbours. The
+phase is never touched.
+
+**Step 1 — heterogeneity.** Every pixel of LogF gets
+
+```
+H = (L − Lmin)/(Lmax − Lmin) · (I − Imin)/(Imax − Imin)  ∈ [0, 1]
+```
+
+where `L` is the discrete Laplacian (the paper's Table 1: −1 around a center
+of 8) and `I` the log-amplitude. `H` is large only where a pixel is *both*
+bright and abruptly brighter than its surroundings — one of the two alone is
+not enough, which is why real structure, bright but smooth, mostly survives.
+
+**Step 2 — global sampling.** The threshold on `H` is read off its own
+20-bin histogram: take the longest run of populated bins and walk from its
+peak towards higher `H` until a bin holds at most half of the peak's count;
+`Href` is the middle of that bin. Over the quiet pixels (`H ≤ Href`) the
+intensity threshold `Iref = (max + mean)/2` is formed, and the first
+candidate set is
+
+```
+Pn1 = { H > Href  and  I > Iref }
+```
+
+**Step 3 — divide and conquer.** The neighbourhood of the origin is where
+the amplitude changes by orders of magnitude, so it is treated separately.
+The intensity-weighted moment-of-inertia tensor of `Pn1` gives a center and
+an initial radius `√(σx + σy)`; a disk grows around the center in tenths of
+that radius while more than `density` of the pixels inside it are candidates.
+Inside (`C0`) an anisotropic Gaussian is least-squares fitted to the
+intensities and only pixels *above* the fit stay candidates — a peak that the
+smooth model already explains is not noise. Outside (`Pn2`) a pixel stays a
+candidate if it stands more than `cvar_k` standard deviations above its own
+neighbourhood.
+
+**Step 4 — lines.** Both sets are thinned once more by the same histogram
+rule (10 bins this time) and then kept only where they look like a line: a
+row or column of the region that is more than two thirds candidates, or a run
+of `min_run` consecutive candidates. This is the step that separates a stripe
+from a bright speck, and it is why the method needs no direction — a
+horizontal line in the spectrum and a vertical one are equally acceptable.
+
+**Step 5 — the CVAR test and the filter.** For each surviving pixel the mean
+and standard deviation of the *non-candidate* pixels in its
+`(2·window+1)²` neighbourhood are taken (that constraint is the C in CVAR),
+and the pixel is pulled down to that mean if it exceeds it by more than
+`cvar_k` standard deviations. Clusters are worked from their boundary
+inwards, so a pixel in the middle of one still has restored values to average
+over. The filter is then
+
+```
+Φ = exp(restored LogF) / exp(LogF)   ∈ (0, 1]
+```
+
+and the result is the inverse FFT of the spectrum times `Φ`. Since `Φ ≤ 1`
+the method can only ever *take energy out* of the image — the paper insists
+on this, on the grounds that a denoiser which adds height to an AFM
+measurement is inventing topography. The dialog's bottom right panel is `Φ`
+(the paper's F-image): yellow is kept, dark is removed, and the title counts
+how many frequencies were touched.
+
+Parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `cvar_k` | How far above its neighbours a frequency must sit to count as noise, in standard deviations. The main knob: lower removes more. |
+| `window` | `NS` of the `(2·NS+1)²` neighbourhood. The paper uses 1. |
+| `density` | Candidate density at which the central disk stops growing (0.85 in the paper). |
+| `min_run` | How many candidates in a row make a line (4 in the paper). Larger is more conservative. |
+| `keep_mean` | Leave the amplitude at the origin — the mean height — alone. |
+
+The paper fixes all of these internally and takes the raw image as its only
+input; they are exposed here because AFM scans vary more than the set the
+values were tuned on, and because watching them is the only way to see what
+the method is doing.
+
+Three places where the paper leaves a step underdetermined are marked in the
+source: the direction of the histogram walk, the normalization of the inertia
+tensor (its radius is only a radius if the tensor is divided by the total
+mass), and the "VAR test" that the flow chart names but the text never
+defines — the constrained version of it, the CVAR test, *is* defined, so the
+unconstrained one is used. `keep_mean` is a deliberate deviation: the paper
+lets the origin be restored like any other pixel and reports that for one SEM
+image most of the striping was in fact the amplitude at the origin, but for
+an AFM height map that amplitude is the mean height, and scaling it moves the
+whole surface up or down without touching a single stripe.
+
+**What it does on AFM data.** Per-line offsets live on the `fx = 0` column of
+the spectrum, and that is exactly where the method finds them: on a synthetic
+scan (grainy topography plus random per-line offsets) every noisy frequency
+it identifies is on that column, and the error against the true topography
+falls by a quarter. On a real scan with strong topography it is more
+selective — it removes a handful of periodic bands rather than the broad
+stripe content — and because it acts on individual frequencies, what it takes
+out is a set of clean sinusoids across the whole image. Check the removed
+panel: if it shows a regular ripple rather than the stripes you meant to
+remove, raise `cvar_k` or use one of the other two methods.
+
+#### Parameter sweep (all three methods)
 
 Parameters like these are best judged by eye and against
 each other, so *Parameter sweep...* runs a grid over **two parameters you
@@ -240,13 +352,15 @@ stays responsive.
 The window offers the parameters of whichever method the dialog is set to,
 and each axis steps around the value currently in the dialog in the way that
 suits it: gains and widths are *multiplied* (`mu1`, `mu2`, `sigma`,
-`directions`, iterations — they span orders of magnitude), while counts and
-angles are *incremented* (`levels`, `angle`, `max_angle`). GSR opens on
-`mu1` × `mu2` with *Same rate* ticked, which keeps both axes on one step
-factor: with factor 2 the rows are `mu1/2, mu1, 2·mu1` and the columns
-`mu2/2, mu2, 2·mu2`, and the diagonal is then the "scale both together"
-direction the paper describes. MDSR opens on `sigma` × `levels`; there the
-two steps are independent, because multiplying a scale count makes no sense.
+`directions`, iterations — they span orders of magnitude), while counts,
+angles and thresholds are *incremented* (`levels`, `angle`, `max_angle`,
+`cvar_k`, `min_run`, `density`, `window`). GSR opens on `mu1` × `mu2` with
+*Same rate* ticked, which keeps both axes on one step factor: with factor 2
+the rows are `mu1/2, mu1, 2·mu1` and the columns `mu2/2, mu2, 2·mu2`, and the
+diagonal is then the "scale both together" direction the paper describes.
+MDSR opens on `sigma` × `levels` and DeStripe on `cvar_k` × `min_run`; there
+the two steps are independent — *Same rate* is only ticked by default for two
+multiplied axes, since two incremented parameters do not share a unit.
 Values that would leave a parameter's allowed range are clamped to it, and
 `directions` stays on powers of two.
 
@@ -263,18 +377,26 @@ because the mask is visible. It suits regular stripes of roughly constant
 width. Its cost is intrinsic — it removes *everything* inside a frequency
 band, including real structure elongated along the scan lines.
 
+DeStripe is the conservative one, and the one to try first when you do not
+know the stripe direction or do not want to choose parameters: it touches
+only the frequencies it can argue are noise, typically a fraction of a
+percent of the spectrum, and it can only remove energy. The same caution is
+its limit — on an image whose stripes are broadband it will under-remove, and
+the paper says so itself.
+
 GSR is an optimization and adapts to the image, which is why
 [[2]](#stripe-references) reports it outperforming both MDSR+ and the
 variational VSNR [[3]](#stripe-references) on light-sheet, FIB-SEM and remote
 sensing data (PSNR, MS-SSIM, curtaining metric, line profiles), particularly
-on irregular stripes of varying width and on short trails. It is the slower
-of the two here, and its own documented limitation is that image structures
-aligned with the stripe direction get reduced along with the stripes.
+on irregular stripes of varying width and on short trails. It is by far the
+slowest of the three here, and its own documented limitation is that image
+structures aligned with the stripe direction get reduced along with the
+stripes.
 
-Two things apply to both:
+Two things apply to all three:
 
 * **Level the image first.** A plane tilt across the slow axis *is* a set of
-  line offsets, and neither method can tell it from an artifact — it will be
+  line offsets, and no method can tell it from an artifact — it will be
   removed along with the stripes.
 * **Per-line offsets always go.** For MDSR this is exact: the zero-frequency
   line along the stripes is damped to zero at any σ (the overall mean height
@@ -323,6 +445,10 @@ Two things apply to both:
     removal with combined wavelet — Fourier filtering", *Opt. Express*
     **17**(10), 8567–8591 (2009). — the wavelet-Fourier ancestor of MDSR's
     damping step.
+11. S.-w. W. Chen and J.-L. Pellequer, "DeStripe: frequency-based algorithm
+    for removing stripe noises from AFM images", *BMC Struct. Biol.* **11**,
+    7 (2011).
+    [doi:10.1186/1472-6807-11-7](https://doi.org/10.1186/1472-6807-11-7)
 
 ### Two-Way Scan Processing (`gwy_twoway.py`)
 

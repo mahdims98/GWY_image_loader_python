@@ -18,9 +18,11 @@ Provides an interactive Tkinter application to:
         drag to notch a rectangle), optional smooth mask edges and a
         zoom window comparing the image before and after the filter
       * Stripe removal (gwy_destripe): the multidirectional stripe
-        remover of Liang et al. (2016) or the variational general
-        stripe remover of Rottmayer et al. (2025), selected in the
-        dialog, which shows only the chosen method's parameters
+        remover of Liang et al. (2016), the variational general stripe
+        remover of Rottmayer et al. (2025) or the spectrum denoiser
+        DeStripe of Chen & Pellequer (2011), selected in the dialog,
+        which shows only the chosen method's parameters, with a
+        parameter sweep over any two of them
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
       * Two-way merge of the forward and backward scans (gwy_twoway):
@@ -119,10 +121,25 @@ def _gsr_kwargs(params):
     )
 
 
+def _chen_kwargs(params):
+    """DeStripe parameters as gwy_destripe keywords."""
+    return dict(
+        window=int(params.get("window", gd.CHEN_DEFAULTS["window"])),
+        cvar_k=float(params.get("cvar_k", gd.CHEN_DEFAULTS["cvar_k"])),
+        density=float(params.get("density", gd.CHEN_DEFAULTS["density"])),
+        min_run=int(params.get("min_run", gd.CHEN_DEFAULTS["min_run"])),
+        keep_mean=bool(params.get("keep_mean",
+                                  gd.CHEN_DEFAULTS["keep_mean"])),
+    )
+
+
 def _op_destripe(data, params, dx, dy):
-    """Stripe removal by either of the two methods; `method` selects."""
-    if str(params.get("method", "MDSR")).upper() == "GSR":
+    """Stripe removal by any of the three methods; `method` selects."""
+    method = str(params.get("method", "MDSR")).upper()
+    if method == "GSR":
         return gd.gsr(data, **_gsr_kwargs(params))
+    if method == "DESTRIPE":
+        return gd.destripe_chen(data, **_chen_kwargs(params))
     return gd.mdsr(data, pad=bool(params.get("pad", False)),
                    **_mdsr_kwargs(params))
 
@@ -431,11 +448,22 @@ def _validate_percentile(params):
 
 
 def _validate_destripe(params):
-    if str(params.get("method", "MDSR")).upper() == "GSR":
+    method = str(params.get("method", "MDSR")).upper()
+    if method == "GSR":
         if params["mu1"] <= 0 or params["mu2"] <= 0:
             return "mu1 and mu2 must be positive"
         if params["iterations"] < 1:
             return "There must be at least one iteration"
+        return None
+    if method == "DESTRIPE":
+        if params["window"] < 1:
+            return "The neighbourhood must be at least 1 pixel wide"
+        if params["cvar_k"] < 0:
+            return "The CVAR threshold cannot be negative"
+        if not 0.0 < params["density"] <= 1.0:
+            return "The central density must be between 0 and 1"
+        if params["min_run"] < 1:
+            return "A line must be at least one pixel long"
         return None
     if params["sigma"] <= 0:
         return "Damping width must be positive"
@@ -452,10 +480,17 @@ def _validate_destripe(params):
 
 def _describe_destripe(params):
     angle = f"{params.get('angle', 0.0):g} deg"
-    if str(params.get("method", "MDSR")).upper() == "GSR":
+    method = str(params.get("method", "MDSR")).upper()
+    if method == "GSR":
         return (f"GSR, {angle}, mu1={params.get('mu1', 0.0):.4g}, "
                 f"mu2={params.get('mu2', 0.0):.4g}, "
                 f"{params.get('iterations', 0)} iterations")
+    if method == "DESTRIPE":
+        return (f"DeStripe, k={params.get('cvar_k', 0.0):g}, "
+                f"window {2 * int(params.get('window', 1)) + 1}px, "
+                f"density {params.get('density', 0.0):g}, "
+                f"run {params.get('min_run', 0)}"
+                + ("" if params.get("keep_mean", True) else ", mean filtered"))
     return (f"MDSR, {angle}, sigma={params.get('sigma', 0.0):g}, "
             f"{params.get('directions', 8)} dirs, "
             f"{params.get('levels', 5)} scales"
@@ -561,7 +596,7 @@ OPERATIONS = {
         # only the parameters that belong to the selected one.
         "params": [
             {"name": "method", "label": "Method", "type": "choice",
-             "default": "MDSR", "values": ["MDSR", "GSR"]},
+             "default": "MDSR", "values": ["MDSR", "GSR", "DeStripe"]},
             {"name": "angle", "label": "Stripe angle (deg)", "type": "float",
              "default": 0.0, "min": -180.0, "max": 180.0},
             # --- MDSR (Fourier filtering in the contourlet domain)
@@ -584,6 +619,18 @@ OPERATIONS = {
              "default": gd.GSR_DEFAULTS["mu2"], "min": 0.0, "max": 100.0},
             {"name": "iterations", "label": "Iterations", "type": "int",
              "default": gd.GSR_DEFAULTS["iterations"], "min": 1, "max": 100000},
+            # --- DeStripe (noisy pixels of the log spectrum)
+            {"name": "cvar_k", "label": "CVAR threshold (sigma)",
+             "type": "float", "default": gd.CHEN_DEFAULTS["cvar_k"],
+             "min": 0.0, "max": 100.0},
+            {"name": "window", "label": "Neighbourhood NS", "type": "int",
+             "default": gd.CHEN_DEFAULTS["window"], "min": 1, "max": 10},
+            {"name": "density", "label": "Central density", "type": "float",
+             "default": gd.CHEN_DEFAULTS["density"], "min": 0.01, "max": 1.0},
+            {"name": "min_run", "label": "Line length (px)", "type": "int",
+             "default": gd.CHEN_DEFAULTS["min_run"], "min": 1, "max": 100},
+            {"name": "keep_mean", "label": "Keep mean height", "type": "bool",
+             "default": gd.CHEN_DEFAULTS["keep_mean"]},
         ],
         "removed_label": "Removed stripes",
         "validate": _validate_destripe,
@@ -1051,10 +1098,12 @@ class DestripeSweepWindow(tk.Toplevel):
 
     Each axis sweeps one parameter of the current method around the value
     set in the dialog. Gains are stepped by a factor (geometric: with factor
-    2 and a 3x3 grid the rows are mu1/2, mu1, 2*mu1), counts and angles by an
-    increment - 'Same rate' keeps both axes on the same step, which for GSR's
-    mu1/mu2 makes the diagonal the "scale both together" direction the paper
-    describes.
+    2 and a 3x3 grid the rows are mu1/2, mu1, 2*mu1), counts, angles and
+    thresholds by an increment. 'Same rate' keeps both axes on the same
+    step, which for GSR's mu1/mu2 makes the diagonal the "scale both
+    together" direction the paper describes; it is on by default only for
+    two multiplied axes, since two incremented parameters need not share a
+    unit.
 
     Nothing runs until 'Run' is pressed. The cells are then computed one at a
     time so the window fills in visibly instead of freezing. Every cell is
@@ -1076,8 +1125,13 @@ class DestripeSweepWindow(tk.Toplevel):
         "mu1":        ("mul", 2.0, "float"),
         "mu2":        ("mul", 2.0, "float"),
         "iterations": ("mul", 2.0, "int"),
+        "cvar_k":     ("add", 0.5, "float"),
+        "window":     ("add", 1.0, "int"),
+        "density":    ("add", 0.05, "float"),
+        "min_run":    ("add", 2.0, "int"),
     }
-    DEFAULT_AXES = {"GSR": ("mu1", "mu2"), "MDSR": ("sigma", "levels")}
+    DEFAULT_AXES = {"GSR": ("mu1", "mu2"), "MDSR": ("sigma", "levels"),
+                    "DESTRIPE": ("cvar_k", "min_run")}
 
     def __init__(self, dialog):
         super().__init__(dialog)
@@ -1191,7 +1245,6 @@ class DestripeSweepWindow(tk.Toplevel):
             self.col_combo["values"] = list(self._names)
             self.row_var.set(self._label(row))
             self.col_var.set(self._label(col))
-            self.link_var.set(True)     # _sync_link drops it if it cannot hold
         finally:
             self._syncing = False
         self._on_axis_change("row")
@@ -1227,18 +1280,28 @@ class DestripeSweepWindow(tk.Toplevel):
                 self.col_step_var.set(step)
         finally:
             self._syncing = False
+        # a new axis parameter, so the link goes back to its default
+        self.link_var.set(self._axis_modes() == ("mul", "mul"))
         self._sync_link()
 
-    def _modes_match(self):
+    def _axis_modes(self):
+        """How each axis steps, or (None, None) before the axes are set."""
         row = getattr(self, "_names", {}).get(self.row_var.get())
         col = getattr(self, "_names", {}).get(self.col_var.get())
         if row is None or col is None:
-            return False
-        return self.SWEEP_STEPS[row][0] == self.SWEEP_STEPS[col][0]
+            return None, None
+        return self.SWEEP_STEPS[row][0], self.SWEEP_STEPS[col][0]
+
+    def _modes_match(self):
+        modes = self._axis_modes()
+        return modes[0] is not None and modes[0] == modes[1]
 
     def _sync_link(self):
         """'Same rate' only means something when both axes step the same
-        way; otherwise the column keeps its own step."""
+        way; otherwise the column keeps its own step. It is on by default
+        only for two multiplied axes - two gains scaled together is the
+        comparison it exists for, whereas two incremented parameters (an
+        angle and a pixel count, say) do not share a unit."""
         same = self._modes_match()
         if not same:
             self.link_var.set(False)
@@ -2156,6 +2219,17 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
     the stripes are pushed out, 'mu2' how carefully real structure is kept;
     the result improves with 'Iterations' until it converges.
 
+    DeStripe - the AFM method of Chen & Pellequer (2011). It looks for the
+    stripes in the image's own log-amplitude spectrum: pixels that are both
+    bright and abruptly brighter than their surroundings, and that lie in
+    lines, are pulled down to the level of their neighbours. The bottom
+    right panel shows the resulting filter Phi (the paper's F-image) - 1
+    means the frequency is kept untouched, 0 that it is removed entirely.
+    'CVAR threshold' is the knob: it is how many standard deviations above
+    its neighbours a frequency must sit to count as noise, so lower removes
+    more. This method takes no stripe direction - it finds whatever lines
+    are in the spectrum.
+
     'Zoom window...' - or dragging on the result panel - opens the image
     before and after the filter side by side, which is the honest way to
     check that only stripes were removed. 'Parameter sweep...' runs a grid
@@ -2171,6 +2245,9 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         "MDSR": ["method", "angle", "sigma", "directions", "levels",
                  "sigma_a", "max_angle", "pad"],
         "GSR": ["method", "angle", "mu1", "mu2", "iterations"],
+        # DeStripe finds the stripe direction itself, so no angle here
+        "DESTRIPE": ["method", "cvar_k", "window", "density", "min_run",
+                     "keep_mean"],
     }
 
     def __init__(self, app, op_key="destripe"):
@@ -2218,11 +2295,17 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         if win is not None and win.winfo_exists():
             win.sync_method()          # offer the new method's parameters
         if hasattr(self, "hint_var"):
+            hints = {
+                "GSR": "  |  GSR: more iterations = better converged, slower",
+                "DESTRIPE": "  |  DeStripe: lower CVAR threshold = more "
+                            "frequencies removed",
+            }
             self.hint_var.set(
-                "Stripe angle: 0 = horizontal scan lines, 90 = vertical  |  "
-                "Drag on the result panel to pick the zoom area"
-                + ("  |  GSR: more iterations = better converged, slower"
-                   if method == "GSR" else "")
+                ("DeStripe finds the stripe direction itself"
+                 if method == "DESTRIPE" else
+                 "Stripe angle: 0 = horizontal scan lines, 90 = vertical")
+                + "  |  Drag on the result panel to pick the zoom area"
+                + hints.get(method, "")
             )
 
     # ---- zoom on a selected area (see ZoomAreaMixin) ----
@@ -2264,7 +2347,7 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
 
         im0 = ax0.imshow(result, origin="upper", cmap=gp.get_gwyddion_cmap(),
                          extent=extent, aspect="equal")
-        ax0.set_title(f"Preview: {self._method()} result  "
+        ax0.set_title(f"Preview: {params.get('method', 'MDSR')} result  "
                       f"(drag = area to zoom)")
         ax0.set_xlabel(f"x ({app.spatial_units})")
         ax0.set_ylabel(f"y ({app.spatial_units})")
@@ -2277,8 +2360,11 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         ax1.set_ylabel(f"y ({app.spatial_units})")
         self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
 
-        if self._method() == "GSR":
+        method = self._method()
+        if method == "GSR":
             self._draw_input_panel(ax2, data, extent)
+        elif method == "DESTRIPE":
+            self._draw_phi_panel(ax2, data, params)
         else:
             self._draw_mask_panel(ax2, data, params)
 
@@ -2299,17 +2385,39 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         ax.set_xlabel(f"x ({app.spatial_units})")
         self.figure.colorbar(im, ax=ax, fraction=0.046).set_label(app.z_units)
 
+    def _freq_extent(self, shape):
+        """Physical frequency axes of a shifted spectrum, as an imshow
+        extent (the same convention as the FFT filter dialog)."""
+        app = self.app
+        ny, nx = shape
+        freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=app.dx))
+        freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=app.dy))
+        hx, hy = 0.5 / (nx * app.dx), 0.5 / (ny * app.dy)
+        return [freq_x[0] - hx, freq_x[-1] + hx,
+                freq_y[-1] + hy, freq_y[0] - hy]
+
+    def _draw_phi_panel(self, ax, data, params):
+        """DeStripe's filter image: how much of each frequency survives,
+        and how many spectral pixels were found noisy."""
+        app = self.app
+        phi, noisy, _ = gd.destripe_chen_filter(data, **_chen_kwargs(params))
+        im = ax.imshow(phi, origin="upper", cmap="viridis",
+                       extent=self._freq_extent(data.shape), aspect="equal",
+                       vmin=0, vmax=1)
+        ax.set_title(f"DeStripe filter Phi (1 = kept): {int(noisy.sum())} "
+                     f"noisy frequencies\nof {noisy.size} "
+                     f"({100 * noisy.mean():.3f}%)")
+        ax.set_xlabel(f"fx (1/{app.spatial_units})")
+        ax.set_ylabel(f"fy (1/{app.spatial_units})")
+        self.figure.colorbar(im, ax=ax, fraction=0.046).set_label("kept")
+
     def _draw_mask_panel(self, ax, data, params):
         """The composite MDSR frequency mask, on the same physical frequency
         axes as the FFT filter dialog."""
         app = self.app
         ny, nx = data.shape
         mask = gd.mdsr_mask(data.shape, **_mdsr_kwargs(params))
-        freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=app.dx))
-        freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=app.dy))
-        hx, hy = 0.5 / (nx * app.dx), 0.5 / (ny * app.dy)
-        freq_extent = [freq_x[0] - hx, freq_x[-1] + hx,
-                       freq_y[-1] + hy, freq_y[0] - hy]
+        freq_extent = self._freq_extent(data.shape)
         im = ax.imshow(mask, origin="upper", cmap="viridis",
                        extent=freq_extent, aspect="equal", vmin=0, vmax=1)
         # the groove reaches about 2.5 sigma bins, so it takes out
