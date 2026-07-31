@@ -13,7 +13,8 @@ Provides an interactive Tkinter application to:
       * FFT filtering (filter_by_2d_fft_mask): lowpass/highpass, circular
         notches, rectangles and straight bands combined in one dialog,
         with a large interactive spectrum (click to place cutoff/notches,
-        drag to notch a rectangle) and optional smooth mask edges
+        drag to notch a rectangle), optional smooth mask edges and a
+        zoom window comparing the image before and after the filter
       * Scar removal (remove_scars)
       * Set baseline to zero (set_baseline_to_zero)
       * Two-way merge of the forward and backward scans (gwy_twoway):
@@ -23,6 +24,8 @@ Provides an interactive Tkinter application to:
   - Undo changes step by step (or reset to the original data)
   - Batch-process every .gwy file in a folder by replaying the
     current processing pipeline on the selected channel
+  - Save the result as an image or back into a .gwy file, next to
+    every other channel of the measurement
 
 Run with:  python gwy_processor_gui.py
 """
@@ -808,14 +811,33 @@ def save_pure_image(data, path, x_real=None, y_real=None):
     mpimage.imsave(path, data, cmap=gp.get_gwyddion_cmap(), origin="upper")
 
 
+def _gwy_channel_titles(container):
+    """The titles of the channels already present in a .gwy container."""
+    titles = []
+    for k in container.keys():
+        parts = k.split("/")
+        if len(parts) == 4 and parts[1].isdigit() and parts[2:] == ["data",
+                                                                    "title"]:
+            titles.append(container[k])
+    return titles
+
+
 def save_channel_to_gwy(path, title, data, xreal=None, yreal=None,
-                        unit_xy="", unit_z=""):
+                        unit_xy="", unit_z="", extra_channels=()):
     """
     Save `data` (in SI units) as a channel of a Gwyddion .gwy file.
 
     If the file already exists, the channel is APPENDED with the next free
     channel number, so repeated saves collect all processed channels in
-    one .gwy file. Returns the channel number used.
+    one .gwy file.
+
+    `extra_channels` is a sequence of (title, GwyDataField) written next to
+    it - typically the untouched channels of the source measurement, so the
+    saved file stands on its own. A channel whose title is already in the
+    file is skipped, so saving repeatedly never duplicates them.
+
+    Returns (channel number of `data`, its title - numbered if that title
+    was taken -, titles of the extra channels written).
     """
     if os.path.exists(path):
         container = gwy_loader.GwyObject.fromfile(path)
@@ -836,10 +858,202 @@ def save_channel_to_gwy(path, title, data, xreal=None, yreal=None,
         si_unit_xy=unit_xy or None,
         si_unit_z=unit_z or None,
     )
+    # Gwyddion identifies channels by title, so a repeated save gets a
+    # numbered one instead of a second channel with the same name.
+    have = set(_gwy_channel_titles(container))
+    unique, k = title, 2
+    while unique in have:
+        unique = f"{title} {k}"
+        k += 1
     container[f"/{n}/data"] = field
-    container[f"/{n}/data/title"] = title
+    container[f"/{n}/data/title"] = unique
+    have.add(unique)
+
+    written = []
+    for extra_title, extra_field in extra_channels:
+        if extra_title in have:
+            continue
+        n += 1
+        container[f"/{n}/data"] = extra_field
+        container[f"/{n}/data/title"] = extra_title
+        have.add(extra_title)
+        written.append(extra_title)
+
     container.tofile(path)
-    return n
+    return n - len(written), unique, written
+
+
+# ---------------------------------------------------------------------------
+# Zoom on a selected area (shared by the dialogs that preview images)
+# ---------------------------------------------------------------------------
+
+class ZoomWindow(tk.Toplevel):
+    """A large side-by-side view of one region of the previewed images, so
+    small features can be inspected close up. The region is picked by
+    dragging a rectangle on one panel of the parent dialog; until one is
+    picked the full images are shown. The views share one color scale so
+    heights are directly comparable, and the window follows every preview
+    update and display-leveling change."""
+
+    def __init__(self, dialog, source="Forward"):
+        super().__init__(dialog)
+        self.title(f"Zoom - drag a rectangle on the {source} panel "
+                   "to pick the area")
+        self.geometry("1500x600")
+        self.figure = Figure(figsize=(15, 5.4), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+    def show(self, panels, extent, subtitle, z_units):
+        """panels: [(title, image), ...], all the same shape."""
+        self.figure.clf()
+        axes = np.atleast_1d(self.figure.subplots(1, len(panels),
+                                                  sharex=True, sharey=True))
+        allv = np.concatenate([img.ravel() for _, img in panels])
+        v0, v1 = np.percentile(allv, [0.5, 99.5])
+        if v1 <= v0:
+            v1 = v0 + 1.0
+        cmap = gp.get_gwyddion_cmap()
+        im = None
+        for ax, (title, img) in zip(axes, panels):
+            im = ax.imshow(img, origin="upper", cmap=cmap, extent=extent,
+                           aspect="equal", vmin=v0, vmax=v1)
+            ax.set_title(title, fontsize=10)
+        self.figure.colorbar(im, ax=list(axes), fraction=0.03,
+                             pad=0.02).set_label(z_units)
+        self.figure.suptitle(subtitle, fontsize=10)
+        self.canvas.draw()
+
+
+class ZoomAreaMixin:
+    """Drag-to-pick an area on one preview panel and inspect it big in a
+    `ZoomWindow`.
+
+    The host dialog must provide `self.app` and `self.canvas`, call
+    `_init_zoom()` in its constructor, and on every draw call
+    `_attach_zoom_selector(ax)` on the panel to drag on, `_mark_zoom_rect()`
+    on the panels that should outline the area, and `_update_zoom_window()`.
+    It supplies the images through `_zoom_panels()` and re-renders itself
+    through `_redraw_zoom_source()`.
+    """
+
+    ZOOM_SOURCE = "Forward"          # name of the panel carrying the selector
+
+    def _init_zoom(self):
+        self._zoom_rect = None       # (x0, x1, y0, y1) in physical units
+        self._zoom_win = None
+        self._zoom_selector = None
+
+    # ---- to be provided by the dialog ----
+
+    def _zoom_panels(self):
+        """`([(title, image), ...], subtitle_tag)`, or None when there is
+        nothing to show yet. All images must have the same shape."""
+        raise NotImplementedError
+
+    def _redraw_zoom_source(self):
+        """Re-render the dialog itself, so the picked area gets outlined."""
+        raise NotImplementedError
+
+    # ---- area selection ----
+
+    def open_zoom_window(self):
+        """Open (or raise) the large zoom view of the selected area."""
+        if self._zoom_win is None or not self._zoom_win.winfo_exists():
+            self._zoom_win = ZoomWindow(self, self.ZOOM_SOURCE)
+        else:
+            self._zoom_win.lift()
+        self._update_zoom_window()
+
+    def _attach_zoom_selector(self, ax):
+        """Drag-to-select on the source panel; the rectangle is shown big in
+        the zoom window. Re-created on every draw (figure was cleared)."""
+        try:
+            self._zoom_selector = RectangleSelector(
+                ax, self._on_zoom_select, useblit=True, button=[1],
+                props=dict(fill=False, edgecolor="red", linestyle="--"),
+            )
+        except TypeError:
+            # Older matplotlib uses `rectprops`
+            self._zoom_selector = RectangleSelector(
+                ax, self._on_zoom_select, useblit=True, button=[1],
+                rectprops=dict(fill=False, edgecolor="red", linestyle="--"),
+            )
+
+    def _on_zoom_select(self, eclick, erelease):
+        toolbar = getattr(self.canvas, "toolbar", None)
+        if toolbar is not None and getattr(toolbar, "mode", ""):
+            return              # pan/zoom tool active - not a selection
+        coords = (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata)
+        if any(c is None for c in coords):
+            return
+        x0, x1 = sorted(coords[:2])
+        y0, y1 = sorted(coords[2:])
+        if (x1 - x0) < 2 * self.app.dx or (y1 - y0) < 2 * self.app.dy:
+            return              # a click, not a drag
+        self._zoom_rect = (x0, x1, y0, y1)
+        self.open_zoom_window()
+        self._redraw_zoom_source()
+
+    def _zoom_slices(self, shape):
+        """The pixel rows/columns of the current zoom rectangle, or None for
+        the full image (images are drawn with origin='upper', so pixel row 0
+        sits at the TOP of the physical extent)."""
+        if self._zoom_rect is None:
+            return None
+        ny, nx = shape
+        dx, dy = self.app.dx, self.app.dy
+        x0, x1, y0, y1 = self._zoom_rect
+        ix0 = max(0, int(np.floor(x0 / dx)))
+        ix1 = min(nx, int(np.ceil(x1 / dx)))
+        iy0 = max(0, int(np.floor(ny - y1 / dy)))
+        iy1 = min(ny, int(np.ceil(ny - y0 / dy)))
+        if ix1 - ix0 < 2 or iy1 - iy0 < 2:
+            return None
+        return slice(iy0, iy1), slice(ix0, ix1)
+
+    def _mark_zoom_rect(self, *axes):
+        """Outline the zoomed area on the dialog's own image panels."""
+        if self._zoom_rect is None:
+            return
+        x0, x1, y0, y1 = self._zoom_rect
+        for ax in axes:
+            ax.add_patch(Rectangle(
+                (x0, y0), x1 - x0, y1 - y0, fill=False,
+                edgecolor="red", lw=1.2))
+
+    def _update_zoom_window(self):
+        if self._zoom_win is None or not self._zoom_win.winfo_exists():
+            return
+        panels = self._zoom_panels()
+        if panels is None:
+            return
+        panels, tag = panels
+        images = [img for _, img in panels]
+        dx, dy = self.app.dx, self.app.dy
+        ny, nx = images[0].shape
+        sl = self._zoom_slices(images[0].shape)
+        if sl is None:
+            extent = (0, nx * dx, 0, ny * dy)
+            where = (f"full image (drag on the {self.ZOOM_SOURCE} panel "
+                     f"to pick an area)")
+        else:
+            rows, cols = sl
+            images = [img[rows, cols] for img in images]
+            extent = (cols.start * dx, cols.stop * dx,
+                      (ny - rows.stop) * dy, (ny - rows.start) * dy)
+            where = (f"area {cols.stop - cols.start}x{rows.stop - rows.start}"
+                     f" px at ({extent[0]:.3g}, {extent[2]:.3g}) "
+                     f"{self.app.spatial_units}")
+        self._zoom_win.show([(t, img) for (t, _), img in zip(panels, images)],
+                            extent, f"{where}{tag}", self.app.z_units)
+
+    def destroy(self):
+        win = getattr(self, "_zoom_win", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        super().destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +1270,7 @@ class PolynomialDialog(OperationDialog):
                 pass
 
 
-class FFTFilterDialog(OperationDialog):
+class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
     """
     Combined FFT filter dialog: an optional radial lowpass/highpass and
     notch filtering of specific periodic signals, all applied as ONE
@@ -1082,7 +1296,13 @@ class FFTFilterDialog(OperationDialog):
     protected center: compact ones become circular notches, extended
     ones rectangles. 'Edge smoothing' softens the whole mask with a
     Gaussian roll-off so the filters do not ring.
+
+    'Zoom window...' opens the before/after images side by side and large;
+    dragging on the result panel picks the area to inspect there, so it can
+    be checked that the filter removed the noise and not the topography.
     """
+
+    ZOOM_SOURCE = "result"
 
     def __init__(self, app, op_key="fft_filter"):
         self.notches = []       # list of [fx, fy] circular notches
@@ -1093,6 +1313,8 @@ class FFTFilterDialog(OperationDialog):
         self._spec_ax = None
         self._spec_selector = None
         self._press = None      # left-button press position (click vs drag)
+        self._last_result = None
+        self._init_zoom()
         super().__init__(app, op_key)
         self.geometry("1500x850")
         self.canvas.mpl_connect("button_press_event", self._on_click)
@@ -1112,6 +1334,8 @@ class FFTFilterDialog(OperationDialog):
         ttk.Button(btns, text="Clear notches", command=self.clear_notches).pack(
             side=tk.LEFT, padx=2
         )
+        ttk.Button(btns, text="Zoom window...",
+                   command=self.open_zoom_window).pack(side=tk.LEFT, padx=2)
         ttk.Label(btns, text="Click sets:").pack(side=tk.LEFT, padx=(12, 2))
         self.click_mode_var = tk.StringVar(value="circle notch")
         ttk.Combobox(
@@ -1161,6 +1385,21 @@ class FFTFilterDialog(OperationDialog):
         self.rects = []
         self.x_bands = []
         self.y_bands = []
+        self.update_preview()
+
+    # ---- zoom on a selected area (see ZoomAreaMixin) ----
+
+    def _zoom_panels(self):
+        """Before/after the filter, so the zoom window shows directly what
+        the mask took out of the image."""
+        if self._last_result is None:
+            return None
+        params = self.get_params()
+        tag = f" - {describe_step(self.op_key, params)}" if params else ""
+        return ([("Before filtering", self.app.data),
+                 ("After filtering", self._last_result)], tag)
+
+    def _redraw_zoom_source(self):
         self.update_preview()
 
     def _toolbar_busy(self):
@@ -1277,6 +1516,7 @@ class FFTFilterDialog(OperationDialog):
 
     def _draw(self, result, removed):
         app = self.app
+        self._last_result = result
         self._ensure_spectrum()
         mag, freq_extent = self._spectrum
         extent = (0, app.x_real, 0, app.y_real)
@@ -1337,7 +1577,7 @@ class FFTFilterDialog(OperationDialog):
             result, origin="upper", cmap=gp.get_gwyddion_cmap(),
             extent=extent, aspect="equal",
         )
-        ax1.set_title("Preview: result")
+        ax1.set_title("Preview: result  (drag = area to zoom)")
         ax1.set_xlabel(f"x ({app.spatial_units})")
         ax1.set_ylabel(f"y ({app.spatial_units})")
         self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
@@ -1350,9 +1590,12 @@ class FFTFilterDialog(OperationDialog):
         ax2.set_xlabel(f"x ({app.spatial_units})")
         self.figure.colorbar(im2, ax=ax2, fraction=0.046).set_label(app.z_units)
 
+        self._mark_zoom_rect(ax1, ax2)
         self.figure.tight_layout()
         self._attach_spec_selector(ax0)
+        self._attach_zoom_selector(ax1)
         self.canvas.draw()
+        self._update_zoom_window()
 
 
 class CropDialog(OperationDialog):
@@ -1558,45 +1801,6 @@ DIALOG_CLASSES = {
 }
 
 
-class ZoomWindow(tk.Toplevel):
-    """A large side-by-side view of one region of the forward, backward, and
-    merged images, so edges can be inspected close up. The region is picked
-    by dragging a rectangle on the Forward panel of the parent dialog; until
-    one is picked the full images are shown. The three views share one color
-    scale so heights are directly comparable, and the window follows every
-    preview update and display-leveling change."""
-
-    def __init__(self, dialog):
-        super().__init__(dialog)
-        self.title("Zoom - drag a rectangle on the Forward panel "
-                   "to pick the area")
-        self.geometry("1500x600")
-        self.figure = Figure(figsize=(15, 5.4), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
-
-    def show(self, panels, extent, subtitle, z_units):
-        """panels: [(title, image), ...], all the same shape."""
-        self.figure.clf()
-        axes = np.atleast_1d(self.figure.subplots(1, len(panels),
-                                                  sharex=True, sharey=True))
-        allv = np.concatenate([img.ravel() for _, img in panels])
-        v0, v1 = np.percentile(allv, [0.5, 99.5])
-        if v1 <= v0:
-            v1 = v0 + 1.0
-        cmap = gp.get_gwyddion_cmap()
-        im = None
-        for ax, (title, img) in zip(axes, panels):
-            im = ax.imshow(img, origin="upper", cmap=cmap, extent=extent,
-                           aspect="equal", vmin=v0, vmax=v1)
-            ax.set_title(title, fontsize=10)
-        self.figure.colorbar(im, ax=list(axes), fraction=0.03,
-                             pad=0.02).set_label(z_units)
-        self.figure.suptitle(subtitle, fontsize=10)
-        self.canvas.draw()
-
-
 class CorrelationWindow(tk.Toplevel):
     """Diagnostics of the correlation-gated merge, in its own big window:
     the local forward/backward height correlation with the margin, the
@@ -1783,7 +1987,7 @@ class StripeWindow(tk.Toplevel):
 # Main application
 # ---------------------------------------------------------------------------
 
-class TwoWayDialog(tk.Toplevel):
+class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
     """Forward/backward scan merging: hysteresis-and-lag alignment and the
     per-pixel combination of the two scans, with every hyper-parameter
     exposed. Shows the two raw scans, their opacity/anaglyph overlay, the
@@ -1827,9 +2031,7 @@ class TwoWayDialog(tk.Toplevel):
         self.vars = {}
         self.result = None
         self._last_params = None
-        self._zoom_rect = None      # (x0, x1, y0, y1) in physical units
-        self._zoom_win = None
-        self._zoom_selector = None
+        self._init_zoom()
         self._corr_win = None
         self._stripe_win = None
         self._aux_names = []
@@ -2288,97 +2490,17 @@ class TwoWayDialog(tk.Toplevel):
         fwd, bwd, merged = images
         return fwd, bwd, merged, tag
 
-    # ---- Zoom on a selected area ----
+    # ---- Zoom on a selected area (see ZoomAreaMixin) ----
 
-    def open_zoom_window(self):
-        """Open (or raise) the large zoom view of the selected area."""
-        if self._zoom_win is None or not self._zoom_win.winfo_exists():
-            self._zoom_win = ZoomWindow(self)
-        else:
-            self._zoom_win.lift()
-        self._update_zoom_window()
-
-    def _attach_zoom_selector(self, ax):
-        """Drag-to-select on the Forward panel; the rectangle is shown big
-        in the zoom window. Re-created on every draw (figure was cleared)."""
-        try:
-            self._zoom_selector = RectangleSelector(
-                ax, self._on_zoom_select, useblit=True, button=[1],
-                props=dict(fill=False, edgecolor="red", linestyle="--"),
-            )
-        except TypeError:
-            # Older matplotlib uses `rectprops`
-            self._zoom_selector = RectangleSelector(
-                ax, self._on_zoom_select, useblit=True, button=[1],
-                rectprops=dict(fill=False, edgecolor="red", linestyle="--"),
-            )
-
-    def _on_zoom_select(self, eclick, erelease):
-        toolbar = getattr(self.canvas, "toolbar", None)
-        if toolbar is not None and getattr(toolbar, "mode", ""):
-            return              # pan/zoom tool active - not a selection
-        coords = (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata)
-        if any(c is None for c in coords):
-            return
-        x0, x1 = sorted(coords[:2])
-        y0, y1 = sorted(coords[2:])
-        if (x1 - x0) < 2 * self.app.dx or (y1 - y0) < 2 * self.app.dy:
-            return              # a click, not a drag
-        self._zoom_rect = (x0, x1, y0, y1)
-        self.open_zoom_window()
-        self._draw(self._last_params)   # re-render to outline the area
-
-    def _zoom_slices(self, shape):
-        """The pixel rows/columns of the current zoom rectangle, or None for
-        the full image (images are drawn with origin='upper', so pixel row 0
-        sits at the TOP of the physical extent)."""
-        if self._zoom_rect is None:
+    def _zoom_panels(self):
+        if self.result is None:
             return None
-        ny, nx = shape
-        dx, dy = self.app.dx, self.app.dy
-        x0, x1, y0, y1 = self._zoom_rect
-        ix0 = max(0, int(np.floor(x0 / dx)))
-        ix1 = min(nx, int(np.ceil(x1 / dx)))
-        iy0 = max(0, int(np.floor(ny - y1 / dy)))
-        iy1 = min(ny, int(np.ceil(ny - y0 / dy)))
-        if ix1 - ix0 < 2 or iy1 - iy0 < 2:
-            return None
-        return slice(iy0, iy1), slice(ix0, ix1)
-
-    def _update_zoom_window(self):
-        if (self._zoom_win is None or not self._zoom_win.winfo_exists()
-                or self.result is None):
-            return
         fwd_d, bwd_d, merged_d, tag = self._display_images()
-        sl = self._zoom_slices(fwd_d.shape)
-        if sl is None:
-            crops = [fwd_d, bwd_d, merged_d]
-            extent = self._extent_of(fwd_d)
-            where = "full image (drag on the Forward panel to pick an area)"
-        else:
-            rows, cols = sl
-            crops = [fwd_d[rows, cols], bwd_d[rows, cols],
-                     merged_d[rows, cols]]
-            ny = fwd_d.shape[0]
-            dx, dy = self.app.dx, self.app.dy
-            extent = (cols.start * dx, cols.stop * dx,
-                      (ny - rows.stop) * dy, (ny - rows.start) * dy)
-            where = (f"area {cols.stop - cols.start}x{rows.stop - rows.start}"
-                     f" px at ({extent[0]:.3g}, {extent[2]:.3g}) "
-                     f"{self.app.spatial_units}")
         titles = [f"Forward ({self.fwd_title})", "Backward, aligned", "Merged"]
-        self._zoom_win.show(list(zip(titles, crops)), extent,
-                            f"{where}{tag}", self.app.z_units)
+        return list(zip(titles, [fwd_d, bwd_d, merged_d])), tag
 
-    def _mark_zoom_rect(self, *axes):
-        """Outline the zoomed area on the dialog's own image panels."""
-        if self._zoom_rect is None:
-            return
-        x0, x1, y0, y1 = self._zoom_rect
-        for ax in axes:
-            ax.add_patch(Rectangle(
-                (x0, y0), x1 - x0, y1 - y0, fill=False,
-                edgecolor="red", lw=1.2))
+    def _redraw_zoom_source(self):
+        self._draw(self._last_params)   # re-render to outline the area
 
     # ---- Merge-details windows (correlation / stripes) ----
 
@@ -2466,8 +2588,7 @@ class TwoWayDialog(tk.Toplevel):
                 first.get_shared_y_axes().join(first, ax)
 
     def destroy(self):
-        for win in (getattr(self, "_zoom_win", None),
-                    getattr(self, "_corr_win", None),
+        for win in (getattr(self, "_corr_win", None),
                     getattr(self, "_stripe_win", None)):
             if win is not None and win.winfo_exists():
                 win.destroy()
@@ -3083,31 +3204,46 @@ class GwyProcessorGUI(tk.Tk):
 
     def save_to_gwy(self):
         """Append the processed channel to a .gwy file (creating it if needed),
-        so all processed channels can be collected in one Gwyddion file."""
+        so all processed channels can be collected in one Gwyddion file.
+
+        Every other channel of the loaded image is written along with it, so
+        the saved file is a complete copy of the measurement plus the
+        processed result. The name defaults to the source file with a
+        '_processed' suffix, next to the original."""
         if not self._require_data():
             return
         base = os.path.splitext(os.path.basename(self.filename or "image"))[0]
         path = filedialog.asksaveasfilename(
             defaultextension=".gwy",
             filetypes=[("Gwyddion files", "*.gwy")],
-            initialfile="processed.gwy",
+            initialfile=f"{base}_processed.gwy",
+            initialdir=os.path.dirname(self.filename or "") or ".",
             confirmoverwrite=False,  # existing files are appended to, not replaced
         )
         if not path:
             return
         title = f"{base} - {self.channel_var.get()} (processed)"
+        # The processed data may have been cropped, so its physical size is
+        # the source size scaled by the shape ratio, not the source size.
+        ny, nx = self.data.shape
+        t_ny, t_nx = self.field.data.shape
         try:
-            n = save_channel_to_gwy(
+            n, title, extras = save_channel_to_gwy(
                 path, title,
                 self.data / self.z_factor,  # back to SI units
-                xreal=self.field.xreal, yreal=self.field.yreal,
+                xreal=nx * float(self.field.xreal or t_nx) / t_nx,
+                yreal=ny * float(self.field.yreal or t_ny) / t_ny,
                 unit_xy=self.unit_xy_str, unit_z=self.unit_z_str,
+                extra_channels=list(self.channels.items()),
             )
         except Exception as e:
             messagebox.showerror("Save error", f"Could not write .gwy file:\n{e}")
             return
-        self._log(f"Saved channel {n} '{title}' to {os.path.basename(path)}")
-        self.status_var.set(f"Appended channel {n} to {os.path.basename(path)}")
+        extra_txt = f" (+ {len(extras)} original channels)" if extras else ""
+        self._log(f"Saved channel {n} '{title}'{extra_txt} to "
+                  f"{os.path.basename(path)}")
+        self.status_var.set(
+            f"Appended channel {n}{extra_txt} to {os.path.basename(path)}")
 
     # --------------------------------------------------------------- Batch --
 

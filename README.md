@@ -36,7 +36,7 @@ environment variable to point elsewhere.
 * **Scar Removal** (`remove_scars`): Detects and interpolates horizontal line defects (strokes) introduced during scanning.
 * **Baseline Adjustment** (`set_baseline_to_zero`): Shifts the minimum data point to a base of zero.
 * **Outlier Filtering** (`filter_by_percentile`): Clips extreme values (spikes) based on a designated percentile range.
-* **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft_mask`): 2D FFT analysis (no windowing - the displayed spectrum is exactly the one being filtered, normalized so the DC bin is the image mean) and frequency-domain filtering through a single mask that can combine a radial lowpass/highpass (`build_pass_mask`), circular notches (`build_notch_mask`), rectangular patches (`build_rect_mask`), and straight bands (`build_band_mask`). Noise is auto-detected systematically (`detect_fft_noise`) on the *excess* spectrum - the dB magnitude above the local radial background (`fft_excess_db`), so the falloff of the real topography never triggers it: streak columns/rows (median excess along the axis), coherent interference peaks sitting on the fx/fy axes, and off-axis regions each get their own statistically matched test. The whole mask can be given a smooth Gaussian roll-off (`smooth_fft_mask`) instead of hard edges. The GUI exposes all of these in one FFT-filter dialog with a large interactive spectrum (click to place cutoff/notches/bands, drag to notch a rectangle).
+* **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft_mask`): 2D FFT analysis (no windowing - the displayed spectrum is exactly the one being filtered, normalized so the DC bin is the image mean) and frequency-domain filtering through a single mask that can combine a radial lowpass/highpass (`build_pass_mask`), circular notches (`build_notch_mask`), rectangular patches (`build_rect_mask`), and straight bands (`build_band_mask`). Noise is auto-detected systematically (`detect_fft_noise`) on the *excess* spectrum - the dB magnitude above the local radial background (`fft_excess_db`), so the falloff of the real topography never triggers it: streak columns/rows (median excess along the axis), coherent interference peaks sitting on the fx/fy axes, and off-axis regions each get their own statistically matched test. The whole mask can be given a smooth Gaussian roll-off (`smooth_fft_mask`) instead of hard edges. The GUI exposes all of these in one FFT-filter dialog with a large interactive spectrum (click to place cutoff/notches/bands, drag to notch a rectangle) and a *Zoom window* that shows the image before and after the filter side by side on one color scale, cropped to an area dragged on the result panel - so it can be checked close up that the filter took out the noise and not the topography.
 
 ### Two-Way Scan Processing (`gwy_twoway.py`)
 
@@ -134,6 +134,18 @@ Both windows offer two ways to commit the result:
   data. The merge is recorded as the first pipeline step, so *Batch process
   folder* reproduces it on every file (re-measuring the shift for each one).
 * **Replace current image** overwrites the image being edited.
+
+### Saving from the GUI
+
+* **Save processed image...** writes an annotated PNG (axes, colorbar, scale bar)
+  plus a bare one-pixel-per-datapoint copy in a `pure/` subfolder, or a `.npy`
+  array.
+* **Save channel to .gwy...** writes the processed channel *together with every
+  other channel of the loaded image*, so the output is a complete copy of the
+  measurement plus the result. It defaults to the source file name with a
+  `_processed` suffix, in the source folder. Saving into an existing file
+  appends: the originals already in it are not written twice, and a repeated
+  save of the same channel gets a numbered title (`... (processed) 2`).
 
 ### Visualization
 * Offers a custom colormap approximating the default Gwyddion "Gwy" palette (`get_gwyddion_cmap`).
