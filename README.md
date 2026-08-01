@@ -119,15 +119,51 @@ cells, the fitted background swung over 700 nm on an image whose features are
 40 nm tall. And the **contour expansion is not the paper's active contour** —
 same purpose, one parameter instead of two, no dependency beyond scipy.
 
-`passes` (default 2) repeats the whole thing on the flattened result. There is a
-chicken and egg to handle here: segmenting needs a reasonably flat image,
-because on a raw scan the drift between one line and the next is routinely
-larger than the cells sitting on it, and segmenting *that* marks the bright scan
-lines rather than the sample. So the first mask is taken from a plainly
-flattened copy — the same fit over every pixel, features and all. That copy is a
-bad image (it is exactly the one this module exists to avoid) but a good image
-to *segment*, and it is thrown away. The final fit is always taken on the
-original data, so passes refine the mask and never stack subtractions.
+**Finding the features is kept separate from removing the background**, and
+that turned out to matter more than anything else here. Segmenting needs a
+reasonably flat image: on a raw scan the drift between one line and the next is
+routinely larger than the cells sitting on it, and segmenting *that* marks the
+bright scan lines rather than the sample. So the features are always looked for
+on a `seed_background` copy — a plane off and a **second-order polynomial off
+every scan line**, which is the standard way of making a raw scan readable —
+whatever fit is going to be used afterwards. That copy is a bad image (it is
+exactly the one this module exists to avoid: it dents the features) but a good
+image to *segment*, and it is thrown away. Only then is the background fitted,
+once, the way you asked.
+
+Both halves of that are measured rather than assumed. Scored against
+`gwy_balance.segment_cells` on a properly flattened image — an independent
+segmentation, already checked against these same scans — over **18 scans from
+six sessions**:
+
+| seed order | 1 pass | 2 passes | 3 passes |
+| --- | --- | --- | --- |
+| 1 | 0.477 | 0.337 | 0.306 |
+| **2** | **0.912** | 0.465 | 0.324 |
+| 3 | 0.572 | 0.372 | 0.253 |
+
+(mean intersection-over-union with the reference mask). Second order at one pass
+was the best of the nine on *every single scan*: first order leaves the drift
+in, third order starts following the features.
+
+That one look is already the paper's two-step segmentation — its last section
+segments, flattens with the resulting mask and segments the flattened image, and
+the seed here *is* that flattening. `passes` above 1 repeats it again, and the
+table shows what that does. The reason is worth knowing before raising it: once
+the features are restored to their full height they have a wide spread of their
+own, and Otsu's threshold, which splits a histogram wherever that separates it
+best, starts splitting *inside* the features instead of between them and the
+substrate.
+
+The other consequence of seeding every pass is that **the mask no longer depends
+on the fit**. Segmenting the fit-flattened image instead — the obvious reading of
+the paper — makes it depend badly: with `fit="surface"` the flattened image still
+has every line-to-line step in it, because no surface of any order can remove
+drift that lands *between* lines, so the mask that comes back disagreed with the
+`fit="rows"` one on about three quarters of its area. Seeding brings that
+disagreement to exactly nothing across all 18 scans. Which features are on the
+sample is a fact about the sample, and should not change with how you intend to
+remove the background.
 
 **Nothing here rescales z.** The result is `data - background`, a subtraction,
 so a height measured on the result is the height that was measured on the
@@ -160,7 +196,7 @@ their neighbours.
 import gwy_flatten as gf
 
 result = gf.flatten(image, threshold="otsu", detect="convex",
-                    fit="rows", order=3, window=0, passes=2)
+                    fit="rows", order=3, window=0)
 flat = result["data"]          # the levelled image
 result["mask"]                 # what was kept out of the fit
 result["coverage"]             # how much of the frame that was
