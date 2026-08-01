@@ -77,6 +77,22 @@ up its flank. Two thresholds are offered and they are for different samples:
 paper complements the image; so does this) or both. `both` is refused with
 `otsu`, which splits the image in two and would therefore mask all of it.
 
+`feature_size` is the one knob that decides what `otsu` can see. A single
+threshold has to be taken on a smoothed copy, or the texture of the sample
+splits instead of the sample, and this is that smoothing width as a percentage
+of the shorter side. It also sets the finest shape the outline can take, because
+the outline follows the smoothed copy: on a cross with square corners, a blur of
+8 % of the frame gave an outline agreeing with the true shape to 0.78 while one
+of 0.5 % agreed to 1.00, the difference being background swallowed at the
+corners. **If the outline is cutting corners off your features or bulging into
+the substrate between them, this is the parameter to lower.** What it cannot do
+is find something that is bright next to its own surroundings but still below
+the one global threshold — a ridge running through the substrate between cells
+is the usual case. A single threshold has no way to see that; `adaptive` does,
+but only when the neighbourhood can be made wider than the features, which for
+cells it cannot. That is what the hand exclusion below is for, and it is exactly
+why the second paper adds one.
+
 **2. Take the outline out to the foot** (`expand_contour`). What the threshold
 leaves outside the mask is the foot of the feature, and the foot is the worst
 possible thing to feed a background fit — it is the steepest part of the error.
@@ -109,6 +125,21 @@ averaging is a convolution of the coefficient images), which is what makes it a
 second or two on a 512×1024 scan instead of a quarter of a million least-squares
 fits. It is checked against a literal position-by-position implementation to
 1e-7.
+
+**The order is per line, and that is worth knowing about.** A scan line whose
+background is a few clumps at one end cannot carry a cubic, so it is offered the
+order you asked for and drops to the next one down until one is supportable (see
+below). On a sparse sample nothing ever drops. On a frame two thirds covered by
+cells, most lines do: measured on the yeast scans, at `order=3` the lines come
+out at a mix of orders 1, 2 and 3, with a handful of places where one line is
+fitted by a cubic and the line under it by a straight line. Those two are
+visibly different curves, and the switch is a hard one — **one pixel added to
+the mask can flip a line from one to the other and move it by up to 97 nm**,
+where at `order=1` the same nudge moves the whole image by at most 17 nm. That
+is what banding inside a crowded frame usually is, and the answer is to lower
+the order rather than to keep adding to the mask. `flatten` returns `reduced`,
+the share of lines that had to come down, and the dialog reports it and warns
+above a quarter.
 
 **Two departures from the paper**, both about images its nanobubbles never
 produced. A fit is **rejected outright when it would be extrapolating** rather
@@ -226,6 +257,15 @@ scan with a trench across every line and `detect="convex"` (which cannot see a
 pit), the fitted background follows the trench 26 nm away from the truth;
 marking it by hand brings that to 0.26 nm.
 
+A region you draw and a region the threshold found are then **the same thing**:
+the fit is given one mask and cannot tell where a pixel in it came from, which
+is asserted to the last bit in the tests. Two things do change when you draw
+one, though, and they are worth knowing. It is fed to the seed as well, so the
+automatic mask itself moves a little. And it takes background away from every
+line it crosses, which can push those lines down the order ladder — so the lines
+through a region you drew may genuinely be levelled by a different curve from
+their neighbours. That is the ladder, not the drawing.
+
 **Nothing here rescales z.** The result is `data - background`, a subtraction,
 so a height measured on the result is the height that was measured on the
 sample. Multiplying the input by three multiplies the output by exactly three,
@@ -250,8 +290,8 @@ levelling two buttons up. Where that panel is flat the mask made no difference;
 where it is bright, that is how much of the sample the ordinary fit was
 subtracting from itself. Underneath, the mask's share of the frame is reported,
 with a warning if almost nothing is left to fit, if nothing was masked at all,
-or if any scan lines had no background left and had to be interpolated from
-their neighbours. A fourth row of controls covers the manual exclusion: **drag
+if any scan lines had no background left and had to be interpolated from their
+neighbours, or if lines could not carry the order you asked for. A fourth row of controls covers the manual exclusion: **drag
 on the result panel** to keep that rectangle out of the fit, right-click one to
 take it back. The rectangles are carried in physical units, so they survive into
 the pipeline, the log and a batch replay.

@@ -118,6 +118,8 @@ def _smart_kwargs(params):
     return dict(
         detect=str(params.get("detect", gf.DEFAULTS["detect"])),
         threshold=str(params.get("threshold", gf.DEFAULTS["threshold"])),
+        feature_size=float(params.get("feature_size",
+                                      gf.DEFAULTS["feature_size"])),
         neighbourhood=float(params.get("neighbourhood",
                                        gf.DEFAULTS["neighbourhood"])),
         sensitivity=float(params.get("sensitivity",
@@ -170,6 +172,8 @@ def _validate_smart(params):
     if params.get("threshold") == "otsu" and params.get("detect") == "both":
         return ("Otsu splits the image in two, so 'both' would mask all of "
                 "it. Choose convex or concave, or use the adaptive threshold.")
+    if not 0.0 < params.get("feature_size", 1.0) <= 100.0:
+        return "The feature size is a percentage of the image, above 0"
     if not 0.0 < params["neighbourhood"] <= 100.0:
         return "The neighbourhood is a percentage of the image, above 0"
     if params["sensitivity"] <= 0:
@@ -689,6 +693,9 @@ OPERATIONS = {
              "default": gf.DEFAULTS["detect"], "values": list(gf.DETECT)},
             {"name": "threshold", "label": "Find by", "type": "choice",
              "default": gf.DEFAULTS["threshold"], "values": list(gf.THRESHOLDS)},
+            {"name": "feature_size", "label": "Feature size (%)",
+             "type": "float", "default": gf.DEFAULTS["feature_size"],
+             "min": 0.0, "max": 100.0},
             {"name": "neighbourhood", "label": "Neighbourhood (%)",
              "type": "float", "default": gf.DEFAULTS["neighbourhood"],
              "min": 0.0, "max": 100.0},
@@ -2077,13 +2084,15 @@ class SmartLevelDialog(OperationDialog):
 
     GROUPS = (
         ("1. Find the features",
-         ("detect", "threshold", "neighbourhood", "sensitivity")),
+         ("detect", "threshold", "feature_size", "neighbourhood",
+          "sensitivity")),
         ("2. Take the outline out to the foot of each one",
          ("min_area", "expand", "edge", "grow")),
         ("3. Fit the background to what is left",
          ("fit", "order", "window", "passes")),
     )
     ADAPTIVE_ONLY = ("neighbourhood", "sensitivity")
+    OTSU_ONLY = ("feature_size",)
 
     def __init__(self, app, op_key="smart_level"):
         self.result = None
@@ -2132,11 +2141,15 @@ class SmartLevelDialog(OperationDialog):
 
     def _sync_threshold(self):
         """Otsu takes one threshold for the whole image, so the adaptive
-        neighbourhood and offset have nothing to act on."""
+        neighbourhood and offset have nothing to act on - and the other way
+        round for the blur the single threshold is taken on."""
         adaptive = self.vars["threshold"].get() == "adaptive"
         for name in self.ADAPTIVE_ONLY:
             self.param_widgets[name].state(
                 ["!disabled"] if adaptive else ["disabled"])
+        for name in self.OTSU_ONLY:
+            self.param_widgets[name].state(
+                ["disabled"] if adaptive else ["!disabled"])
 
     # ---- areas excluded by hand ----
 
@@ -2228,6 +2241,10 @@ class SmartLevelDialog(OperationDialog):
         if res["starved"] > 0:
             notes.append(f"{100 * res['starved']:.0f}% of lines had no "
                          f"background left and were interpolated")
+        if res["reduced"] > 0:
+            notes.append(f"{100 * res['reduced']:.0f}% of lines could not "
+                         f"support order {self.vars['order'].get()} and were "
+                         f"fitted lower")
         self.excluded_var.set(
             "none" if not self.excluded
             else f"{len(self.excluded)} area"
@@ -2239,6 +2256,10 @@ class SmartLevelDialog(OperationDialog):
         elif res["coverage"] < 0.005:
             warn = ("  -- nothing was masked, so this is the ordinary "
                     "background subtraction.")
+        elif res["reduced"] > 0.25:
+            warn = ("  -- most lines cannot carry this order, so neighbouring "
+                    "lines are being levelled by different curves. Lower the "
+                    "order.")
         self.status_var.set(", ".join(notes) + warn)
         self._status_label.configure(
             foreground="red" if warn else "#404040")

@@ -119,6 +119,7 @@ import gwy_balance as gb
 DEFAULTS = {
     "detect": "convex",        # which features to exclude
     "threshold": "otsu",       # how the first outline is found
+    "feature_size": 3.0,       # otsu blur, % of the shorter side
     "neighbourhood": 25.0,     # adaptive window, % of the shorter side
     "sensitivity": 3.0,        # threshold offset, in robust sigmas
     "expand": 8,               # contour expansion steps (0 = off)
@@ -332,7 +333,8 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
                        sensitivity=DEFAULTS["sensitivity"],
                        expand=DEFAULTS["expand"], edge=DEFAULTS["edge"],
                        grow=DEFAULTS["grow"],
-                       min_area=DEFAULTS["min_area"]):
+                       min_area=DEFAULTS["min_area"],
+                       feature_size=DEFAULTS["feature_size"]):
     """
     Mark everything that is sample rather than background.
 
@@ -355,6 +357,18 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
         grow (int): Plain dilation applied at the end, in pixels.
         min_area (float): Smallest feature kept, as a percentage of the
             frame.
+        feature_size (float): How much the image is blurred before the
+            single `otsu` threshold, as a percentage of the shorter side;
+            unused when `threshold` is `adaptive`. One threshold for the
+            whole image has to be taken on a smoothed copy, or the texture
+            of the sample splits instead of the sample, and this sets that
+            scale. It also sets the finest shape the mask can take, because
+            the outline follows that smoothed copy: measured on a cross with
+            square corners, a blur of 8 % of the frame gave an outline
+            agreeing with the true shape to 0.78 and one of 0.5 % agreed to
+            1.00, the difference being background swallowed at the corners.
+            Lower it to follow real edges and catch thin structure, raise it
+            to ignore texture and keep only the large features.
 
     Returns:
         np.ndarray: A boolean mask, True on the foreground.
@@ -368,8 +382,11 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
                          f"{list(DETECT)}")
 
     if threshold == "otsu":
-        above = gb.segment_cells(data, min_area=min_area / 100.0)
-        below = gb.segment_cells(-data, min_area=min_area / 100.0)
+        blur = max(1e-6, feature_size / 100.0)
+        above = gb.segment_cells(data, cell_fraction=blur,
+                                 min_area=min_area / 100.0)
+        below = gb.segment_cells(-data, cell_fraction=blur,
+                                 min_area=min_area / 100.0)
     else:
         above, below = adaptive_threshold(data, neighbourhood, sensitivity)
 
@@ -490,7 +507,7 @@ def _fill_gaps(coeffs, level):
     return coeffs
 
 
-def _global_background(data, weight, fit, order):
+def _global_background(data, weight, fit, order, report=None):
     """
     One polynomial per scan line, or one over the whole image, fitted to the
     pixels with a non-zero weight.
@@ -508,13 +525,23 @@ def _global_background(data, weight, fit, order):
     Rejecting a fit outright is why nothing needs damping here: `EPS` is in
     the normal matrix to keep it invertible and is small enough to leave a
     well-covered fit exact.
+
+    That ladder is also the one thing here that behaves discontinuously, and
+    it is worth knowing about, so `report` is filled with the share of lines
+    that had to come down. A line at order 3 and its neighbour at order 1 are
+    levelled by visibly different curves, and on a frame two thirds covered
+    by sample a single pixel added to the mask can flip a line from one to
+    the other and move it by tens of nanometres. The alternative - carrying
+    on with a cubic that the data does not support - is worse, so the ladder
+    stays; but a scan where most lines are coming down is a scan asking to be
+    fitted at a lower order in the first place.
     """
     ny, nx = data.shape
     present = weight > 0
     level = float(np.median(data[present])) if present.any() else 0.0
 
     if fit == "columns":
-        return _global_background(data.T, weight.T, "rows", order).T
+        return _global_background(data.T, weight.T, "rows", order, report).T
 
     if fit == "rows":
         x = np.linspace(-1.0, 1.0, nx)
@@ -523,6 +550,7 @@ def _global_background(data, weight, fit, order):
         limits = [SLACK * _ideal_reach(_terms("rows", p), (x, zero))
                   for p in range(order + 1)]
         coeffs = np.full((ny, order + 1), np.nan)
+        used = np.full(ny, -1)
         for y in range(ny):
             for p in range(order, -1, -1):
                 fitted = _solve(design[:, :p + 1], weight[y], data[y],
@@ -530,7 +558,10 @@ def _global_background(data, weight, fit, order):
                 if fitted is not None:
                     coeffs[y, :p + 1] = fitted
                     coeffs[y, p + 1:] = 0.0
+                    used[y] = p
                     break
+        if report is not None:
+            report["reduced"] = float(np.mean(used < order))
         return _fill_gaps(coeffs, level) @ design.T
 
     grid_y, grid_x = np.meshgrid(np.linspace(-1.0, 1.0, ny),
@@ -543,7 +574,11 @@ def _global_background(data, weight, fit, order):
         limit = SLACK * _ideal_reach(terms, (flat_x, flat_y))
         fitted = _solve(design, w, values, terms, EPS, limit)
         if fitted is not None:
+            if report is not None:
+                report["reduced"] = 0.0 if p == order else 1.0
             return (design @ fitted).reshape(ny, nx)
+    if report is not None:
+        report["reduced"] = 1.0
     return np.full(data.shape, level)
 
 
@@ -733,14 +768,15 @@ def choose_direction(data, mask=None):
 def _fit_once(data, weight, fit, order, window):
     """One fit in one direction: the whole-line (or whole-image) polynomial,
     with the sliding window laid over it wherever the window reached."""
-    background = _global_background(data, weight, fit, order)
+    note = {"reduced": 0.0}
+    background = _global_background(data, weight, fit, order, note)
     covered = 1.0
     if window and int(window) > 1:
         local, reach = _sliding_background(data, weight, fit, order,
                                            int(window))
         covered = float(reach.mean())
         background = np.where(reach, local, background)
-    return background, covered
+    return background, covered, note["reduced"]
 
 
 def fit_background(data, mask, fit=DEFAULTS["fit"], order=DEFAULTS["order"],
@@ -761,8 +797,9 @@ def fit_background(data, mask, fit=DEFAULTS["fit"], order=DEFAULTS["order"],
         window (int): Sliding window in pixels; 0 fits each line, or the
             image, in one piece.
         report (dict): Optional; filled with `covered`, the fraction of the
-            image the sliding fit could reach, and `fit`, the direction
-            actually used once `auto` has been resolved.
+            image the sliding fit could reach, `fit`, the direction actually
+            used once `auto` has been resolved, and `reduced`, the share of
+            scan lines that could not support `order` and were fitted lower.
 
     Returns:
         np.ndarray: The fitted background, the same shape as `data`.
@@ -781,17 +818,21 @@ def fit_background(data, mask, fit=DEFAULTS["fit"], order=DEFAULTS["order"],
         # second fit sees no row-to-row drift, so what it removes is the
         # column-to-column part - the drift a single line fit cannot reach,
         # at the price of the sample being fitted around twice.
-        first, covered = _fit_once(data, weight, "rows", order, window)
-        second, again = _fit_once(data - first, weight, "columns", order,
-                                  window)
+        first, covered, reduced = _fit_once(data, weight, "rows", order,
+                                            window)
+        second, again, more = _fit_once(data - first, weight, "columns",
+                                        order, window)
         background = first + second
         covered = min(covered, again)
+        reduced = max(reduced, more)
     else:
-        background, covered = _fit_once(data, weight, fit, order, window)
+        background, covered, reduced = _fit_once(data, weight, fit, order,
+                                                 window)
 
     if report is not None:
         report["covered"] = covered
         report["fit"] = fit
+        report["reduced"] = reduced
     return background
 
 
@@ -857,7 +898,8 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
             edge=DEFAULTS["edge"], grow=DEFAULTS["grow"],
             min_area=DEFAULTS["min_area"], fit=DEFAULTS["fit"],
             order=DEFAULTS["order"], window=DEFAULTS["window"],
-            passes=DEFAULTS["passes"], exclude=None):
+            passes=DEFAULTS["passes"], exclude=None,
+            feature_size=DEFAULTS["feature_size"]):
     """
     Segment the foreground, fit the background to what is left, subtract it.
 
@@ -907,7 +949,7 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
     Args:
         data (np.ndarray): A 2D image.
         detect, threshold, neighbourhood, sensitivity, expand, edge, grow,
-        min_area: Passed to `segment_foreground`.
+        min_area, feature_size: Passed to `segment_foreground`.
         fit, order, window: Passed to `fit_background`.
         passes (int): How many times to look for the features.
         exclude (np.ndarray): Optional boolean mask, True on pixels to keep
@@ -918,13 +960,14 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
         subtracted), `mask` (the foreground of the last pass, `exclude`
         included), `coverage` (the fraction of the frame it holds), `covered`
         (the fraction the sliding fit reached; 1.0 when no window is used),
-        `starved` (the fraction of scan lines the mask left no background on)
+        `starved` (the fraction of scan lines the mask left no background
+        on), `reduced` (the share of lines that could not support `order`)
         and `fit` (the direction used, which is the answer when `auto` was
         asked for).
     """
     data = np.asarray(data, dtype=float)
     mask = np.zeros(data.shape, dtype=bool)
-    report = {"covered": 1.0}
+    report = {"covered": 1.0, "reduced": 0.0}
 
     if exclude is not None:
         exclude = np.asarray(exclude, dtype=bool)
@@ -949,6 +992,7 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
             data - seed, detect=detect, threshold=threshold,
             neighbourhood=neighbourhood, sensitivity=sensitivity,
             expand=expand, edge=edge, grow=grow, min_area=min_area,
+            feature_size=feature_size,
         )
         if exclude is not None:
             mask = mask | exclude
@@ -968,5 +1012,6 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
         "coverage": float(mask.mean()),
         "covered": report["covered"],
         "starved": starved,
+        "reduced": report["reduced"],
         "fit": fit,
     }
