@@ -39,7 +39,8 @@ Provides an interactive Tkinter application to:
     (gwy_balance): every image is segmented into cells and substrate and
     measured at both, and the folder is reduced to a single range - so
     the same colour means the same thing in every image of a set - with
-    a contact sheet, diagnostics and a PNG export
+    a contact sheet, diagnostics, and an export of the whole folder as
+    annotated PNGs, pure images and/or .gwy files
   - Keep a log of every change applied to the image
   - Undo and redo changes step by step (or reset to the original data)
   - Batch-process every .gwy file in a folder by replaying the
@@ -933,13 +934,17 @@ def add_scale_bar(ax, x_real, y_real, units):
 
 
 def render_annotated_figure(data, x_real, y_real, title, spatial_units, z_units,
-                            dpi=150):
-    """Build a publication-style figure: image, axes, colorbar and scale bar."""
+                            dpi=150, vmin=None, vmax=None):
+    """Build a publication-style figure: image, axes, colorbar and scale bar.
+
+    `vmin`/`vmax` fix the two ends of the colour map, so a set of images can
+    be drawn on one scale; without them the image is stretched over its own
+    full range."""
     fig = Figure(figsize=(7, 6), dpi=dpi)
     ax = fig.add_subplot(111)
     im = ax.imshow(
         data, origin="upper", cmap=gcm.current(),
-        extent=(0, x_real, 0, y_real), aspect="equal",
+        extent=(0, x_real, 0, y_real), aspect="equal", vmin=vmin, vmax=vmax,
     )
     ax.set_title(title)
     ax.set_xlabel(f"x ({spatial_units})")
@@ -3681,6 +3686,7 @@ def channel_view(field):
         "y_real": (field.yreal or ny) * xy_factor,
         "spatial_units": spatial_units,
         "z_units": z_units,
+        "xy_factor": xy_factor,
         "z_factor": z_factor,
         "unit_xy_str": xy_unit,
         "unit_z_str": z_unit,
@@ -3906,6 +3912,60 @@ class QuickViewTab(ttk.Frame):
         self.canvas.draw()
 
 
+class ExportChoiceDialog(tk.Toplevel):
+    """Ask what to write when a whole folder is exported.
+
+    `result` is a dict of the three flags once OK is pressed, and None if the
+    dialog was cancelled or closed.
+    """
+
+    CHOICES = (
+        ("annotated", "Annotated PNG - axes, colour bar and scale bar", True),
+        ("pure", "Pure image - one pixel per data point, in a 'pure' "
+                 "subfolder", True),
+        ("gwy", "Gwyddion .gwy file - the balanced channel", False),
+    )
+
+    def __init__(self, master, warning=None):
+        super().__init__(master)
+        self.title("Export the balanced folder")
+        self.resizable(False, False)
+        self.result = None
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="For every image in the folder, write:").pack(
+            anchor=tk.W, pady=(0, 6))
+        self.vars = {}
+        for key, text, default in self.CHOICES:
+            self.vars[key] = tk.BooleanVar(value=default)
+            ttk.Checkbutton(frame, text=text,
+                            variable=self.vars[key]).pack(anchor=tk.W, pady=1)
+        ttk.Label(frame, wraplength=430, foreground="#606060",
+                  text="All of them are drawn with the folder's shared range, "
+                       "so they can be compared side by side. The .gwy keeps "
+                       "the full data - only the display is clipped to the "
+                       "range.").pack(anchor=tk.W, pady=(8, 0))
+        if warning:
+            ttk.Label(frame, text=warning, wraplength=430,
+                      foreground="#a04000").pack(anchor=tk.W, pady=(8, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(
+            side=tk.RIGHT)
+        ttk.Button(buttons, text="Choose folder...",
+                   command=self._accept).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.transient(master)
+        self.grab_set()
+        self.wait_window(self)
+
+    def _accept(self):
+        self.result = {k: bool(v.get()) for k, v in self.vars.items()}
+        self.destroy()
+
+
 class BalancedViewTab(ttk.Frame):
     """Show a whole folder on one colour scale.
 
@@ -4002,6 +4062,9 @@ class BalancedViewTab(ttk.Frame):
         self.level_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Level first", variable=self.level_var,
                         command=self.analyse).pack(side=tk.LEFT, padx=(0, 12))
+        self.zero_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Baseline to zero", variable=self.zero_var,
+                        command=self.rebalance).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(row, text="Recompute",
                    command=self.analyse).pack(side=tk.LEFT)
 
@@ -4025,7 +4088,7 @@ class BalancedViewTab(ttk.Frame):
         ttk.Button(row2, text="Auto", command=self.auto_range).pack(
             side=tk.LEFT)
 
-        ttk.Button(row2, text="Export PNGs...", command=self.export).pack(
+        ttk.Button(row2, text="Export all...", command=self.export).pack(
             side=tk.RIGHT)
         self.view_var = tk.StringVar(value=self.VIEWS[0])
         view = ttk.Combobox(row2, textvariable=self.view_var,
@@ -4214,6 +4277,9 @@ class BalancedViewTab(ttk.Frame):
         if not self.measures:
             return
         self.result = gb.balance(self.measures, self.mode())
+        self.zeroed = bool(self.zero_var.get())
+        if self.zeroed:
+            self.result = gb.zero_baseline(self.result)
         self.override = None
         self._show_range()
         self._update_nav()
@@ -4328,7 +4394,7 @@ class BalancedViewTab(ttk.Frame):
         offset = self.result["offsets"][index]
         if abs(gain - 1.0) > 1e-9:
             return f"{units}, rescaled x{gain:.2f}"
-        if offset:
+        if offset and not getattr(self, "zeroed", False):
             return f"{units} above the substrate"
         return units
 
@@ -4469,44 +4535,110 @@ class BalancedViewTab(ttk.Frame):
 
     # ------------------------------------------------------------- export --
 
+    def _targets(self, folder, choice):
+        """Where each image would be written, as {index: {kind: path}}."""
+        pure_dir = os.path.join(folder, "pure")
+        out = []
+        for path in self.files:
+            base = f"{os.path.splitext(os.path.basename(path))[0]}_balanced"
+            here = {}
+            if choice["annotated"]:
+                here["annotated"] = os.path.join(folder, base + ".png")
+            if choice["pure"]:
+                here["pure"] = os.path.join(pure_dir, base + ".png")
+            if choice["gwy"]:
+                here["gwy"] = os.path.join(folder, base + ".gwy")
+            out.append(here)
+        return out
+
     def export(self):
-        """Write every image as a PNG, all on the shared range."""
+        """Write the whole folder out, all of it on the shared range."""
         if not self.result:
-            messagebox.showinfo("Nothing to export",
-                                "Select a folder first.")
+            messagebox.showinfo("Nothing to export", "Select a folder first.")
             return
+        rescaled = self.result["mode"] == "matched"
+        dialog = ExportChoiceDialog(self.winfo_toplevel(), warning=(
+            "Matched contrast rescales z, so the heights written to a .gwy "
+            "are not the measured heights. Each image's gain goes into the "
+            "channel title; switch to 'Common range' to keep them true."
+            if rescaled else None))
+        choice = dialog.result
+        if not choice:
+            return
+        if not any(choice.values()):
+            self.status_var.set("Nothing selected to export.")
+            return
+
         folder = filedialog.askdirectory(
-            title="Save the balanced images to...",
+            title="Save the balanced folder to...",
             initialdir=self.folder or ".")
         if not folder:
             return
-        targets = [os.path.join(
-            folder, f"{os.path.splitext(os.path.basename(p))[0]}"
-                    f"_balanced.png") for p in self.files]
-        clashes = [t for t in targets if os.path.exists(t)]
+        targets = self._targets(folder, choice)
+        clashes = [p for t in targets for p in t.values()
+                   if os.path.exists(p)]
         if clashes and not messagebox.askyesno(
                 "Overwrite?",
-                f"{len(clashes)} file(s) in that folder will be "
-                f"overwritten, starting with "
+                f"{len(clashes)} file(s) will be overwritten, starting with "
                 f"{os.path.basename(clashes[0])}.\n\nGo ahead?"):
             return
+        if choice["pure"]:
+            os.makedirs(os.path.join(folder, "pure"), exist_ok=True)
 
         self._busy = True
+        written = 0
         try:
             self.progress.config(maximum=len(self.files), value=0)
-            for i, (path, target) in enumerate(zip(self.files, targets)):
-                self.status_var.set(f"Writing {i + 1}/{len(self.files)}: "
-                                    f"{os.path.basename(target)}")
+            for i, target in enumerate(targets):
+                name = os.path.basename(self.files[i])
+                self.status_var.set(
+                    f"Writing {i + 1}/{len(self.files)}: {name}")
                 self.progress.config(value=i)
                 self.update()
-                data, view = self._balanced(i)
-                vmin, vmax = self._range_for(i)
-                save_pure_image(data, target, view["x_real"], view["y_real"],
-                                vmin=vmin, vmax=vmax)
+                written += self._export_one(i, target)
             self.progress.config(value=0)
-            self.status_var.set(f"Wrote {len(self.files)} images to {folder}.")
+            kinds = ", ".join(k for k in ("annotated", "pure", "gwy")
+                              if choice[k])
+            self.status_var.set(f"Wrote {written} file(s) ({kinds}) for "
+                                f"{len(self.files)} images to {folder}.")
+        except Exception as e:
+            self.status_var.set(f"Export stopped after {written} file(s): {e}")
+            messagebox.showerror("Export error", str(e))
         finally:
             self._busy = False
+
+    def _export_one(self, index, target):
+        """Write one image in every form asked for; returns the file count."""
+        data, view = self._balanced(index)
+        vmin, vmax = self._range_for(index)
+        base = os.path.splitext(os.path.basename(self.files[index]))[0]
+
+        if "annotated" in target:
+            figure = render_annotated_figure(
+                data, view["x_real"], view["y_real"],
+                f"{base} - {self.channel}", view["spatial_units"],
+                self._z_label(index), vmin=vmin, vmax=vmax)
+            figure.savefig(target["annotated"], dpi=200, bbox_inches="tight")
+        if "pure" in target:
+            save_pure_image(data, target["pure"], view["x_real"],
+                            view["y_real"], vmin=vmin, vmax=vmax)
+        if "gwy" in target:
+            # Appending is what save_channel_to_gwy does with an existing
+            # file; here the export should be repeatable, so the old file
+            # goes first - the overwrite was confirmed above.
+            if os.path.exists(target["gwy"]):
+                os.remove(target["gwy"])
+            gain = self.result["gains"][index]
+            title = f"{base} - {self.channel} (balanced"
+            title += f", z x{gain:.3f})" if abs(gain - 1.0) > 1e-9 else ")"
+            save_channel_to_gwy(
+                target["gwy"], title,
+                data / view["z_factor"],              # back to SI units
+                xreal=view["x_real"] / view["xy_factor"],
+                yreal=view["y_real"] / view["xy_factor"],
+                unit_xy=view["unit_xy_str"], unit_z=view["unit_z_str"],
+            )
+        return len(target)
 
 
 class GwyProcessorGUI(tk.Tk):

@@ -272,6 +272,42 @@ def balance(measures, mode=DEFAULT_MODE):
     }
 
 
+def zero_baseline(result):
+    """
+    Shift a balance so the bottom of the range reads zero.
+
+    Every image and the range itself move by the same amount, so nothing
+    about the balance changes - the images stay on one scale, and the colour
+    bar simply starts at 0 instead of at a negative number. In `per_image`
+    mode, where there is no shared range, each image is shifted by its own.
+
+    The shift is folded into the offsets rather than added afterwards:
+    `apply_levels` multiplies by the gain after adding the offset, so a shift
+    of `s` on the output is a shift of `s / gain` on the input.
+
+    Note this puts the *bottom of the range* at zero, not the substrate,
+    which then sits a little above it - by the same amount in every image.
+    Zeroing each image on its own minimum instead (the usual "set baseline to
+    zero") would give every image a different offset again, which is the
+    thing this module exists to undo.
+
+    Args:
+        result (dict): From `balance`.
+
+    Returns:
+        dict: A new result, shifted. The input is not modified.
+    """
+    shifts = [-lo for lo, _ in result["ranges"]]
+    shifted = dict(result)
+    shifted["offsets"] = [o + s / g for o, s, g
+                          in zip(result["offsets"], shifts, result["gains"])]
+    shifted["ranges"] = [(lo + s, hi + s) for (lo, hi), s
+                         in zip(result["ranges"], shifts)]
+    if result["shared"]:
+        shifted["vmin"], shifted["vmax"] = shifted["ranges"][0]
+    return shifted
+
+
 def apply_levels(data, offset, gain):
     """
     Put an image on the balanced scale: shift it, then stretch it.

@@ -664,9 +664,32 @@ clipped. Lowering the bottom of the range brings the substrate texture back, at
 the cost of contrast inside the cells — the diagnostics histogram shows exactly
 what is being cut.
 
-**Export PNGs...** writes every image to a folder of your choice, all on the
-shared range, using the current colour map, as bare images with square pixels
-and no axes (`<name>_balanced.png`). It asks before overwriting.
+**Baseline to zero** (on by default) shifts the whole set — every image *and*
+the range, by the same amount — so the bottom of the range reads 0 and every
+colour bar runs `0 … span` instead of starting at a negative number. The
+substrate then sits a little above zero, by the same amount in every image.
+Note this is deliberately *not* the usual per-image "set baseline to zero"
+(subtract each image's own minimum): that would give every image a different
+offset again, which is the thing this tab exists to undo.
+
+**Export all...** asks what to write and then for a folder. For every image,
+any of:
+
+* **Annotated PNG** — axes, colour bar and scale bar, as the main window's
+  *Save processed image...* writes them — `<name>_balanced.png`.
+* **Pure image** — one pixel per data point, no labels, square pixels — in a
+  `pure/` subfolder, same file name.
+* **Gwyddion `.gwy`** — the balanced channel, titled
+  `<name> - <channel> (balanced, z x1.018)`.
+
+All of them use the shared range and the current colour map, so they can be
+compared side by side. The `.gwy` holds the **full data** — only the display is
+clipped to the range — and an existing file is replaced rather than appended to,
+so re-exporting is repeatable. In `Matched contrast` the gain has rescaled z, so
+the heights in a `.gwy` are not the measured heights; the dialog says so, the
+gain is in the channel title, and `Common range` is the mode to use when they
+have to stay true. Existing files are listed and confirmed before anything is
+overwritten.
 
 Outside the GUI:
 
@@ -674,7 +697,7 @@ Outside the GUI:
 import gwy_balance as gb
 
 measures = [gb.measure(image) for image in levelled_images]
-result = gb.balance(measures, "matched")
+result = gb.zero_baseline(gb.balance(measures, "matched"))
 shown = [gb.apply_levels(image, offset, gain)
          for image, offset, gain in zip(levelled_images, result["offsets"],
                                         result["gains"])]
