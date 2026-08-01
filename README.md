@@ -631,22 +631,26 @@ far below anything real and squashes the picture. When the split fails, the
 image is treated as all cell, its lower quartile stands in for the substrate,
 and the status line says how many images that happened to.
 
-**The three modes** (increasing order of how much they change the data):
+**The two modes:**
 
-| Mode | What it does | Heights still true? |
-| --- | --- | --- |
-| Per image (no sharing) | Each image keeps its own anchors — the "before" picture, and the honest baseline to compare against. | yes |
-| Common range (heights kept) | Every image is shifted so its substrate reads zero; all are drawn with one range, the median of the individual anchors. | yes |
-| Matched contrast (rescaled) | As above, plus a per-image gain stretching each image's substrate-to-cell-top span onto the folder's median span. | **no** |
+| Mode | What it does |
+| --- | --- |
+| Per image (no sharing) | Each image keeps its own anchors — the "before" picture, and the honest baseline to compare against. |
+| Common range (shared) | Every image is shifted so its substrate reads zero; all are drawn with one range, the median of the individual anchors. |
 
-`Matched contrast` is the default because it is the one that makes the cells and
-the structures inside them read the same colour in every image whatever the
-layer. It is a *display* normalisation: the gain rescales z, so the colour bar is
-no longer a height in nanometres. Nothing hides this — the colour bar is labelled
-`nm, rescaled x1.07`, and the status line reports the spread of gains over the
-folder. Use `Common range` when heights have to stay comparable; a layer with
-genuinely taller cells will then clip, which is real information rather than a
-defect.
+**Only offsets are ever applied — the z scale of the data is never touched.**
+That is a hard rule, not a default, and `gwy_balance.apply_levels` is an
+addition and nothing else. An earlier version had a third mode that stretched
+each image onto the folder's median span with a per-image gain. It made a set
+look more uniform, and it was wrong: on the yeast data it rewrote a cell
+measured 46.7 nm above the substrate as 27.8 nm — a 40 % error — and that number
+went into the exported PNGs and `.gwy` files. Uniform appearance is not worth a
+false height, so the gain was removed rather than merely defaulted off.
+
+The consequence to expect: under `Common range`, a layer whose cells are
+genuinely taller than the folder's median will clip at the bright end. That is
+real information, not a defect — the diagnostics view reports the clipped
+fraction per image, and the range can always be widened by hand.
 
 **Looking at the result.** **View** switches between a single image (with
 **Next**/**Back**, or the arrow keys after one click on the image), a **contact
@@ -680,16 +684,15 @@ any of:
 * **Pure image** — one pixel per data point, no labels, square pixels — in a
   `pure/` subfolder, same file name.
 * **Gwyddion `.gwy`** — the balanced channel, titled
-  `<name> - <channel> (balanced, z x1.018)`.
+  `<name> - <channel> (balanced)`.
 
 All of them use the shared range and the current colour map, so they can be
-compared side by side. The `.gwy` holds the **full data** — only the display is
+compared side by side. Because balancing only shifts, the `.gwy` carries the
+**measured heights**: its data differs from the source channel by one constant
+and by nothing else. It also holds the **full data** — only the display is
 clipped to the range — and an existing file is replaced rather than appended to,
-so re-exporting is repeatable. In `Matched contrast` the gain has rescaled z, so
-the heights in a `.gwy` are not the measured heights; the dialog says so, the
-gain is in the channel title, and `Common range` is the mode to use when they
-have to stay true. Existing files are listed and confirmed before anything is
-overwritten.
+so re-exporting is repeatable. Existing files are listed and confirmed before
+anything is overwritten.
 
 Outside the GUI:
 

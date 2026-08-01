@@ -3943,8 +3943,10 @@ class ExportChoiceDialog(tk.Toplevel):
                             variable=self.vars[key]).pack(anchor=tk.W, pady=1)
         ttk.Label(frame, wraplength=430, foreground="#606060",
                   text="All of them are drawn with the folder's shared range, "
-                       "so they can be compared side by side. The .gwy keeps "
-                       "the full data - only the display is clipped to the "
+                       "so they can be compared side by side. Balancing only "
+                       "ever shifts an image, never rescales it, so the .gwy "
+                       "holds the measured heights - and the full data, since "
+                       "only the display is clipped to the "
                        "range.").pack(anchor=tk.W, pady=(8, 0))
         if warning:
             ttk.Label(frame, text=warning, wraplength=430,
@@ -4348,10 +4350,12 @@ class BalancedViewTab(ttk.Frame):
                          + (" (typed in)" if self.override else ""))
         else:
             parts.append("each image on its own range")
-        gains = r["gains"]
-        if r["mode"] == "matched":
-            parts.append(f"gains {min(gains):.2f}-{max(gains):.2f} "
-                         f"(z rescaled, not true heights)")
+        if r["shared"]:
+            outside = [100 * float(np.mean((d < self._range_for(i)[0])
+                                           | (d > self._range_for(i)[1])))
+                       for i, d in enumerate(self._shifted_thumbs())]
+            parts.append(f"{min(outside):.0f}-{max(outside):.0f}% of pixels "
+                         f"outside the range")
         if bad:
             parts.append(f"{bad} image(s) with no substrate in frame - "
                          f"lower quartile used instead")
@@ -4384,17 +4388,18 @@ class BalancedViewTab(ttk.Frame):
     def _balanced(self, index):
         """One image on the balanced scale, with its metadata."""
         view = self._prepared(self.files[index], self.channel)
-        data = gb.apply_levels(view["data"], self.result["offsets"][index],
-                               self.result["gains"][index])
+        data = gb.apply_levels(view["data"], self.result["offsets"][index])
         return data, view
+
+    def _shifted_thumbs(self):
+        """The contact-sheet thumbnails on the balanced scale."""
+        return [gb.apply_levels(thumb, offset) for thumb, offset
+                in zip(self.thumbs, self.result["offsets"])]
 
     def _z_label(self, index):
         units = self.metas[index]["z_units"]
-        gain = self.result["gains"][index]
-        offset = self.result["offsets"][index]
-        if abs(gain - 1.0) > 1e-9:
-            return f"{units}, rescaled x{gain:.2f}"
-        if offset and not getattr(self, "zeroed", False):
+        if self.result["offsets"][index] and not getattr(self, "zeroed",
+                                                         False):
             return f"{units} above the substrate"
         return units
 
@@ -4430,10 +4435,8 @@ class BalancedViewTab(ttk.Frame):
                     else ", each on its own range"))
         self.figure.clf()
         axes = np.atleast_1d(self.figure.subplots(rows, cols)).ravel()
-        for i, thumb in enumerate(self.thumbs):
+        for i, data in enumerate(self._shifted_thumbs()):
             ax = axes[i]
-            data = gb.apply_levels(thumb, self.result["offsets"][i],
-                                   self.result["gains"][i])
             vmin, vmax = self._range_for(i)
             ax.imshow(data, origin="upper", cmap=gcm.current(), vmin=vmin,
                       vmax=vmax, aspect="equal")
@@ -4455,9 +4458,7 @@ class BalancedViewTab(ttk.Frame):
         data, view = self._balanced(index)
         measure = self.measures[index]
         vmin, vmax = self._range_for(index)
-        gain = self.result["gains"][index]
         offset = self.result["offsets"][index]
-        units = self.metas[index]["z_units"]
         self.name_label.config(
             text=f"{index + 1}/{len(self.files)}  -  "
                  f"{os.path.basename(self.files[index])}")
@@ -4484,8 +4485,7 @@ class BalancedViewTab(ttk.Frame):
         lo, hi = np.percentile(data, [0.2, 99.8])
         ax.hist(data.ravel(), bins=300, range=(lo, hi), color="0.7")
         for value, label, colour in anchors:
-            ax.axvline((value + offset) * gain, color=colour, lw=1.2,
-                       label=label)
+            ax.axvline(value + offset, color=colour, lw=1.2, label=label)
         ax.axvspan(vmin, vmax, color="tab:orange", alpha=0.15,
                    label="shown range")
         ax.set_title("where this image sits", fontsize=9)
@@ -4499,9 +4499,8 @@ class BalancedViewTab(ttk.Frame):
                                    ("low", "cell low", "tab:green"),
                                    ("median", "cell median", "tab:olive"),
                                    ("high", "cell high", "tab:red")):
-            y = [(m[key] + o) * g for m, o, g
-                 in zip(self.measures, self.result["offsets"],
-                        self.result["gains"])]
+            y = [m[key] + o for m, o
+                 in zip(self.measures, self.result["offsets"])]
             ax.plot(x, y, ".-", color=colour, lw=1, ms=4, label=label)
         ax.axhspan(vmin, vmax, color="tab:orange", alpha=0.15)
         ax.axvline(index, color="0.4", lw=1, ls=":")
@@ -4510,13 +4509,21 @@ class BalancedViewTab(ttk.Frame):
         ax.set_ylabel(self._z_label(index))
         ax.legend(fontsize=7)
 
+        # How much each image loses to the range - the number to watch when
+        # deciding whether one shared range is doing more harm than good.
         ax = axes[1, 1]
+        shifted = self._shifted_thumbs()
+        below = [100 * float(np.mean(d < self._range_for(i)[0]))
+                 for i, d in enumerate(shifted)]
+        above = [100 * float(np.mean(d > self._range_for(i)[1]))
+                 for i, d in enumerate(shifted)]
         ax.plot(x, [100 * m["coverage"] for m in self.measures], ".-",
                 color="tab:purple", lw=1, ms=4, label="cell coverage (%)")
-        ax.plot(x, [100 * g for g in self.result["gains"]], ".-",
-                color="tab:brown", lw=1, ms=4, label="gain (%)")
+        ax.plot(x, below, ".-", color="tab:blue", lw=1, ms=4,
+                label="clipped dark (%)")
+        ax.plot(x, above, ".-", color="tab:red", lw=1, ms=4,
+                label="clipped bright (%)")
         ax.axvline(index, color="0.4", lw=1, ls=":")
-        ax.axhline(100, color="0.6", lw=0.8)
         ax.set_title("per image", fontsize=9)
         ax.set_xlabel("image")
         ax.legend(fontsize=7)
@@ -4556,12 +4563,7 @@ class BalancedViewTab(ttk.Frame):
         if not self.result:
             messagebox.showinfo("Nothing to export", "Select a folder first.")
             return
-        rescaled = self.result["mode"] == "matched"
-        dialog = ExportChoiceDialog(self.winfo_toplevel(), warning=(
-            "Matched contrast rescales z, so the heights written to a .gwy "
-            "are not the measured heights. Each image's gain goes into the "
-            "channel title; switch to 'Common range' to keep them true."
-            if rescaled else None))
+        dialog = ExportChoiceDialog(self.winfo_toplevel())
         choice = dialog.result
         if not choice:
             return
@@ -4628,11 +4630,8 @@ class BalancedViewTab(ttk.Frame):
             # goes first - the overwrite was confirmed above.
             if os.path.exists(target["gwy"]):
                 os.remove(target["gwy"])
-            gain = self.result["gains"][index]
-            title = f"{base} - {self.channel} (balanced"
-            title += f", z x{gain:.3f})" if abs(gain - 1.0) > 1e-9 else ")"
             save_channel_to_gwy(
-                target["gwy"], title,
+                target["gwy"], f"{base} - {self.channel} (balanced)",
                 data / view["z_factor"],              # back to SI units
                 xreal=view["x_real"] / view["xy_factor"],
                 yreal=view["y_real"] / view["xy_factor"],

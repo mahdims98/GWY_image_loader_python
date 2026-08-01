@@ -37,26 +37,25 @@ wall, it is a small part of the area, and if it is included it drags the top
 of the range up and flattens exactly the structure inside the cell that the
 range is supposed to reveal.
 
-Three ways to use the anchors, in increasing order of how much they change
-the data (`balance`):
+Two ways to use the anchors (`balance`):
 
   per_image  Each image keeps its own anchors. Nothing is shared; this is
              the "before" picture, and the honest baseline to compare
              against.
   common     Every image is shifted so its substrate reads zero, and then
              all of them are drawn with one range, taken as the median of
-             the individual anchors. Only an offset is applied, so heights
-             stay true heights and the colour bar still means nanometres.
-             A layer with genuinely taller cells will clip - that is real
-             information, not a defect.
-  matched    As `common`, plus a per-image gain that stretches each image's
-             substrate-to-cell-top span onto the folder's median span. The
-             cells and the structures in them then read the same colour
-             everywhere, whatever the layer. This is a display
-             normalisation: the gain rescales z, so the colour bar is no
-             longer a height in nanometres and images treated this way must
-             not be used to read heights off. Every gain is reported so the
-             rescaling is never silent.
+             the individual anchors. A layer with genuinely taller cells
+             will clip - that is real information, not a defect.
+
+**Only offsets are ever applied - the z scale of the data is never
+touched.** That is a hard rule here, not a default. An earlier version had a
+third mode that stretched each image onto the folder's median span with a
+per-image gain; it made the set look more uniform, and it was wrong: on this
+data it rewrote a cell measured 46.7 nm above the substrate as 27.8 nm, a
+40 % error, and that number went into the exported images and .gwy files.
+Uniform appearance is not worth a false height, so the gain is gone rather
+than merely defaulted off. If two layers look different under `common`, the
+cells really are different heights, and the picture is telling the truth.
 
 Nothing here is applied to the processing tab's data; it is a way of looking
 at a folder.
@@ -77,10 +76,9 @@ CLIP = (0.5, 99.5)       # outlier clip used before smoothing, percent
 
 MODES = {
     "per_image": "Per image (no sharing)",
-    "common": "Common range (heights kept)",
-    "matched": "Matched contrast (rescaled)",
+    "common": "Common range (shared)",
 }
-DEFAULT_MODE = "matched"
+DEFAULT_MODE = "common"
 
 
 def otsu_threshold(values, bins=256):
@@ -226,14 +224,17 @@ def balance(measures, mode=DEFAULT_MODE):
     substrate. A median rather than a mean, so one bad scan cannot pull the
     range off.
 
+    Every image is placed by an offset alone. There is no gain, by design:
+    see the module docstring.
+
     Args:
         measures (list): Dicts from `measure`, in display order.
         mode (str): One of `MODES`.
 
     Returns:
         dict: With `mode`, `shared` (whether one range covers every image),
-        `vmin`/`vmax` (the shared range, None when not shared), `offsets`,
-        `gains` and `ranges` (a (vmin, vmax) pair per image).
+        `vmin`/`vmax` (the shared range, None when not shared), `offsets`
+        and `ranges` (a (vmin, vmax) pair per image).
 
     Raises:
         ValueError: If `mode` is not one of `MODES`, or `measures` is empty.
@@ -254,20 +255,11 @@ def balance(measures, mode=DEFAULT_MODE):
         return {
             "mode": mode, "shared": False, "vmin": None, "vmax": None,
             "offsets": [0.0] * len(measures),
-            "gains": [1.0] * len(measures),
             "ranges": [(m["low"], m["high"]) for m in measures],
         }
-
-    offsets = [-m["background"] for m in measures]
-    if mode == "common":
-        gains = [1.0] * len(measures)
-    else:                                    # matched
-        spans = highs.copy()
-        spans[spans <= 0] = np.nan           # no measurable step: leave it be
-        gains = [float(vmax / s) if np.isfinite(s) else 1.0 for s in spans]
     return {
         "mode": mode, "shared": True, "vmin": vmin, "vmax": vmax,
-        "offsets": offsets, "gains": gains,
+        "offsets": [-m["background"] for m in measures],
         "ranges": [(vmin, vmax)] * len(measures),
     }
 
@@ -280,10 +272,6 @@ def zero_baseline(result):
     about the balance changes - the images stay on one scale, and the colour
     bar simply starts at 0 instead of at a negative number. In `per_image`
     mode, where there is no shared range, each image is shifted by its own.
-
-    The shift is folded into the offsets rather than added afterwards:
-    `apply_levels` multiplies by the gain after adding the offset, so a shift
-    of `s` on the output is a shift of `s / gain` on the input.
 
     Note this puts the *bottom of the range* at zero, not the substrate,
     which then sits a little above it - by the same amount in every image.
@@ -299,8 +287,8 @@ def zero_baseline(result):
     """
     shifts = [-lo for lo, _ in result["ranges"]]
     shifted = dict(result)
-    shifted["offsets"] = [o + s / g for o, s, g
-                          in zip(result["offsets"], shifts, result["gains"])]
+    shifted["offsets"] = [o + s for o, s
+                          in zip(result["offsets"], shifts)]
     shifted["ranges"] = [(lo + s, hi + s) for (lo, hi), s
                          in zip(result["ranges"], shifts)]
     if result["shared"]:
@@ -308,16 +296,19 @@ def zero_baseline(result):
     return shifted
 
 
-def apply_levels(data, offset, gain):
+def apply_levels(data, offset):
     """
-    Put an image on the balanced scale: shift it, then stretch it.
+    Put an image on the balanced scale.
+
+    This is an addition and nothing else. Differences between any two points
+    of the image come through unchanged, so a height read off a balanced
+    image is the height that was measured.
 
     Args:
         data (np.ndarray): The image.
-        offset (float): Added first; `-background` puts the substrate at 0.
-        gain (float): Multiplied after. 1.0 leaves heights untouched.
+        offset (float): Added; `-background` puts the substrate at 0.
 
     Returns:
-        np.ndarray: The transformed image.
+        np.ndarray: The shifted image.
     """
-    return (np.asarray(data, dtype=float) + offset) * gain
+    return np.asarray(data, dtype=float) + offset
