@@ -11,7 +11,8 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
 * **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
 * **`gwy_colormaps.py`**: Gwyddion's false-colour gradients (`Gray`, `Sky`, `Body`, `Rainbow2`, `Viridis`, ... 60 in all) as matplotlib colormaps, plus the application-wide selection used by the GUI.
-* **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, a folder quick view, and batch folder processing.
+* **`gwy_balance.py`**: One shared colour range for a whole folder — segments each image into cells and substrate, measures both, and reduces the set to a single range so the same colour means the same thing in every image.
+* **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, a folder quick view, a balanced folder view, and batch folder processing.
 
 ## Requirements
 
@@ -566,8 +567,9 @@ Both windows offer two ways to commit the result:
 
 ### Quick view (folder browser)
 
-The GUI has two tabs. *Processing* is the workbench described above; **Quick
-view** is for looking through a measurement session without deciding anything.
+The GUI has three tabs. *Processing* is the workbench described above; **Quick
+view** is for looking through a measurement session without deciding anything,
+and **Balanced view** puts a whole folder on one colour scale.
 
 * **Select folder...** lists every `.gwy` file in it, in natural order
   (`_2` before `_10`).
@@ -583,6 +585,101 @@ view** is for looking through a measurement session without deciding anything.
   whose name starts the same way, then to a Height channel.
 * Results are cached per file and channel, so stepping back is instant. The
   cache holds the last 32 images and then drops the oldest.
+
+### Balanced view (one colour range for a folder)
+
+A stack of scans of the same sample — successive layers of a cell, or a time
+series — almost never shares a false-colour range. Each image is levelled on its
+own, each has a different fraction of its frame covered by cells, and each has a
+different amount of drift left in it. Set the range from the whole image
+(percentiles, or min to max) and the answer moves from image to image: the same
+physical height comes out a different colour, and a layer whose cells happen to
+be taller washes out while its neighbour stays flat. Comparing layers by eye is
+then comparing two different colour scales.
+
+**Balanced view** stops measuring the whole image and measures two *places*
+instead, both of which mean the same thing in every image: the substrate between
+the cells, and the inside of the cells. How much of the frame each one covers no
+longer matters, which is the point — that is what a plain percentile gets wrong.
+
+**How each image is measured** (`gwy_balance.measure`):
+
+1. The image is levelled like the quick view levels it (plane, then rows with a
+   second-order polynomial) unless **Level first** is unticked.
+2. It is segmented into cells and substrate. Segmenting on the height histogram
+   alone does *not* work on levelled AFM data: row alignment gives every row its
+   own baseline, so a row that is mostly cell is pushed down towards the
+   substrate and the two populations smear into one broad peak. The shape
+   survives though — cells are large, smooth and connected, the substrate
+   texture is fine — so the split is made on a heavily smoothed copy, where the
+   histogram is bimodal again and Otsu's threshold lands in the valley. **Cell
+   size (% of frame)** is that smoothing width; raise it if the mask follows the
+   texture, lower it if neighbouring cells merge.
+3. Both masks are shrunk before any statistic is read, so the bright rim at the
+   edge of a cell counts as neither substrate nor interior. Including the rim
+   would drag the top of the range up and flatten exactly the structure inside
+   the cell that the range is supposed to reveal.
+4. The anchors are the median of the substrate and the **cell percentiles** of
+   the interior (2 % and 98 % by default).
+
+A split is only believed when both classes are at least 2 % of the frame and
+still big enough to take a median of after shrinking. That test earns its keep:
+in a frame packed edge to edge with cells, the only thing left below the
+threshold is often a scan artifact — a hole a hundred nanometres deep covering
+one percent of the image — and measuring "the substrate" there puts the anchor
+far below anything real and squashes the picture. When the split fails, the
+image is treated as all cell, its lower quartile stands in for the substrate,
+and the status line says how many images that happened to.
+
+**The three modes** (increasing order of how much they change the data):
+
+| Mode | What it does | Heights still true? |
+| --- | --- | --- |
+| Per image (no sharing) | Each image keeps its own anchors — the "before" picture, and the honest baseline to compare against. | yes |
+| Common range (heights kept) | Every image is shifted so its substrate reads zero; all are drawn with one range, the median of the individual anchors. | yes |
+| Matched contrast (rescaled) | As above, plus a per-image gain stretching each image's substrate-to-cell-top span onto the folder's median span. | **no** |
+
+`Matched contrast` is the default because it is the one that makes the cells and
+the structures inside them read the same colour in every image whatever the
+layer. It is a *display* normalisation: the gain rescales z, so the colour bar is
+no longer a height in nanometres. Nothing hides this — the colour bar is labelled
+`nm, rescaled x1.07`, and the status line reports the spread of gains over the
+folder. Use `Common range` when heights have to stay comparable; a layer with
+genuinely taller cells will then clip, which is real information rather than a
+defect.
+
+**Looking at the result.** **View** switches between a single image (with
+**Next**/**Back**, or the arrow keys after one click on the image), a **contact
+sheet** of the whole folder at once with the current image outlined, and
+**Diagnostics** — the mask over the image, where this image sits inside the
+range, all four anchors across the folder on the balanced scale, and the gain
+and cell coverage per image. The contact sheet is the quickest way to see
+whether the balance worked; the diagnostics say why it did not.
+
+**The range is a starting point, not a verdict.** Type over it and press
+**Apply**, or press **Auto** to go back. The default deliberately favours the
+inside of the cells: the bottom of the range comes from the *cell interior*, so
+the substrate between the cells sits at the dark end and its texture is partly
+clipped. Lowering the bottom of the range brings the substrate texture back, at
+the cost of contrast inside the cells — the diagnostics histogram shows exactly
+what is being cut.
+
+**Export PNGs...** writes every image to a folder of your choice, all on the
+shared range, using the current colour map, as bare images with square pixels
+and no axes (`<name>_balanced.png`). It asks before overwriting.
+
+Outside the GUI:
+
+```python
+import gwy_balance as gb
+
+measures = [gb.measure(image) for image in levelled_images]
+result = gb.balance(measures, "matched")
+shown = [gb.apply_levels(image, offset, gain)
+         for image, offset, gain in zip(levelled_images, result["offsets"],
+                                        result["gains"])]
+# every one of them drawn with vmin=result["vmin"], vmax=result["vmax"]
+```
 
 ### Colour maps
 

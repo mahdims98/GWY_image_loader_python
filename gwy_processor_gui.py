@@ -1,3 +1,4 @@
+
 """
 GUI front-end for gwy_processing.py
 
@@ -34,6 +35,11 @@ Provides an interactive Tkinter application to:
   - Flip through a whole folder in the 'Quick view' tab: each .gwy file
     is shown with a plane subtracted and rows aligned (polynomial,
     order 2), one Next/Back step at a time
+  - Put a whole folder on one colour scale in the 'Balanced view' tab
+    (gwy_balance): every image is segmented into cells and substrate and
+    measured at both, and the folder is reduced to a single range - so
+    the same colour means the same thing in every image of a set - with
+    a contact sheet, diagnostics and a PNG export
   - Keep a log of every change applied to the image
   - Undo and redo changes step by step (or reset to the original data)
   - Batch-process every .gwy file in a folder by replaying the
@@ -68,6 +74,7 @@ from matplotlib.widgets import RectangleSelector, SpanSelector
 
 import gwy_loader
 import gwy_processing as gp
+import gwy_balance as gb
 import gwy_colormaps as gcm
 import gwy_destripe as gd
 import gwy_twoway as gtw
@@ -970,17 +977,23 @@ def _resample_to_square_pixels(data, x_real, y_real):
     return tmp[y0, :] * (1 - fy) + tmp[y1, :] * fy
 
 
-def save_pure_image(data, path, x_real=None, y_real=None):
+def save_pure_image(data, path, x_real=None, y_real=None, vmin=None,
+                    vmax=None):
     """Save the data as a bare colormapped image with no axes, labels,
     colorbar or scale bar.
 
     If the physical extents are given, the data is resampled to square
     pixels first, so the image always shows the true physical aspect ratio
     even when the scan has non-square pixels (e.g. 512x256 px over a
-    square region)."""
+    square region).
+
+    `vmin`/`vmax` fix the two ends of the colour map; without them each
+    image is stretched over its own full range, which is what a single
+    image wants and a set of images to be compared does not."""
     if x_real and y_real:
         data = _resample_to_square_pixels(data, x_real, y_real)
-    mpimage.imsave(path, data, cmap=gcm.current(), origin="upper")
+    mpimage.imsave(path, data, cmap=gcm.current(), origin="upper",
+                   vmin=vmin, vmax=vmax)
 
 
 def _gwy_channel_titles(container):
@@ -3680,6 +3693,23 @@ def _natural_key(name):
             for t in re.split(r"(\d+)", name)]
 
 
+def pick_channel(names, wanted):
+    """Which of `names` to show, given the channel the user last chose.
+
+    Keep `wanted` if this file has it. If it does not - the first file of a
+    folder, or one that names its channels differently - keep the choice
+    loosely by matching the first word, and fall back to a height channel,
+    then to whatever comes first.
+    """
+    if wanted in names:
+        return wanted
+    match = None
+    if wanted:
+        prefix = wanted.split(" ")[0]
+        match = next((n for n in names if n.startswith(prefix)), None)
+    return match or next((n for n in names if "Height" in n), names[0])
+
+
 class QuickViewTab(ttk.Frame):
     """Flip through a folder of .gwy files, minimally preprocessed.
 
@@ -3821,16 +3851,8 @@ class QuickViewTab(ttk.Frame):
 
         names = list(channels)
         self.channel_combo["values"] = names
-        channel = self.channel_var.get()
-        if channel not in channels:
-            # First file, or this one names its channels differently: keep
-            # the choice if a channel matches loosely, else prefer Height.
-            match = None
-            if channel:
-                prefix = channel.split(" ")[0]
-                match = next((n for n in names if n.startswith(prefix)), None)
-            channel = match or next((n for n in names if "Height" in n), names[0])
-            self.channel_var.set(channel)
+        channel = pick_channel(names, self.channel_var.get())
+        self.channel_var.set(channel)
 
         view = self._processed(path, channel, channels[channel])
         self._draw(view, name, channel)
@@ -3882,6 +3904,609 @@ class QuickViewTab(ttk.Frame):
         ax.set_xticks([])
         ax.set_yticks([])
         self.canvas.draw()
+
+
+class BalancedViewTab(ttk.Frame):
+    """Show a whole folder on one colour scale.
+
+    Pick a folder and a channel; every file is levelled the same way the
+    quick view levels it, segmented into cells and substrate, and measured
+    at those two places. The folder's measurements are then reduced to one
+    shared range - see gwy_balance for what the three modes do to get
+    there - and every image is drawn with it, so the same colour means the
+    same thing in every image of the set.
+
+    The range that comes out is a starting point, not a verdict: it can be
+    typed over, and the contact sheet and diagnostics views are there to
+    judge whether it shows the structure inside the cells without
+    flattening it.
+    """
+
+    CACHE_LIMIT = 40         # preprocessed images kept in memory
+    THUMB = 320              # longest side of a contact-sheet thumbnail
+    VIEWS = ("Single image", "Contact sheet", "Diagnostics")
+
+    def __init__(self, master, app):
+        super().__init__(master, padding=8)
+        self.app = app
+        self.folder = None
+        self.files = []          # full paths, natural order
+        self.index = -1
+        self.channel = None      # channel the current analysis was run on
+        self.measures = []       # gwy_balance.measure() per file
+        self.metas = []          # channel_view metadata (no data) per file
+        self.thumbs = []         # decimated data per file
+        self.result = None       # gwy_balance.balance() output
+        self.override = None     # range typed by the user, or None
+        self._cache = {}         # (path, channel, levelled) -> view dict
+        self._cache_order = []
+        self._busy = False
+        self._build()
+
+    # ------------------------------------------------------------- layout --
+
+    def _build(self):
+        files = ttk.Frame(self)
+        files.pack(fill=tk.X)
+        ttk.Button(files, text="Select folder...",
+                   command=self.select_folder).pack(side=tk.LEFT)
+        self.folder_label = ttk.Label(files, text="No folder selected")
+        self.folder_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        nav = ttk.Frame(files)
+        nav.pack(side=tk.RIGHT)
+        ttk.Label(nav, text="Channel:").pack(side=tk.LEFT)
+        self.channel_var = tk.StringVar()
+        self.channel_combo = ttk.Combobox(
+            nav, textvariable=self.channel_var, state="readonly", width=22)
+        self.channel_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.channel_combo.bind("<<ComboboxSelected>>",
+                                lambda e: self.analyse())
+        self.prev_btn = ttk.Button(nav, text="< Back",
+                                   command=lambda: self.step(-1))
+        self.prev_btn.pack(side=tk.LEFT)
+        self.count_label = ttk.Label(nav, text="0 / 0", width=10,
+                                     anchor=tk.CENTER)
+        self.count_label.pack(side=tk.LEFT, padx=4)
+        self.next_btn = ttk.Button(nav, text="Next >",
+                                   command=lambda: self.step(1))
+        self.next_btn.pack(side=tk.LEFT)
+
+        # ---- how the range is found ----
+        box = ttk.LabelFrame(self, text="Balance", padding=6)
+        box.pack(fill=tk.X, pady=(6, 0))
+        row = ttk.Frame(box)
+        row.pack(fill=tk.X)
+
+        ttk.Label(row, text="Mode:").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value=gb.MODES[gb.DEFAULT_MODE])
+        mode = ttk.Combobox(row, textvariable=self.mode_var, state="readonly",
+                            values=list(gb.MODES.values()), width=26)
+        mode.pack(side=tk.LEFT, padx=(4, 12))
+        mode.bind("<<ComboboxSelected>>", lambda e: self.rebalance())
+
+        ttk.Label(row, text="Cell size (% of frame):").pack(side=tk.LEFT)
+        self.cell_var = tk.StringVar(value=f"{100 * gb.CELL_FRACTION:g}")
+        ttk.Spinbox(row, textvariable=self.cell_var, width=5, from_=0.2,
+                    to=20.0, increment=0.5).pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(row, text="Cell percentiles:").pack(side=tk.LEFT)
+        self.plo_var = tk.StringVar(value=f"{gb.P_LO:g}")
+        self.phi_var = tk.StringVar(value=f"{gb.P_HI:g}")
+        ttk.Spinbox(row, textvariable=self.plo_var, width=5, from_=0.0,
+                    to=49.0, increment=0.5).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(row, text="to").pack(side=tk.LEFT)
+        ttk.Spinbox(row, textvariable=self.phi_var, width=5, from_=51.0,
+                    to=100.0, increment=0.5).pack(side=tk.LEFT, padx=(2, 12))
+
+        self.level_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Level first", variable=self.level_var,
+                        command=self.analyse).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(row, text="Recompute",
+                   command=self.analyse).pack(side=tk.LEFT)
+
+        # ---- the range itself, and how to look at it ----
+        row2 = ttk.Frame(box)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row2, text="Range:").pack(side=tk.LEFT)
+        self.vmin_var = tk.StringVar()
+        self.vmax_var = tk.StringVar()
+        self.vmin_entry = ttk.Entry(row2, textvariable=self.vmin_var, width=10)
+        self.vmin_entry.pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(row2, text="to").pack(side=tk.LEFT)
+        self.vmax_entry = ttk.Entry(row2, textvariable=self.vmax_var, width=10)
+        self.vmax_entry.pack(side=tk.LEFT, padx=(2, 4))
+        self.units_label = ttk.Label(row2, text="")
+        self.units_label.pack(side=tk.LEFT)
+        for entry in (self.vmin_entry, self.vmax_entry):
+            entry.bind("<Return>", lambda e: self.apply_range())
+        ttk.Button(row2, text="Apply", command=self.apply_range).pack(
+            side=tk.LEFT, padx=(8, 2))
+        ttk.Button(row2, text="Auto", command=self.auto_range).pack(
+            side=tk.LEFT)
+
+        ttk.Button(row2, text="Export PNGs...", command=self.export).pack(
+            side=tk.RIGHT)
+        self.view_var = tk.StringVar(value=self.VIEWS[0])
+        view = ttk.Combobox(row2, textvariable=self.view_var,
+                            state="readonly", values=self.VIEWS, width=14)
+        view.pack(side=tk.RIGHT, padx=(4, 12))
+        view.bind("<<ComboboxSelected>>", lambda e: self.redraw())
+        ttk.Label(row2, text="View:").pack(side=tk.RIGHT)
+
+        self.name_label = ttk.Label(self, text="", anchor=tk.CENTER,
+                                    font=("TkDefaultFont", 11, "bold"))
+        self.name_label.pack(fill=tk.X, pady=(6, 0))
+
+        self.figure = Figure(figsize=(7, 6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.canvas, self).update()
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill=tk.X, pady=(4, 0))
+        self.progress = ttk.Progressbar(bottom, mode="determinate",
+                                        length=140)
+        self.progress.pack(side=tk.RIGHT, padx=(8, 0))
+        self.status_var = tk.StringVar(
+            value="Select a folder of .gwy files. Every image is measured "
+                  "where the cells are and where the substrate is, and the "
+                  "whole folder is then drawn on one colour scale.")
+        ttk.Label(bottom, textvariable=self.status_var,
+                  wraplength=900).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        plot = self.canvas.get_tk_widget()
+        plot.bind("<Button-1>", lambda e: plot.focus_set())
+        for key, delta in (("<Left>", -1), ("<Right>", 1),
+                           ("<Prior>", -1), ("<Next>", 1)):
+            plot.bind(key, lambda e, d=delta: self.step(d))
+        self._update_nav()
+
+    # ----------------------------------------------------------- settings --
+
+    def mode(self):
+        """The gwy_balance mode key behind the label in the combo box."""
+        label = self.mode_var.get()
+        return next((k for k, v in gb.MODES.items() if v == label),
+                    gb.DEFAULT_MODE)
+
+    def _number(self, var, default, low, high):
+        """A spin box's value, or `default` if it has been typed into and
+        no longer makes sense."""
+        try:
+            value = float(var.get())
+        except ValueError:
+            value = default
+        value = min(max(value, low), high)
+        var.set(f"{value:g}")
+        return value
+
+    def settings(self):
+        """The measurement parameters currently set, as gwy_balance wants
+        them."""
+        p_lo = self._number(self.plo_var, gb.P_LO, 0.0, 49.0)
+        p_hi = self._number(self.phi_var, gb.P_HI, 51.0, 100.0)
+        return {
+            "cell_fraction": self._number(
+                self.cell_var, 100 * gb.CELL_FRACTION, 0.2, 20.0) / 100.0,
+            "p_lo": p_lo,
+            "p_hi": p_hi,
+        }
+
+    # -------------------------------------------------------------- files --
+
+    def select_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select a folder of .gwy files",
+            initialdir=os.path.dirname(self.app.filename or "") or ".")
+        if not folder:
+            return
+        names = sorted((f for f in os.listdir(folder)
+                        if f.lower().endswith(".gwy")), key=_natural_key)
+        if not names:
+            messagebox.showinfo(
+                "No files", "No .gwy files found in the selected folder.")
+            return
+        self.folder = folder
+        self.files = [os.path.join(folder, n) for n in names]
+        self._cache.clear()
+        self._cache_order.clear()
+        self.folder_label.config(
+            text=f"{os.path.basename(folder)}  ({len(self.files)} files)")
+        self.index = 0
+        try:
+            channels = list(gwy_loader.load_gwy(self.files[0]))
+        except Exception as e:
+            messagebox.showerror("Could not read file",
+                                 f"{os.path.basename(self.files[0])}:\n{e}")
+            return
+        self.channel_combo["values"] = channels
+        self.channel_var.set(pick_channel(channels, self.channel_var.get()))
+        self.analyse()
+
+    def step(self, delta):
+        if not self.files:
+            return
+        self.index = min(max(self.index + delta, 0), len(self.files) - 1)
+        self._update_nav()
+        self.redraw()
+
+    def _update_nav(self):
+        n = len(self.files)
+        self.count_label.config(
+            text=f"{self.index + 1} / {n}" if n else "0 / 0")
+        for btn, ok in ((self.prev_btn, self.index > 0),
+                        (self.next_btn, 0 <= self.index < n - 1)):
+            btn.state(["!disabled"] if ok else ["disabled"])
+
+    def _prepared(self, path, channel):
+        """The levelled image of one file, from the cache when possible."""
+        levelled = bool(self.level_var.get())
+        key = (path, channel, levelled)
+        if key in self._cache:
+            return self._cache[key]
+        fields = gwy_loader.load_gwy(path)
+        if not fields:
+            raise ValueError("no data channels")
+        view = channel_view(fields[pick_channel(list(fields), channel)])
+        if levelled:
+            data = gp.level_by_plane_fit(view["data"])
+            view["data"] = gp.align_rows(data, method="polynomial", order=2)
+        self._cache[key] = view
+        self._cache_order.append(key)
+        while len(self._cache_order) > self.CACHE_LIMIT:
+            self._cache.pop(self._cache_order.pop(0), None)
+        return view
+
+    def _thumbnail(self, data):
+        step = max(1, int(np.ceil(max(data.shape) / self.THUMB)))
+        return np.array(data[::step, ::step], dtype=np.float32)
+
+    # ------------------------------------------------------------ measure --
+
+    def analyse(self):
+        """Measure every file in the folder, then balance the folder."""
+        if self._busy or not self.files:
+            return
+        self._busy = True
+        # Drop the old folder's balance first: the pass below yields to the
+        # event loop to stay responsive, and a click that lands in the
+        # middle of it must not draw the new files through the old numbers.
+        self.result = None
+        self._skipped = []
+        try:
+            channel = self.channel_var.get()
+            params = self.settings()
+            kept, measures, metas, thumbs, skipped = [], [], [], [], []
+            self.progress.config(maximum=len(self.files), value=0)
+            for i, path in enumerate(self.files):
+                name = os.path.basename(path)
+                self.status_var.set(
+                    f"Measuring {i + 1}/{len(self.files)}: {name}")
+                self.progress.config(value=i)
+                self.update()
+                try:
+                    view = self._prepared(path, channel)
+                    measures.append(gb.measure(view["data"], **params))
+                except Exception as e:
+                    skipped.append(f"{name}: {e}")
+                    continue
+                metas.append({k: v for k, v in view.items() if k != "data"})
+                thumbs.append(self._thumbnail(view["data"]))
+                kept.append(path)
+            self.progress.config(value=0)
+            if not kept:
+                self._draw_message("None of the files in this folder could "
+                                   "be read.\n\n" + "\n".join(skipped[:10]))
+                self.status_var.set("Nothing to balance.")
+                return
+            self.files = kept
+            self.channel = channel
+            self.measures, self.metas, self.thumbs = measures, metas, thumbs
+            self.index = min(max(self.index, 0), len(kept) - 1)
+            self._skipped = skipped
+            self.rebalance()
+        finally:
+            self._busy = False
+
+    def rebalance(self):
+        """Redo the folder-wide range (cheap - nothing is measured again)."""
+        if not self.measures:
+            return
+        self.result = gb.balance(self.measures, self.mode())
+        self.override = None
+        self._show_range()
+        self._update_nav()
+        self.redraw()
+        self._report()
+
+    def _show_range(self):
+        """Put the current range into the entry boxes."""
+        shared = self.result and self.result["shared"]
+        state = "normal" if shared else "disabled"
+        if shared:
+            vmin, vmax = self._range_for(self.index)
+            self.vmin_var.set(f"{vmin:.4g}")
+            self.vmax_var.set(f"{vmax:.4g}")
+        else:
+            self.vmin_var.set("")
+            self.vmax_var.set("")
+        for entry in (self.vmin_entry, self.vmax_entry):
+            entry.config(state=state)
+        self.units_label.config(text=self.metas[0]["z_units"]
+                                if self.metas else "")
+
+    def _range_for(self, index):
+        if self.override:
+            return self.override
+        return self.result["ranges"][index]
+
+    def apply_range(self):
+        """Draw everything with the range typed into the boxes."""
+        if not self.result or not self.result["shared"]:
+            return
+        try:
+            vmin = float(self.vmin_var.get())
+            vmax = float(self.vmax_var.get())
+        except ValueError:
+            self.status_var.set("The range needs two numbers.")
+            return
+        if not vmax > vmin:
+            self.status_var.set("The top of the range must be above the "
+                                "bottom.")
+            return
+        self.override = (vmin, vmax)
+        self.redraw()
+        self._report()
+
+    def auto_range(self):
+        """Go back to the range the folder's measurements give."""
+        if not self.result:
+            return
+        self.override = None
+        self._show_range()
+        self.redraw()
+        self._report()
+
+    def _report(self):
+        """Say what the balance did, and what it had trouble with."""
+        if not self.result:
+            return
+        r = self.result
+        units = self.metas[0]["z_units"] if self.metas else ""
+        bad = sum(m["degenerate"] for m in self.measures)
+        parts = [f"{len(self.files)} images, {self.channel}"]
+        if r["shared"]:
+            vmin, vmax = self._range_for(self.index)
+            parts.append(f"range {vmin:.4g} to {vmax:.4g} {units}"
+                         + (" (typed in)" if self.override else ""))
+        else:
+            parts.append("each image on its own range")
+        gains = r["gains"]
+        if r["mode"] == "matched":
+            parts.append(f"gains {min(gains):.2f}-{max(gains):.2f} "
+                         f"(z rescaled, not true heights)")
+        if bad:
+            parts.append(f"{bad} image(s) with no substrate in frame - "
+                         f"lower quartile used instead")
+        if getattr(self, "_skipped", None):
+            parts.append(f"{len(self._skipped)} unreadable file(s) skipped")
+        self.status_var.set(".  ".join(parts) + ".")
+
+    # ------------------------------------------------------------ display --
+
+    def refresh_display(self):
+        """Redraw with the current colour map (nothing is recomputed)."""
+        if self.result:
+            self.redraw()
+
+    def redraw(self):
+        if not self.result:
+            return
+        self._show_range()
+        view = self.view_var.get()
+        try:
+            if view == "Contact sheet":
+                self._draw_sheet()
+            elif view == "Diagnostics":
+                self._draw_diagnostics()
+            else:
+                self._draw_single()
+        except Exception as e:                  # a file vanished mid-session
+            self._draw_message(f"Could not draw this image:\n{e}")
+
+    def _balanced(self, index):
+        """One image on the balanced scale, with its metadata."""
+        view = self._prepared(self.files[index], self.channel)
+        data = gb.apply_levels(view["data"], self.result["offsets"][index],
+                               self.result["gains"][index])
+        return data, view
+
+    def _z_label(self, index):
+        units = self.metas[index]["z_units"]
+        gain = self.result["gains"][index]
+        offset = self.result["offsets"][index]
+        if abs(gain - 1.0) > 1e-9:
+            return f"{units}, rescaled x{gain:.2f}"
+        if offset:
+            return f"{units} above the substrate"
+        return units
+
+    def _draw_single(self):
+        index = self.index
+        data, view = self._balanced(index)
+        name = os.path.basename(self.files[index])
+        vmin, vmax = self._range_for(index)
+        self.name_label.config(
+            text=f"{index + 1}/{len(self.files)}  -  {name}")
+
+        self.figure.clf()
+        ax = self.figure.add_subplot(111)
+        im = ax.imshow(data, origin="upper", cmap=gcm.current(),
+                       extent=(0, view["x_real"], 0, view["y_real"]),
+                       aspect="equal", vmin=vmin, vmax=vmax)
+        ax.set_title(self.channel)
+        ax.set_xlabel(f"x ({view['spatial_units']})")
+        ax.set_ylabel(f"y ({view['spatial_units']})")
+        self.figure.colorbar(im, ax=ax, pad=0.05, fraction=0.046).set_label(
+            self._z_label(index))
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _draw_sheet(self):
+        """Every image at once, on the shared range."""
+        n = len(self.thumbs)
+        cols = min(5, max(1, int(np.ceil(np.sqrt(n)))))
+        rows = int(np.ceil(n / cols))
+        self.name_label.config(
+            text=f"{n} images, {self.channel}"
+                 + (", one shared range" if self.result["shared"]
+                    else ", each on its own range"))
+        self.figure.clf()
+        axes = np.atleast_1d(self.figure.subplots(rows, cols)).ravel()
+        for i, thumb in enumerate(self.thumbs):
+            ax = axes[i]
+            data = gb.apply_levels(thumb, self.result["offsets"][i],
+                                   self.result["gains"][i])
+            vmin, vmax = self._range_for(i)
+            ax.imshow(data, origin="upper", cmap=gcm.current(), vmin=vmin,
+                      vmax=vmax, aspect="equal")
+            ax.set_title(os.path.basename(self.files[i])[:24], fontsize=7)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if i == self.index:              # mark where Next/Back is
+                for side in ax.spines.values():
+                    side.set(color="tab:cyan", linewidth=2.5)
+        for ax in axes[n:]:
+            ax.axis("off")
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _draw_diagnostics(self):
+        """What the segmentation found, and how the folder sits in the
+        range."""
+        index = self.index
+        data, view = self._balanced(index)
+        measure = self.measures[index]
+        vmin, vmax = self._range_for(index)
+        gain = self.result["gains"][index]
+        offset = self.result["offsets"][index]
+        units = self.metas[index]["z_units"]
+        self.name_label.config(
+            text=f"{index + 1}/{len(self.files)}  -  "
+                 f"{os.path.basename(self.files[index])}")
+
+        self.figure.clf()
+        axes = self.figure.subplots(2, 2)
+
+        ax = axes[0, 0]
+        ax.imshow(data, origin="upper", cmap=gcm.current(), vmin=vmin,
+                  vmax=vmax, aspect="equal")
+        ax.contour(measure["mask"], levels=[0.5], colors="tab:cyan",
+                   linewidths=0.8)
+        ax.set_title(f"cells {100 * measure['coverage']:.0f}% of the frame"
+                     + (" (no substrate found)" if measure["degenerate"]
+                        else ""), fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        ax = axes[0, 1]
+        anchors = [(measure["background"], "substrate", "tab:blue"),
+                   (measure["low"], "cell low", "tab:green"),
+                   (measure["median"], "cell median", "tab:olive"),
+                   (measure["high"], "cell high", "tab:red")]
+        lo, hi = np.percentile(data, [0.2, 99.8])
+        ax.hist(data.ravel(), bins=300, range=(lo, hi), color="0.7")
+        for value, label, colour in anchors:
+            ax.axvline((value + offset) * gain, color=colour, lw=1.2,
+                       label=label)
+        ax.axvspan(vmin, vmax, color="tab:orange", alpha=0.15,
+                   label="shown range")
+        ax.set_title("where this image sits", fontsize=9)
+        ax.set_xlabel(self._z_label(index))
+        ax.set_yticks([])
+        ax.legend(fontsize=7)
+
+        ax = axes[1, 0]
+        x = np.arange(len(self.measures))
+        for key, label, colour in (("background", "substrate", "tab:blue"),
+                                   ("low", "cell low", "tab:green"),
+                                   ("median", "cell median", "tab:olive"),
+                                   ("high", "cell high", "tab:red")):
+            y = [(m[key] + o) * g for m, o, g
+                 in zip(self.measures, self.result["offsets"],
+                        self.result["gains"])]
+            ax.plot(x, y, ".-", color=colour, lw=1, ms=4, label=label)
+        ax.axhspan(vmin, vmax, color="tab:orange", alpha=0.15)
+        ax.axvline(index, color="0.4", lw=1, ls=":")
+        ax.set_title("the folder on the balanced scale", fontsize=9)
+        ax.set_xlabel("image")
+        ax.set_ylabel(self._z_label(index))
+        ax.legend(fontsize=7)
+
+        ax = axes[1, 1]
+        ax.plot(x, [100 * m["coverage"] for m in self.measures], ".-",
+                color="tab:purple", lw=1, ms=4, label="cell coverage (%)")
+        ax.plot(x, [100 * g for g in self.result["gains"]], ".-",
+                color="tab:brown", lw=1, ms=4, label="gain (%)")
+        ax.axvline(index, color="0.4", lw=1, ls=":")
+        ax.axhline(100, color="0.6", lw=0.8)
+        ax.set_title("per image", fontsize=9)
+        ax.set_xlabel("image")
+        ax.legend(fontsize=7)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _draw_message(self, text):
+        self.figure.clf()
+        ax = self.figure.add_subplot(111)
+        ax.text(0.5, 0.5, text, ha="center", va="center",
+                transform=ax.transAxes, wrap=True)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas.draw()
+
+    # ------------------------------------------------------------- export --
+
+    def export(self):
+        """Write every image as a PNG, all on the shared range."""
+        if not self.result:
+            messagebox.showinfo("Nothing to export",
+                                "Select a folder first.")
+            return
+        folder = filedialog.askdirectory(
+            title="Save the balanced images to...",
+            initialdir=self.folder or ".")
+        if not folder:
+            return
+        targets = [os.path.join(
+            folder, f"{os.path.splitext(os.path.basename(p))[0]}"
+                    f"_balanced.png") for p in self.files]
+        clashes = [t for t in targets if os.path.exists(t)]
+        if clashes and not messagebox.askyesno(
+                "Overwrite?",
+                f"{len(clashes)} file(s) in that folder will be "
+                f"overwritten, starting with "
+                f"{os.path.basename(clashes[0])}.\n\nGo ahead?"):
+            return
+
+        self._busy = True
+        try:
+            self.progress.config(maximum=len(self.files), value=0)
+            for i, (path, target) in enumerate(zip(self.files, targets)):
+                self.status_var.set(f"Writing {i + 1}/{len(self.files)}: "
+                                    f"{os.path.basename(target)}")
+                self.progress.config(value=i)
+                self.update()
+                data, view = self._balanced(i)
+                vmin, vmax = self._range_for(i)
+                save_pure_image(data, target, view["x_real"], view["y_real"],
+                                vmin=vmin, vmax=vmax)
+            self.progress.config(value=0)
+            self.status_var.set(f"Wrote {len(self.files)} images to {folder}.")
+        finally:
+            self._busy = False
 
 
 class GwyProcessorGUI(tk.Tk):
@@ -4033,9 +4658,11 @@ class GwyProcessorGUI(tk.Tk):
         toolbar = NavigationToolbar2Tk(self.canvas, right)
         toolbar.update()
 
-        # ---- Quick view tab ----
+        # ---- Folder tabs ----
         self.quick = QuickViewTab(self.tabs, self)
         self.tabs.add(self.quick, text="Quick view")
+        self.balanced = BalancedViewTab(self.tabs, self)
+        self.tabs.add(self.balanced, text="Balanced view")
 
     # ------------------------------------------------------------- Colour --
 
@@ -4047,6 +4674,7 @@ class GwyProcessorGUI(tk.Tk):
         if self.data is not None:
             self.redraw()
         self.quick.refresh_display()
+        self.balanced.refresh_display()
         self.status_var.set(f"Colour map: {name}")
 
     def _draw_cmap_strip(self):
