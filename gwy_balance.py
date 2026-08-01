@@ -37,15 +37,35 @@ wall, it is a small part of the area, and if it is included it drags the top
 of the range up and flattens exactly the structure inside the cell that the
 range is supposed to reveal.
 
-Two ways to use the anchors (`balance`):
+Three ways to use the anchors (`balance`), which differ in how much of the
+range the folder gets to decide:
 
   per_image  Each image keeps its own anchors. Nothing is shared; this is
              the "before" picture, and the honest baseline to compare
              against.
+  substrate  The bottom of the range comes from the folder, the top from
+             each image's own cells. See below.
   common     Every image is shifted so its substrate reads zero, and then
              all of them are drawn with one range, taken as the median of
              the individual anchors. A layer with genuinely taller cells
              will clip - that is real information, not a defect.
+
+`substrate` is the default, because of what does and does not vary between
+scans of the same sample. Two things move:
+
+  * where the substrate sits, which is drift, thermal motion and the plane
+    fit - an artifact, with no physical content, and it should go; and
+  * how far the cells stand above it, which is the sample, and should not.
+
+`common` removes both, which flattens real height differences. `per_image`
+removes neither: its bottom is that image's own cell-interior percentile,
+which wanders with the segmentation, so the substrate between the cells
+lands anywhere from 5 % to 52 % up the colour map across one folder -
+visible as the substrate changing colour from image to image for no
+physical reason. `substrate` pins the bottom to the folder, so the same
+substrate reads the same colour everywhere, and lets the top follow each
+image's own cell height, so a taller layer is drawn taller instead of
+clipped or squeezed.
 
 **Only offsets are ever applied - the z scale of the data is never
 touched.** That is a hard rule here, not a default. An earlier version had a
@@ -76,9 +96,10 @@ CLIP = (0.5, 99.5)       # outlier clip used before smoothing, percent
 
 MODES = {
     "per_image": "Per image (no sharing)",
+    "substrate": "Substrate anchored (own top)",
     "common": "Common range (shared)",
 }
-DEFAULT_MODE = "common"
+DEFAULT_MODE = "substrate"
 
 
 def otsu_threshold(values, bins=256):
@@ -232,9 +253,10 @@ def balance(measures, mode=DEFAULT_MODE):
         mode (str): One of `MODES`.
 
     Returns:
-        dict: With `mode`, `shared` (whether one range covers every image),
-        `vmin`/`vmax` (the shared range, None when not shared), `offsets`
-        and `ranges` (a (vmin, vmax) pair per image).
+        dict: With `mode`; `shared` (one range covers every image) and
+        `shared_min` (at least the bottom of the range is the folder's);
+        `vmin`/`vmax`, each None when that end is not shared; `offsets`; and
+        `ranges`, a (vmin, vmax) pair per image.
 
     Raises:
         ValueError: If `mode` is not one of `MODES`, or `measures` is empty.
@@ -253,13 +275,28 @@ def balance(measures, mode=DEFAULT_MODE):
 
     if mode == "per_image":
         return {
-            "mode": mode, "shared": False, "vmin": None, "vmax": None,
+            "mode": mode, "shared": False, "shared_min": False,
+            "vmin": None, "vmax": None,
             "offsets": [0.0] * len(measures),
             "ranges": [(m["low"], m["high"]) for m in measures],
         }
+
+    offsets = [-m["background"] for m in measures]
+    if mode == "substrate":
+        # The folder decides the bottom, each image its own top. A top that
+        # does not clear the shared bottom - a scan with no measurable step -
+        # falls back to the folder's span so it is still drawable.
+        ranges = [(vmin, float(high) if high > vmin else vmin + (vmax - vmin))
+                  for high in highs]
+        return {
+            "mode": mode, "shared": False, "shared_min": True,
+            "vmin": vmin, "vmax": None,
+            "offsets": offsets, "ranges": ranges,
+        }
     return {
-        "mode": mode, "shared": True, "vmin": vmin, "vmax": vmax,
-        "offsets": [-m["background"] for m in measures],
+        "mode": mode, "shared": True, "shared_min": True,
+        "vmin": vmin, "vmax": vmax,
+        "offsets": offsets,
         "ranges": [(vmin, vmax)] * len(measures),
     }
 
@@ -291,8 +328,10 @@ def zero_baseline(result):
                           in zip(result["offsets"], shifts)]
     shifted["ranges"] = [(lo + s, hi + s) for (lo, hi), s
                          in zip(result["ranges"], shifts)]
+    if result.get("shared_min"):
+        shifted["vmin"] = shifted["ranges"][0][0]
     if result["shared"]:
-        shifted["vmin"], shifted["vmax"] = shifted["ranges"][0]
+        shifted["vmax"] = shifted["ranges"][0][1]
     return shifted
 
 

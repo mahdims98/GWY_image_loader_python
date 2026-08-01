@@ -11,7 +11,7 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
 * **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
 * **`gwy_colormaps.py`**: Gwyddion's false-colour gradients (`Gray`, `Sky`, `Body`, `Rainbow2`, `Viridis`, ... 60 in all) as matplotlib colormaps, plus the application-wide selection used by the GUI.
-* **`gwy_balance.py`**: One shared colour range for a whole folder — segments each image into cells and substrate, measures both, and reduces the set to a single range so the same colour means the same thing in every image.
+* **`gwy_balance.py`**: A colour range a whole folder can share — segments each image into cells and substrate, measures both, and anchors the range on those two places instead of on the image as a whole, so the substrate reads the same colour in every image without flattening real height differences between them. Offsets only; the z scale is never touched.
 * **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, a folder quick view, a balanced folder view, and batch folder processing.
 
 ## Requirements
@@ -631,12 +631,29 @@ far below anything real and squashes the picture. When the split fails, the
 image is treated as all cell, its lower quartile stands in for the substrate,
 and the status line says how many images that happened to.
 
-**The two modes:**
+**The three modes:**
 
-| Mode | What it does |
-| --- | --- |
-| Per image (no sharing) | Each image keeps its own anchors — the "before" picture, and the honest baseline to compare against. |
-| Common range (shared) | Every image is shifted so its substrate reads zero; all are drawn with one range, the median of the individual anchors. |
+| Mode | Bottom of the range | Top of the range |
+| --- | --- | --- |
+| Per image (no sharing) | that image's own cell-interior low percentile | that image's own cells |
+| **Substrate anchored** (default) | the folder's median, so the substrate reads the same colour everywhere | that image's own cells |
+| Common range (shared) | the folder's median | the folder's median — one range for everything |
+
+`Substrate anchored` is the default because of what does and does not vary
+between scans of the same sample. Two things move: **where the substrate sits**
+— drift, thermal motion and the plane fit, an artifact with no physical content,
+which should go — and **how far the cells stand above it**, which is the sample,
+and should not.
+
+`Common range` removes both, so real height differences between layers get
+flattened or clipped. `Per image` removes neither: its bottom is that image's own
+cell-interior percentile, which wanders with the segmentation, so on one folder
+here the substrate between the cells lands anywhere from **5 % to 52 %** up the
+colour map — visible as the substrate changing colour from image to image for no
+physical reason, which is the original complaint. `Substrate anchored` pins the
+bottom to the folder and lets the top follow each image's own cells, so a taller
+layer is drawn taller instead of clipped or squeezed, and the range boxes let you
+type over the bottom (the shared end) while each top stays that image's own.
 
 **Only offsets are ever applied — the z scale of the data is never touched.**
 That is a hard rule, not a default, and `gwy_balance.apply_levels` is an
@@ -650,7 +667,8 @@ false height, so the gain was removed rather than merely defaulted off.
 The consequence to expect: under `Common range`, a layer whose cells are
 genuinely taller than the folder's median will clip at the bright end. That is
 real information, not a defect — the diagnostics view reports the clipped
-fraction per image, and the range can always be widened by hand.
+fraction per image, and the range can always be widened by hand. `Substrate
+anchored` does not clip that way, because each image's top is its own.
 
 **Looking at the result.** **View** switches between a single image (with
 **Next**/**Back**, or the arrow keys after one click on the image), a **contact
@@ -686,8 +704,8 @@ any of:
 * **Gwyddion `.gwy`** — the balanced channel, titled
   `<name> - <channel> (balanced)`.
 
-All of them use the shared range and the current colour map, so they can be
-compared side by side. Because balancing only shifts, the `.gwy` carries the
+All of them use the range the tab is showing and the current colour map, so they
+can be compared side by side. Because balancing only shifts, the `.gwy` carries the
 **measured heights**: its data differs from the source channel by one constant
 and by nothing else. It also holds the **full data** — only the display is
 clipped to the range — and an existing file is replaced rather than appended to,
@@ -700,11 +718,10 @@ Outside the GUI:
 import gwy_balance as gb
 
 measures = [gb.measure(image) for image in levelled_images]
-result = gb.zero_baseline(gb.balance(measures, "matched"))
-shown = [gb.apply_levels(image, offset, gain)
-         for image, offset, gain in zip(levelled_images, result["offsets"],
-                                        result["gains"])]
-# every one of them drawn with vmin=result["vmin"], vmax=result["vmax"]
+result = gb.zero_baseline(gb.balance(measures, "substrate"))
+shown = [gb.apply_levels(image, offset)
+         for image, offset in zip(levelled_images, result["offsets"])]
+# image i is drawn with vmin, vmax = result["ranges"][i]
 ```
 
 ### Colour maps

@@ -4288,42 +4288,57 @@ class BalancedViewTab(ttk.Frame):
         self.redraw()
         self._report()
 
+    def _editable_ends(self):
+        """Which ends of the range the folder decides, and so can be typed
+        over. In `substrate` mode that is the bottom only: each image's top
+        is its own, and there is no one number to put in the box."""
+        if not self.result:
+            return False, False
+        return bool(self.result.get("shared_min")), bool(self.result["shared"])
+
     def _show_range(self):
         """Put the current range into the entry boxes."""
-        shared = self.result and self.result["shared"]
-        state = "normal" if shared else "disabled"
-        if shared:
-            vmin, vmax = self._range_for(self.index)
-            self.vmin_var.set(f"{vmin:.4g}")
-            self.vmax_var.set(f"{vmax:.4g}")
-        else:
-            self.vmin_var.set("")
-            self.vmax_var.set("")
-        for entry in (self.vmin_entry, self.vmax_entry):
-            entry.config(state=state)
+        low_ok, high_ok = self._editable_ends()
+        vmin, vmax = (self._range_for(self.index) if self.result
+                      else (None, None))
+        for entry, var, ok, value in (
+                (self.vmin_entry, self.vmin_var, low_ok, vmin),
+                (self.vmax_entry, self.vmax_var, high_ok, vmax)):
+            var.set(f"{value:.4g}" if ok else "")
+            entry.config(state="normal" if ok else "disabled")
         self.units_label.config(text=self.metas[0]["z_units"]
                                 if self.metas else "")
 
     def _range_for(self, index):
+        low, high = self.result["ranges"][index]
         if self.override:
-            return self.override
-        return self.result["ranges"][index]
+            low = self.override[0] if self.override[0] is not None else low
+            high = self.override[1] if self.override[1] is not None else high
+        return low, high
 
     def apply_range(self):
         """Draw everything with the range typed into the boxes."""
-        if not self.result or not self.result["shared"]:
+        low_ok, high_ok = self._editable_ends()
+        if not (low_ok or high_ok):
             return
+        # A rejected entry leaves the range that was already in force - both
+        # the numbers and the picture - rather than dropping back to auto.
+        previous = self.override
         try:
-            vmin = float(self.vmin_var.get())
-            vmax = float(self.vmax_var.get())
+            low = float(self.vmin_var.get()) if low_ok else None
+            high = float(self.vmax_var.get()) if high_ok else None
         except ValueError:
-            self.status_var.set("The range needs two numbers.")
+            self.status_var.set("The range needs a number.")
+            self._show_range()
             return
-        if not vmax > vmin:
+        self.override = (low, high)
+        if any(hi <= lo for lo, hi in
+               (self._range_for(i) for i in range(len(self.files)))):
+            self.override = previous
             self.status_var.set("The top of the range must be above the "
-                                "bottom.")
+                                "bottom, in every image.")
+            self._show_range()
             return
-        self.override = (vmin, vmax)
         self.redraw()
         self._report()
 
@@ -4344,18 +4359,23 @@ class BalancedViewTab(ttk.Frame):
         units = self.metas[0]["z_units"] if self.metas else ""
         bad = sum(m["degenerate"] for m in self.measures)
         parts = [f"{len(self.files)} images, {self.channel}"]
+        typed = " (typed in)" if self.override else ""
+        vmin, vmax = self._range_for(self.index)
         if r["shared"]:
-            vmin, vmax = self._range_for(self.index)
-            parts.append(f"range {vmin:.4g} to {vmax:.4g} {units}"
-                         + (" (typed in)" if self.override else ""))
+            parts.append(f"range {vmin:.4g} to {vmax:.4g} {units}{typed}")
+        elif r.get("shared_min"):
+            tops = [hi for _, hi in
+                    (self._range_for(i) for i in range(len(self.files)))]
+            parts.append(f"range from {vmin:.4g} {units}{typed} for all, up to "
+                         f"each image's own cells ({min(tops):.4g} to "
+                         f"{max(tops):.4g} {units})")
         else:
             parts.append("each image on its own range")
-        if r["shared"]:
-            outside = [100 * float(np.mean((d < self._range_for(i)[0])
-                                           | (d > self._range_for(i)[1])))
-                       for i, d in enumerate(self._shifted_thumbs())]
-            parts.append(f"{min(outside):.0f}-{max(outside):.0f}% of pixels "
-                         f"outside the range")
+        outside = [100 * float(np.mean((d < self._range_for(i)[0])
+                                       | (d > self._range_for(i)[1])))
+                   for i, d in enumerate(self._shifted_thumbs())]
+        parts.append(f"{min(outside):.0f}-{max(outside):.0f}% of pixels "
+                     f"outside the range")
         if bad:
             parts.append(f"{bad} image(s) with no substrate in frame - "
                          f"lower quartile used instead")
@@ -4429,10 +4449,13 @@ class BalancedViewTab(ttk.Frame):
         n = len(self.thumbs)
         cols = min(5, max(1, int(np.ceil(np.sqrt(n)))))
         rows = int(np.ceil(n / cols))
-        self.name_label.config(
-            text=f"{n} images, {self.channel}"
-                 + (", one shared range" if self.result["shared"]
-                    else ", each on its own range"))
+        if self.result["shared"]:
+            how = ", one shared range"
+        elif self.result.get("shared_min"):
+            how = ", shared bottom, each image's own top"
+        else:
+            how = ", each on its own range"
+        self.name_label.config(text=f"{n} images, {self.channel}{how}")
         self.figure.clf()
         axes = np.atleast_1d(self.figure.subplots(rows, cols)).ravel()
         for i, data in enumerate(self._shifted_thumbs()):
