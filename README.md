@@ -8,6 +8,7 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 
 * **`gwy_loader.py`**: A pure Python module for parsing and reading `.gwy` files. It extracts data fields, metadata, physical dimensions, and SI units.
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
+* **`gwy_flatten.py`**: Background subtraction that leaves the sample out of the fit — the cells, bubbles or pits are segmented and excluded first, so the polynomial cannot bend itself around them and leave trenches and uneven surfaces behind. After Wang et al. (2018), with the paper's sliding-window fit in closed form.
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
 * **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
 * **`gwy_colormaps.py`**: Gwyddion's false-colour gradients (`Gray`, `Sky`, `Body`, `Rainbow2`, `Viridis`, ... 60 in all) as matplotlib colormaps, plus the application-wide selection used by the GUI.
@@ -40,6 +41,130 @@ environment variable to point elsewhere.
 * **Baseline Adjustment** (`set_baseline_to_zero`): Shifts the minimum data point to a base of zero.
 * **Outlier Filtering** (`filter_by_percentile`): Clips extreme values (spikes) based on a designated percentile range. In the GUI the clip is *re-editable*: reopening the dialog right after a clip edits that same step, so the histogram still shows the full unclipped distribution and the limits can be widened again instead of only narrowed.
 * **FFT Analysis & Filtering** (`get_2d_fft_magnitude`, `filter_by_2d_fft_mask`): 2D FFT analysis (no windowing - the displayed spectrum is exactly the one being filtered, normalized so the DC bin is the image mean) and frequency-domain filtering through a single mask that can combine a radial lowpass/highpass (`build_pass_mask`), circular notches (`build_notch_mask`), rectangular patches (`build_rect_mask`), and straight bands (`build_band_mask`). Noise is auto-detected systematically (`detect_fft_noise`) on the *excess* spectrum - the dB magnitude above the local radial background (`fft_excess_db`), so the falloff of the real topography never triggers it: streak columns/rows (median excess along the axis), coherent interference peaks sitting on the fx/fy axes, and off-axis regions each get their own statistically matched test. The whole mask can be given a smooth Gaussian roll-off (`smooth_fft_mask`) instead of hard edges. The GUI exposes all of these in one FFT-filter dialog with a large interactive spectrum (click to place cutoff/notches/bands, drag to notch a rectangle) and a *Zoom window* that shows the image before and after the filter side by side on one color scale, cropped to an area dragged on the result panel - so it can be checked close up that the filter took out the noise and not the topography.
+
+### Smart background (`gwy_flatten.py`)
+
+Levelling means fitting the artifact — tilt, bow, drift, the slow wander of the
+z scanner — and subtracting it. The fit is the whole problem. Fit it to *every*
+pixel, as `level_by_plane_fit` or `align_rows` does, and the sample is fitted
+too: a scan line that crosses a cell has its baseline pulled up by the cell, the
+fit compensates by pushing that line down, and what comes out is a dark trench
+along each side of every raised object and a cell whose surface is no longer
+flat. On the yeast scans in `Data to test`, the ordinary row-by-row cubic pushes
+the cells all the way down onto the substrate: a cross section shows the cell
+and the substrate between the cells at *the same height*, with the 20–47 nm the
+cells actually stand proud of it removed as though it were an artifact.
+
+The fix is not a better polynomial. It is to fit the background only to the
+background, which means finding the background first. This module follows
+
+> Y. Wang, T. Lu, X. Li and H. Wang, *Automated image segmentation-assisted
+> flattening of atomic force microscopy images*, Beilstein J. Nanotechnol.
+> **2018**, 9, 975–985. [doi:10.3762/bjnano.9.91](https://doi.org/10.3762/bjnano.9.91)
+
+in two steps: segment the features and exclude them, then fit what is left.
+
+**1. Find the features** (`segment_foreground`). A threshold gives a first
+outline, which is always too small — a threshold necessarily cuts a bump partway
+up its flank. Two thresholds are offered and they are for different samples:
+
+| `threshold` | How it splits | Use it when |
+| --- | --- | --- |
+| `otsu` | one threshold for the whole image, on a heavily smoothed copy | features are **large** — cells, anything a good fraction of the frame across. This is the default, and it is what the `Data to test` folders need. |
+| `adaptive` | each pixel against the median of a `neighbourhood` around it | features are **small and many** — the paper's nanobubbles and nanopits. The neighbourhood must be wider than any one feature, or the window sees the middle of a cell as its own background. |
+
+`detect` chooses convex features (bumps, cells), concave ones (pits, holes — the
+paper complements the image; so does this) or both. `both` is refused with
+`otsu`, which splits the image in two and would therefore mask all of it.
+
+**2. Take the outline out to the foot** (`expand_contour`). What the threshold
+leaves outside the mask is the foot of the feature, and the foot is the worst
+possible thing to feed a background fit — it is the steepest part of the error.
+The mask grows a pixel at a time and a pixel joins only while the gradient says
+the flank is still falling, so growth stops on its own at flat ground; `expand`
+is a limit, not a target, and `edge` sets how much slope still counts. `grow`
+adds a plain margin afterwards and `min_area` drops specks.
+
+**3. Fit what is left** (`fit_background`). `rows` fits a polynomial along each
+scan line (the paper's curve fitting), `columns` does the same down each column,
+`surface` fits one polynomial over the whole image. Masked pixels are simply not
+in the least-squares problem. `rows` is the default and is usually right: drift
+is slow compared with a scan line, so it lands between lines rather than along
+them, and only a per-line fit can take it out — the paper reaches the same
+conclusion by rotating an image 90° and watching the flattening get worse.
+
+Setting `window` above 0 switches on the paper's sliding-window fit (SWCF/SWSF)
+for backgrounds too complicated for one polynomial. A window of that many pixels
+steps across the image one pixel at a time; at each position a polynomial is
+fitted to the background inside it and recorded at every pixel it covers, and
+each pixel averages the values from every window that reached it. Raising the
+order instead is the obvious alternative and the wrong one — a high-order fit
+oscillates between the points that constrain it. Smaller windows follow the
+background more closely; larger ones start leaving a corrugation behind. This is
+computed in closed form rather than by looping over positions (the normal
+equations of every window at once are a handful of `correlate1d` passes, and the
+averaging is a convolution of the coefficient images), which is what makes it a
+second or two on a 512×1024 scan instead of a quarter of a million least-squares
+fits. It is checked against a literal position-by-position implementation to
+1e-7.
+
+**Two departures from the paper**, both about images its nanobubbles never
+produced. A fit is **rejected outright when it would be extrapolating** rather
+than interpolating — when the background it has left is bunched at one end of
+the line or one corner of the window, so the polynomial it supports says nothing
+about the rest of it. A whole-line fit then drops its order until one is
+supportable, down to a constant; a window drops out and the whole-image fit
+stands in. This is not a refinement: without it, on a scan two thirds covered by
+cells, the fitted background swung over 700 nm on an image whose features are
+40 nm tall. And the **contour expansion is not the paper's active contour** —
+same purpose, one parameter instead of two, no dependency beyond scipy.
+
+`passes` (default 2) repeats the whole thing on the flattened result. There is a
+chicken and egg to handle here: segmenting needs a reasonably flat image,
+because on a raw scan the drift between one line and the next is routinely
+larger than the cells sitting on it, and segmenting *that* marks the bright scan
+lines rather than the sample. So the first mask is taken from a plainly
+flattened copy — the same fit over every pixel, features and all. That copy is a
+bad image (it is exactly the one this module exists to avoid) but a good image
+to *segment*, and it is thrown away. The final fit is always taken on the
+original data, so passes refine the mask and never stack subtractions.
+
+**Nothing here rescales z.** The result is `data - background`, a subtraction,
+so a height measured on the result is the height that was measured on the
+sample. Multiplying the input by three multiplies the output by exactly three,
+which is checked for every fit and window setting.
+
+**What it does not do, by construction.** A per-line fit corrects each line by
+what its own background says, so drift that happened while the tip was crossing
+a cell — where there is no background to see it in — stays in the image. The
+ordinary levelling appears to remove it, but only because it is re-levelling
+each line on the cell itself, which is the same operation that flattens the
+cell. So a scan whose lines are individually noisy will still look banded
+*inside* the features after this step, and the honest order is to level with
+**Smart background** and then take the line noise out with
+[Stripe Removal](#stripe-removal-gwy_destripepy), which is built to tell a
+stripe from topography. Levelling harder is not the answer to a stripe.
+
+In the GUI, **Smart background...** sits directly under *Plane level* and *Poly
+background*. Its dialog shows three panels: the result with the excluded area
+outlined, the background that was removed, and **what the mask changed** — the
+difference against the same fit run over every pixel, i.e. against the ordinary
+levelling two buttons up. Where that panel is flat the mask made no difference;
+where it is bright, that is how much of the sample the ordinary fit was
+subtracting from itself. Underneath, the mask's share of the frame is reported,
+with a warning if almost nothing is left to fit, if nothing was masked at all,
+or if any scan lines had no background left and had to be interpolated from
+their neighbours.
+
+```python
+import gwy_flatten as gf
+
+result = gf.flatten(image, threshold="otsu", detect="convex",
+                    fit="rows", order=3, window=0, passes=2)
+flat = result["data"]          # the levelled image
+result["mask"]                 # what was kept out of the fit
+result["coverage"]             # how much of the frame that was
+```
 
 ### Stripe Removal (`gwy_destripe.py`)
 
@@ -790,6 +915,26 @@ if channel:
         title="Processed AFM Height", cmap=get_gwyddion_cmap(),
         cbar_label="Height (nm)", spatial_units="µm"
     )
+```
+
+### Levelling a scan without flattening the sample into the background
+
+```python
+from gwy_loader import load_gwy
+import gwy_processing as gp
+import gwy_flatten as gf
+
+channels = load_gwy('sample_scan.gwy')
+image = channels['Height [Fwd]'].data * 1e9          # nm
+
+# Take the tilt out first, then fit the rest to the background only.
+result = gf.flatten(gp.level_by_plane_fit(image), fit="rows", order=3)
+
+flat = result["data"]
+inside = flat[result["mask"]]
+outside = flat[~result["mask"]]
+print(f"{100 * result['coverage']:.0f} % of the frame is sample, "
+      f"standing {inside.mean() - outside.mean():.1f} nm above the substrate")
 ```
 
 ### Merging a forward/backward pair

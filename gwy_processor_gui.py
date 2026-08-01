@@ -9,6 +9,12 @@ Provides an interactive Tkinter application to:
       * Plane leveling (level_by_plane_fit)
       * Polynomial background removal with separate x/y orders
         (level_by_polynomial_xy)
+      * Smart background (gwy_flatten): the same polynomial levelling,
+        but fitted only to the pixels that are not sample. The cells,
+        bubbles or pits are segmented first and excluded, so the fit
+        cannot bend itself around them and leave the trenches and
+        uneven surfaces that ordinary levelling does; after Wang et
+        al., Beilstein J. Nanotechnol. 2018, 9, 975
       * Align rows: median of differences / polynomial (align_rows)
       * Percentile range clipping (filter_by_percentile), re-editable:
         a clip opened right after another one edits that same step, so
@@ -77,6 +83,7 @@ import gwy_loader
 import gwy_processing as gp
 import gwy_balance as gb
 import gwy_colormaps as gcm
+import gwy_flatten as gf
 import gwy_destripe as gd
 import gwy_twoway as gtw
 
@@ -101,6 +108,59 @@ def _op_polynomial(data, params, dx, dy):
     return gp.level_by_polynomial_xy(
         data, x_order=params["x_order"], y_order=params["y_order"]
     )
+
+
+def _smart_kwargs(params):
+    """Dialog values as gwy_flatten keywords."""
+    return dict(
+        detect=str(params.get("detect", gf.DEFAULTS["detect"])),
+        threshold=str(params.get("threshold", gf.DEFAULTS["threshold"])),
+        neighbourhood=float(params.get("neighbourhood",
+                                       gf.DEFAULTS["neighbourhood"])),
+        sensitivity=float(params.get("sensitivity",
+                                     gf.DEFAULTS["sensitivity"])),
+        expand=int(params.get("expand", gf.DEFAULTS["expand"])),
+        edge=float(params.get("edge", gf.DEFAULTS["edge"])),
+        grow=int(params.get("grow", gf.DEFAULTS["grow"])),
+        min_area=float(params.get("min_area", gf.DEFAULTS["min_area"])),
+        fit=str(params.get("fit", gf.DEFAULTS["fit"])),
+        order=int(params.get("order", gf.DEFAULTS["order"])),
+        window=int(params.get("window", gf.DEFAULTS["window"])),
+        passes=int(params.get("passes", gf.DEFAULTS["passes"])),
+    )
+
+
+def _op_smart_level(data, params, dx, dy):
+    return gf.flatten(data, **_smart_kwargs(params))["data"]
+
+
+def _validate_smart(params):
+    if params.get("threshold") == "otsu" and params.get("detect") == "both":
+        return ("Otsu splits the image in two, so 'both' would mask all of "
+                "it. Choose convex or concave, or use the adaptive threshold.")
+    if not 0.0 < params["neighbourhood"] <= 100.0:
+        return "The neighbourhood is a percentage of the image, above 0"
+    if params["sensitivity"] <= 0:
+        return "The threshold offset must be positive"
+    if params["edge"] < 0:
+        return "The edge gate cannot be negative"
+    if params["min_area"] < 0:
+        return "The smallest feature cannot be negative"
+    if params["window"] and params["window"] < 3:
+        return "A sliding window is at least 3 px wide (0 fits in one piece)"
+    if params["passes"] < 1:
+        return "There must be at least one pass"
+    return None
+
+
+def _describe_smart(params):
+    where = {"rows": "along rows", "columns": "down columns",
+             "surface": "as a surface"}[params.get("fit", "rows")]
+    window = params.get("window", 0)
+    return (f"{params.get('threshold', '?')}/{params.get('detect', '?')} mask, "
+            f"order {params.get('order', 0)} {where}"
+            + (f", {window}px window" if window else "")
+            + f", {params.get('passes', 1)} passes")
 
 
 def _op_align_rows(data, params, dx, dy):
@@ -581,6 +641,45 @@ OPERATIONS = {
         ],
         "removed_label": "Removed background",
     },
+    "smart_level": {
+        "label": "Smart background",
+        "func": _op_smart_level,
+        # Declared grouped, and in the order the dialog shows them:
+        # threshold, then refine the outline, then fit what is left.
+        "params": [
+            {"name": "detect", "label": "Features", "type": "choice",
+             "default": gf.DEFAULTS["detect"], "values": list(gf.DETECT)},
+            {"name": "threshold", "label": "Find by", "type": "choice",
+             "default": gf.DEFAULTS["threshold"], "values": list(gf.THRESHOLDS)},
+            {"name": "neighbourhood", "label": "Neighbourhood (%)",
+             "type": "float", "default": gf.DEFAULTS["neighbourhood"],
+             "min": 0.0, "max": 100.0},
+            {"name": "sensitivity", "label": "Threshold (sigma)",
+             "type": "float", "default": gf.DEFAULTS["sensitivity"],
+             "min": 0.0, "max": 100.0},
+            {"name": "min_area", "label": "Smallest (% of frame)",
+             "type": "float", "default": gf.DEFAULTS["min_area"],
+             "min": 0.0, "max": 100.0},
+            {"name": "expand", "label": "Expand (px)", "type": "int",
+             "default": gf.DEFAULTS["expand"], "min": 0, "max": 500},
+            {"name": "edge", "label": "Edge gate (sigma)", "type": "float",
+             "default": gf.DEFAULTS["edge"], "min": 0.0, "max": 100.0},
+            {"name": "grow", "label": "Margin (px)", "type": "int",
+             "default": gf.DEFAULTS["grow"], "min": 0, "max": 100},
+            {"name": "fit", "label": "Fit", "type": "choice",
+             "default": gf.DEFAULTS["fit"], "values": list(gf.FITS)},
+            {"name": "order", "label": "Order", "type": "int",
+             "default": gf.DEFAULTS["order"], "min": 0, "max": 6},
+            {"name": "window", "label": "Sliding window (px, 0 = whole)",
+             "type": "int", "default": gf.DEFAULTS["window"],
+             "min": 0, "max": 4096},
+            {"name": "passes", "label": "Passes", "type": "int",
+             "default": gf.DEFAULTS["passes"], "min": 1, "max": 5},
+        ],
+        "removed_label": "Removed background",
+        "validate": _validate_smart,
+        "describe": _describe_smart,
+    },
     "align_rows": {
         "label": "Align rows",
         "func": _op_align_rows,
@@ -825,6 +924,7 @@ OPERATION_ROWS = [
     ("two_way",),
     ("parachute",),
     ("plane_level", "polynomial"),
+    ("smart_level",),
     ("align_rows",),
     ("fft_filter",),
     ("destripe",),
@@ -1702,39 +1802,49 @@ class OperationDialog(tk.Toplevel):
             ttk.Label(frame, text="No parameters for this operation.").pack(side=tk.LEFT)
 
         for p in self.spec["params"]:
-            label = ttk.Label(frame, text=p["label"] + ":")
-            label.pack(side=tk.LEFT, padx=(8, 2))
-            self.param_labels[p["name"]] = label
-            if p["type"] == "int":
-                var = tk.IntVar(value=p["default"])
-                widget = ttk.Spinbox(
-                    frame, from_=p.get("min", 0), to=p.get("max", 100),
-                    width=5, textvariable=var,
-                )
-            elif p["type"] == "float":
-                var = tk.DoubleVar(value=p["default"])
-                widget = ttk.Entry(frame, textvariable=var, width=8)
-            elif p["type"] == "choice":
-                var = tk.StringVar(value=p["default"])
-                widget = ttk.Combobox(
-                    frame, textvariable=var, values=p["values"],
-                    state="readonly", width=max(len(v) for v in p["values"]) + 2,
-                )
-            elif p["type"] == "bool":
-                var = tk.BooleanVar(value=p["default"])
-                widget = ttk.Checkbutton(frame, variable=var)
-            else:
-                raise ValueError(f"Unknown param type: {p['type']}")
-            widget.pack(side=tk.LEFT)
-
-            var.trace_add("write", self._on_param_change)
-            self.vars[p["name"]] = var
-            self.param_widgets[p["name"]] = widget
+            self._make_param(frame, p)
 
         self.status_var = tk.StringVar(value="")
         self._status_label = ttk.Label(frame, textvariable=self.status_var,
                                        foreground="red")
         self._status_label.pack(side=tk.RIGHT, padx=8)
+
+    def _make_param(self, parent, p):
+        """Build the label and the widget for one parameter inside `parent`.
+
+        Kept separate from `_build_params` so a dialog with more parameters
+        than fit on one line can put them in several frames; `_show_params`
+        works either way, because packing a widget again puts it back in the
+        frame it was built in."""
+        label = ttk.Label(parent, text=p["label"] + ":")
+        label.pack(side=tk.LEFT, padx=(8, 2))
+        self.param_labels[p["name"]] = label
+        if p["type"] == "int":
+            var = tk.IntVar(value=p["default"])
+            widget = ttk.Spinbox(
+                parent, from_=p.get("min", 0), to=p.get("max", 100),
+                width=5, textvariable=var,
+            )
+        elif p["type"] == "float":
+            var = tk.DoubleVar(value=p["default"])
+            widget = ttk.Entry(parent, textvariable=var, width=8)
+        elif p["type"] == "choice":
+            var = tk.StringVar(value=p["default"])
+            widget = ttk.Combobox(
+                parent, textvariable=var, values=p["values"],
+                state="readonly", width=max(len(v) for v in p["values"]) + 2,
+            )
+        elif p["type"] == "bool":
+            var = tk.BooleanVar(value=p["default"])
+            widget = ttk.Checkbutton(parent, variable=var)
+        else:
+            raise ValueError(f"Unknown param type: {p['type']}")
+        widget.pack(side=tk.LEFT)
+
+        var.trace_add("write", self._on_param_change)
+        self.vars[p["name"]] = var
+        self.param_widgets[p["name"]] = widget
+        return widget
 
     def _show_params(self, names):
         """Show only these parameter widgets, keeping the declared order.
@@ -1891,6 +2001,139 @@ class PolynomialDialog(OperationDialog):
                 self.vars["y_order"].set(self.vars["x_order"].get())
             except tk.TclError:
                 pass
+
+
+class SmartLevelDialog(OperationDialog):
+    """
+    Background subtraction that leaves the sample out of the fit
+    (gwy_flatten, after Wang et al. 2018).
+
+    The window answers the two questions this operation raises. What was
+    called a feature? - the mask is drawn on the result as a contour. And
+    what did masking actually change? - the third panel is the difference
+    against the same fit run over every pixel, which is the ordinary
+    background subtraction sitting two buttons up. Where that panel is flat
+    the mask made no difference; where it is bright, that is the amount of
+    the sample that the ordinary fit was subtracting from itself.
+
+    The parameters are in three rows because there are three steps and they
+    fail in different ways: too much or too little threshold shows up in the
+    contour, an outline stopping short of the foot shows up as a trench
+    beside each feature, and a bad fit shows up in the background panel.
+    """
+
+    GROUPS = (
+        ("1. Find the features",
+         ("detect", "threshold", "neighbourhood", "sensitivity")),
+        ("2. Take the outline out to the foot of each one",
+         ("min_area", "expand", "edge", "grow")),
+        ("3. Fit the background to what is left",
+         ("fit", "order", "window", "passes")),
+    )
+    ADAPTIVE_ONLY = ("neighbourhood", "sensitivity")
+
+    def __init__(self, app, op_key="smart_level"):
+        self.result = None
+        super().__init__(app, op_key)
+        self.geometry("1180x700")
+
+    def _build_params(self):
+        outer = ttk.Frame(self, padding=(8, 8, 8, 0))
+        outer.pack(side=tk.TOP, fill=tk.X)
+        self.params_frame = outer
+        self.param_widgets = {}
+        self.param_labels = {}
+
+        frames = {}
+        for title, names in self.GROUPS:
+            frame = ttk.LabelFrame(outer, text=title, padding=4)
+            frame.pack(fill=tk.X, pady=(0, 4))
+            for name in names:
+                frames[name] = frame
+
+        for p in self.spec["params"]:
+            self._make_param(frames[p["name"]], p)
+
+        self.status_var = tk.StringVar(value="")
+        self._status_label = ttk.Label(outer, textvariable=self.status_var,
+                                       foreground="red", wraplength=1100)
+        self._status_label.pack(side=tk.TOP, fill=tk.X)
+
+        self.vars["threshold"].trace_add("write", lambda *a: self._sync_threshold())
+        self._sync_threshold()
+
+    def _sync_threshold(self):
+        """Otsu takes one threshold for the whole image, so the adaptive
+        neighbourhood and offset have nothing to act on."""
+        adaptive = self.vars["threshold"].get() == "adaptive"
+        for name in self.ADAPTIVE_ONLY:
+            self.param_widgets[name].state(
+                ["!disabled"] if adaptive else ["disabled"])
+
+    def _compute(self, params):
+        data = self._base_data()
+        self.result = gf.flatten(data, **_smart_kwargs(params))
+        # the same fit with nothing masked out: the ordinary levelling, kept
+        # for the comparison panel
+        self.plain = data - gf.fit_background(
+            data, np.zeros(data.shape, dtype=bool),
+            fit=params["fit"], order=params["order"], window=params["window"])
+        return self.result["data"]
+
+    def _report(self):
+        res = self.result
+        notes = [f"mask {100 * res['coverage']:.0f}% of the frame"]
+        if res["covered"] < 1.0:
+            notes.append(f"sliding fit reached {100 * res['covered']:.0f}%, "
+                         f"the rest from the whole-line fit")
+        if res["starved"] > 0:
+            notes.append(f"{100 * res['starved']:.0f}% of lines had no "
+                         f"background left and were interpolated")
+        warn = ""
+        if res["coverage"] > 0.85:
+            warn = ("  -- almost nothing is left to fit; loosen the "
+                    "threshold or check the mask.")
+        elif res["coverage"] < 0.005:
+            warn = ("  -- nothing was masked, so this is the ordinary "
+                    "background subtraction.")
+        self.status_var.set(", ".join(notes) + warn)
+        self._status_label.configure(
+            foreground="red" if warn else "#404040")
+
+    def _draw(self, result, removed):
+        app = self.app
+        extent = (0, app.x_real, 0, app.y_real)
+        self.figure.clf()
+        ax1, ax2, ax3 = self.figure.subplots(1, 3)
+
+        lo, hi = np.percentile(result, [0.5, 99.5])
+        im1 = ax1.imshow(result, origin="upper", cmap=gcm.current(),
+                         extent=extent, aspect="equal", vmin=lo, vmax=hi)
+        if self.result["mask"].any():
+            ax1.contour(self.result["mask"].astype(float), [0.5],
+                        colors="#ff30c0", linewidths=0.8, extent=extent,
+                        origin="upper")
+        ax1.set_title("Result, with the excluded area outlined")
+        ax1.set_ylabel(f"y ({app.spatial_units})")
+        self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
+
+        im2 = ax2.imshow(removed, origin="upper", cmap="viridis",
+                         extent=extent, aspect="equal")
+        ax2.set_title(self.spec["removed_label"])
+        self.figure.colorbar(im2, ax=ax2, fraction=0.046).set_label(app.z_units)
+
+        gained = result - self.plain
+        span = float(np.abs(gained).max()) or 1.0
+        im3 = ax3.imshow(gained, origin="upper", cmap="coolwarm",
+                         extent=extent, aspect="equal", vmin=-span, vmax=span)
+        ax3.set_title("What the mask changed\n(vs the same fit on every pixel)")
+        self.figure.colorbar(im3, ax=ax3, fraction=0.046).set_label(app.z_units)
+
+        for ax in (ax1, ax2, ax3):
+            ax.set_xlabel(f"x ({app.spatial_units})")
+        self.figure.tight_layout()
+        self.canvas.draw()
+        self._report()
 
 
 class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
@@ -2689,6 +2932,7 @@ class PercentileDialog(OperationDialog):
 # Dialog class to use per operation (default: OperationDialog)
 DIALOG_CLASSES = {
     "crop": CropDialog,
+    "smart_level": SmartLevelDialog,
     "polynomial": PolynomialDialog,
     "fft_filter": FFTFilterDialog,
     "destripe": DestripeDialog,
