@@ -67,6 +67,35 @@ nanobubbles never produced:
     out and the whole-image fit stands in. Nothing is damped or smoothed
     towards a guess: either the data supports the fit or it does not.
 
+A second paper,
+
+    J. Zhang, A. Biswas, J. Rade, C. Shukla, J. Ren, A. Sarkar,
+    A. Krishnamurthy and A. Balu, "Artifact Removal and Image Restoration in
+    AFM: A Structured Mask-Guided Directional Inpainting Approach",
+    arXiv:2602.04051 (2026),
+
+builds a whole pipeline - classify the scan, segment the artifacts with a
+network, inpaint them - whose flattening stage ("Smart Flatten", its section
+2.4) is the same idea as Wang's with three additions, and those three are
+here:
+
+  * the fit can run down columns as well as along rows, it can do both in
+    turn (`fit="both"`: a polynomial off every row, then one off every
+    column of what is left), and it can pick the direction itself
+    (`fit="auto"`, see `choose_direction`);
+  * regions can be excluded by hand, on top of whatever the segmentation
+    found (`exclude`). The paper is blunt about why: an automatic mask does
+    not always cover a step edge or an unusual structure, and one that is
+    left in bends the baseline. In the GUI this is a rectangle dragged on
+    the image.
+
+Its remaining pieces are not here, because this module already does the same
+job better or is not trying to do it at all: its exclusion mask is a global
+`|z - mean| > k*sigma` threshold plus a dilation, its fallback for a scan
+line with too few background pixels is to subtract that line's median, and
+the rest of the paper - the ResNet classifier, the segmentation network and
+the Telea inpainting - is about repairing artifacts rather than levelling.
+
 The contour expansion is also not the paper's. Wang et al. evolve an active
 contour under the image's gradient field, with two coefficients that set how
 continuous and how smooth the contour stays. Here the mask instead grows one
@@ -96,7 +125,7 @@ DEFAULTS = {
     "edge": 1.0,               # gradient gate, in robust sigmas
     "grow": 2,                 # plain margin added afterwards, px
     "min_area": 0.05,          # smallest feature kept, % of the frame
-    "fit": "rows",             # rows / columns / surface
+    "fit": "rows",             # rows / columns / both / surface / auto
     "order": 3,                # polynomial order
     "window": 0,               # sliding window, px (0 = whole line/image)
     "passes": 1,               # times to look for the features
@@ -104,7 +133,8 @@ DEFAULTS = {
 
 DETECT = ("convex", "concave", "both")
 THRESHOLDS = ("adaptive", "otsu")
-FITS = ("rows", "columns", "surface")
+FITS = ("rows", "columns", "both", "surface", "auto")
+LINES = ("rows", "columns")   # the fits that are one polynomial per scan line
 
 EDGE_SIGMA = 1.5    # smoothing of the gradient field used by the expansion, px
 MIN_FILL = 0.15     # share of a window that must be background for it to count
@@ -374,7 +404,9 @@ def _terms(fit, order):
         return [(i, total - i)
                 for total in range(order + 1)
                 for i in range(total, -1, -1)]
-    raise ValueError(f"unknown fit {fit!r}, expected one of {list(FITS)}")
+    # `both` and `auto` are resolved by `fit_background` and never arrive here
+    raise ValueError(f"unknown fit {fit!r}, expected one of "
+                     f"{list(LINES) + ['surface']}")
 
 
 def _window_shape(fit, window):
@@ -633,6 +665,84 @@ def _sliding_background(data, weight, fit, order, window):
     return background, covered
 
 
+def _line_jitter(data, mask=None):
+    """
+    How far each line sits from the one before it, beyond what the noise in
+    the lines themselves would explain. Robust: a straight tilt gives zero,
+    because the step from line to line is then the same every time.
+    """
+    values = np.asarray(data, dtype=float)
+    if mask is not None:
+        values = np.where(np.asarray(mask, dtype=bool), np.nan, values)
+    counts = np.isfinite(values).sum(axis=1)
+    ok = counts > 0
+    if int(ok.sum()) < 3:
+        return 0.0
+    level = np.nanmedian(values[ok], axis=1)
+    seen = _robust_sigma(np.diff(level))
+
+    # A median of n points has a standard error of sqrt(pi/2) * sigma / sqrt(n)
+    # and this is the difference of two of them, so even lines that are
+    # perfectly aligned show this much jitter. Subtracting it in quadrature is
+    # what makes the two directions comparable when the image is not square,
+    # or when one direction is noisier than the other. `sigma` comes from the
+    # pixel-to-pixel difference along the line, whose spread is sqrt(2) sigma.
+    noise = _robust_sigma(np.diff(values[ok], axis=1)) / np.sqrt(2.0)
+    floor = np.sqrt(np.pi / 2.0) * noise * np.sqrt(2.0 / max(1.0,
+                                                            float(np.median(counts[ok]))))
+    return float(np.sqrt(max(0.0, seen ** 2 - floor ** 2)))
+
+
+def choose_direction(data, mask=None):
+    """
+    Which way the scan lines run, measured rather than assumed.
+
+    Zhang et al. pick the fitting direction from "the dominant slope
+    direction". Taken literally that is the wrong statistic: a smooth tilt is
+    removed just as well by a fit along rows as by one down columns, so the
+    slope says nothing about which to choose. What only a line-by-line fit
+    can remove is the part of the background that is *incoherent* between
+    neighbouring lines - the offset the z scanner has drifted to by the time
+    it starts the next line, and which no smooth surface can follow. That
+    lands between lines along the slow axis, and it is removed by fitting
+    along the fast one.
+
+    So the two directions are compared on exactly that quantity: the spread
+    of the step from one line to the next, with the part of it that the noise
+    inside the lines already accounts for taken back out (`_line_jitter`).
+    Whichever direction shows more of it is the direction the scan lines run,
+    and the one to fit along. A tie means neither is drifting relative to the
+    other, in which case the background is smooth and either fit will follow
+    it - the choice does not matter, and it goes to `rows`.
+
+    Args:
+        data (np.ndarray): A 2D image.
+        mask (np.ndarray): Optional foreground mask, whose pixels are left
+            out of the measurement.
+
+    Returns:
+        str: `rows` or `columns`.
+    """
+    data = np.asarray(data, dtype=float)
+    mask = None if mask is None else np.asarray(mask, dtype=bool)
+    across = _line_jitter(data, mask)
+    down = _line_jitter(data.T, None if mask is None else mask.T)
+    return "rows" if across >= down else "columns"
+
+
+def _fit_once(data, weight, fit, order, window):
+    """One fit in one direction: the whole-line (or whole-image) polynomial,
+    with the sliding window laid over it wherever the window reached."""
+    background = _global_background(data, weight, fit, order)
+    covered = 1.0
+    if window and int(window) > 1:
+        local, reach = _sliding_background(data, weight, fit, order,
+                                           int(window))
+        covered = float(reach.mean())
+        background = np.where(reach, local, background)
+    return background, covered
+
+
 def fit_background(data, mask, fit=DEFAULTS["fit"], order=DEFAULTS["order"],
                    window=DEFAULTS["window"], report=None):
     """
@@ -642,32 +752,46 @@ def fit_background(data, mask, fit=DEFAULTS["fit"], order=DEFAULTS["order"],
         data (np.ndarray): A 2D image.
         mask (np.ndarray): Boolean; True where the image is foreground and
             must be kept out of the fit.
-        fit (str): `rows` (a polynomial along each scan line, the paper's
-            curve fitting), `columns` (the same down each column) or
-            `surface` (one polynomial over the whole image).
+        fit (str): `rows` (a polynomial along each scan line, Wang's curve
+            fitting), `columns` (the same down each column), `both` (rows and
+            then columns, Zhang's two-step), `surface` (one polynomial over
+            the whole image) or `auto` (rows or columns, whichever
+            `choose_direction` measures).
         order (int): Polynomial order.
         window (int): Sliding window in pixels; 0 fits each line, or the
             image, in one piece.
         report (dict): Optional; filled with `covered`, the fraction of the
-            image the sliding fit could reach.
+            image the sliding fit could reach, and `fit`, the direction
+            actually used once `auto` has been resolved.
 
     Returns:
         np.ndarray: The fitted background, the same shape as `data`.
     """
     data = np.asarray(data, dtype=float)
-    weight = (~np.asarray(mask, dtype=bool)).astype(float)
+    mask = np.asarray(mask, dtype=bool)
+    weight = (~mask).astype(float)
     if fit not in FITS:
         raise ValueError(f"unknown fit {fit!r}, expected one of {list(FITS)}")
 
-    background = _global_background(data, weight, fit, order)
-    covered = 1.0
-    if window and int(window) > 1:
-        local, reach = _sliding_background(data, weight, fit, order,
-                                           int(window))
-        covered = float(reach.mean())
-        background = np.where(reach, local, background)
+    if fit == "auto":
+        fit = choose_direction(data, mask)
+
+    if fit == "both":
+        # Every row levelled, then every column of what that leaves. The
+        # second fit sees no row-to-row drift, so what it removes is the
+        # column-to-column part - the drift a single line fit cannot reach,
+        # at the price of the sample being fitted around twice.
+        first, covered = _fit_once(data, weight, "rows", order, window)
+        second, again = _fit_once(data - first, weight, "columns", order,
+                                  window)
+        background = first + second
+        covered = min(covered, again)
+    else:
+        background, covered = _fit_once(data, weight, fit, order, window)
+
     if report is not None:
         report["covered"] = covered
+        report["fit"] = fit
     return background
 
 
@@ -733,7 +857,7 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
             edge=DEFAULTS["edge"], grow=DEFAULTS["grow"],
             min_area=DEFAULTS["min_area"], fit=DEFAULTS["fit"],
             order=DEFAULTS["order"], window=DEFAULTS["window"],
-            passes=DEFAULTS["passes"]):
+            passes=DEFAULTS["passes"], exclude=None):
     """
     Segment the foreground, fit the background to what is left, subtract it.
 
@@ -774,43 +898,75 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
     rows or as a surface, which is the only defensible answer, since which
     features are on the sample is a fact about the sample.
 
+    `exclude` is the other paper's contribution: an area the caller already
+    knows does not belong in the background - a step edge, a piece of debris,
+    a structure the threshold has no reason to recognise - marked by hand and
+    added to the mask. It is kept out of the seed as well as out of the final
+    fit, so it cannot bend the image the features are looked for on either.
+
     Args:
         data (np.ndarray): A 2D image.
         detect, threshold, neighbourhood, sensitivity, expand, edge, grow,
         min_area: Passed to `segment_foreground`.
         fit, order, window: Passed to `fit_background`.
         passes (int): How many times to look for the features.
+        exclude (np.ndarray): Optional boolean mask, True on pixels to keep
+            out of the fit whatever the segmentation decides about them.
 
     Returns:
         dict: With `data` (the flattened image), `background` (what was
-        subtracted), `mask` (the foreground of the last pass), `coverage`
-        (the fraction of the frame it holds), `covered` (the fraction the
-        sliding fit reached; 1.0 when no window is used) and `starved` (the
-        fraction of scan lines the mask left no background on).
+        subtracted), `mask` (the foreground of the last pass, `exclude`
+        included), `coverage` (the fraction of the frame it holds), `covered`
+        (the fraction the sliding fit reached; 1.0 when no window is used),
+        `starved` (the fraction of scan lines the mask left no background on)
+        and `fit` (the direction used, which is the answer when `auto` was
+        asked for).
     """
     data = np.asarray(data, dtype=float)
     mask = np.zeros(data.shape, dtype=bool)
     report = {"covered": 1.0}
 
+    if exclude is not None:
+        exclude = np.asarray(exclude, dtype=bool)
+        if exclude.shape != data.shape:
+            raise ValueError(f"exclude is {exclude.shape}, image is "
+                             f"{data.shape}")
+        if not exclude.any():
+            exclude = None
+
+    # Resolved here rather than inside the fit so that the seed, the fit and
+    # the report all speak of the same direction.
+    if fit == "auto":
+        fit = choose_direction(data, exclude)
+
     for step in range(max(1, int(passes))):
+        known = mask if step else np.zeros(data.shape, dtype=bool)
+        if exclude is not None:
+            known = known | exclude
         # only ever used to find the features, never returned
-        seed = seed_background(data, fit, mask if step else None)
+        seed = seed_background(data, fit, known if known.any() else None)
         mask = segment_foreground(
             data - seed, detect=detect, threshold=threshold,
             neighbourhood=neighbourhood, sensitivity=sensitivity,
             expand=expand, edge=edge, grow=grow, min_area=min_area,
         )
+        if exclude is not None:
+            mask = mask | exclude
 
     background = fit_background(data, mask, fit=fit, order=order,
                                 window=window, report=report)
 
-    axis = 0 if fit == "columns" else 1
-    starved = float(np.mean((~mask).sum(axis=axis) == 0))
+    free = ~mask
+    starved = max(float(np.mean(free.sum(axis=1) == 0))
+                  if fit in ("rows", "both") else 0.0,
+                  float(np.mean(free.sum(axis=0) == 0))
+                  if fit in ("columns", "both") else 0.0)
     return {
         "data": data - background,
         "background": background,
         "mask": mask,
         "coverage": float(mask.mean()),
         "covered": report["covered"],
-        "starved": 0.0 if fit == "surface" else starved,
+        "starved": starved,
+        "fit": fit,
     }

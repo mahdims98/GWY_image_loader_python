@@ -14,7 +14,10 @@ Provides an interactive Tkinter application to:
         bubbles or pits are segmented first and excluded, so the fit
         cannot bend itself around them and leave the trenches and
         uneven surfaces that ordinary levelling does; after Wang et
-        al., Beilstein J. Nanotechnol. 2018, 9, 975
+        al., Beilstein J. Nanotechnol. 2018, 9, 975. The direction can
+        be picked by the scan itself, rows and columns can be done in
+        turn, and areas the threshold has no way of recognising can be
+        dragged out by hand; after Zhang et al., arXiv:2602.04051
       * Align rows: median of differences / polynomial (align_rows)
       * Percentile range clipping (filter_by_percentile), re-editable:
         a clip opened right after another one edits that same step, so
@@ -130,8 +133,37 @@ def _smart_kwargs(params):
     )
 
 
+def _exclusion_mask(shape, rects, dx, dy):
+    """Rectangles dragged on the preview, as a boolean mask.
+
+    They are carried in the parameters - and so into the pipeline, the log
+    and any replay - in physical units, like the FFT dialog's notches, so
+    they still mean the same part of the sample if the pixel size changes.
+    Images are drawn with origin='upper', so y counts up from the bottom of
+    the extent while row 0 is at the top."""
+    ny, nx = shape
+    mask = np.zeros(shape, dtype=bool)
+    for rect in rects or ():
+        x0, x1, y0, y1 = (float(v) for v in rect)
+        ix0 = max(0, int(np.floor(min(x0, x1) / dx)))
+        ix1 = min(nx, int(np.ceil(max(x0, x1) / dx)))
+        iy0 = max(0, int(np.floor(ny - max(y0, y1) / dy)))
+        iy1 = min(ny, int(np.ceil(ny - min(y0, y1) / dy)))
+        if ix1 > ix0 and iy1 > iy0:
+            mask[iy0:iy1, ix0:ix1] = True
+    return mask
+
+
+def _smart_flatten(data, params, dx, dy):
+    """The whole `gwy_flatten` result, so the dialog can show the mask and
+    the direction `auto` settled on; the operation itself keeps the image."""
+    exclude = _exclusion_mask(data.shape, params.get("exclude"), dx, dy)
+    return gf.flatten(data, exclude=exclude if exclude.any() else None,
+                      **_smart_kwargs(params))
+
+
 def _op_smart_level(data, params, dx, dy):
-    return gf.flatten(data, **_smart_kwargs(params))["data"]
+    return _smart_flatten(data, params, dx, dy)["data"]
 
 
 def _validate_smart(params):
@@ -155,12 +187,18 @@ def _validate_smart(params):
 
 def _describe_smart(params):
     where = {"rows": "along rows", "columns": "down columns",
-             "surface": "as a surface"}[params.get("fit", "rows")]
+             "both": "along rows then down columns",
+             "surface": "as a surface",
+             "auto": "along whichever way the scan lines run"}.get(
+                 params.get("fit", "rows"), "?")
     window = params.get("window", 0)
+    drawn = len(params.get("exclude") or ())
     return (f"{params.get('threshold', '?')}/{params.get('detect', '?')} mask, "
             f"order {params.get('order', 0)} {where}"
             + (f", {window}px window" if window else "")
-            + f", {params.get('passes', 1)} passes")
+            + f", {params.get('passes', 1)} passes"
+            + (f", {drawn} area{'s' if drawn > 1 else ''} excluded by hand"
+               if drawn else ""))
 
 
 def _op_align_rows(data, params, dx, dy):
@@ -1898,6 +1936,13 @@ class OperationDialog(tk.Toplevel):
         the image from before that step."""
         return self.app.data
 
+    def _toolbar_busy(self):
+        """True while the navigation toolbar's pan or zoom tool is armed, so
+        a dialog that reads clicks on its own panels can stay out of the way
+        of one that is only meant to move the view."""
+        toolbar = getattr(self.canvas, "toolbar", None)
+        return toolbar is not None and getattr(toolbar, "mode", "")
+
     def _compute(self, params):
         """Run the operation on the base image."""
         return self.spec["func"](self._base_data(), params,
@@ -2020,6 +2065,14 @@ class SmartLevelDialog(OperationDialog):
     fail in different ways: too much or too little threshold shows up in the
     contour, an outline stopping short of the foot shows up as a trench
     beside each feature, and a bad fit shows up in the background panel.
+
+    A fourth row is the manual override from Zhang et al.: DRAG on the result
+    panel to exclude that rectangle from the fit whatever the threshold
+    thinks of it, and right-click one to take it back. It is there for what a
+    threshold has no way of recognising - a step edge, a piece of debris, the
+    corner where the tip crashed - and it feeds the segmentation too, not
+    only the fit, so the excluded area cannot bend the image the features are
+    looked for on either.
     """
 
     GROUPS = (
@@ -2034,8 +2087,11 @@ class SmartLevelDialog(OperationDialog):
 
     def __init__(self, app, op_key="smart_level"):
         self.result = None
+        self.excluded = []           # [x0, x1, y0, y1] in physical units
+        self._area_selector = None
         super().__init__(app, op_key)
-        self.geometry("1180x700")
+        self.geometry("1180x760")
+        self.canvas.mpl_connect("button_press_event", self._on_click)
 
     def _build_params(self):
         outer = ttk.Frame(self, padding=(8, 8, 8, 0))
@@ -2054,6 +2110,18 @@ class SmartLevelDialog(OperationDialog):
         for p in self.spec["params"]:
             self._make_param(frames[p["name"]], p)
 
+        hand = ttk.LabelFrame(outer, text="4. Anything the threshold missed",
+                              padding=4)
+        hand.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(hand, text="Drag on the result panel to keep an area out "
+                             "of the fit; right-click one to take it back.").pack(
+            side=tk.LEFT, padx=(8, 2))
+        self.excluded_var = tk.StringVar(value="none")
+        ttk.Label(hand, textvariable=self.excluded_var).pack(side=tk.LEFT,
+                                                             padx=(8, 2))
+        ttk.Button(hand, text="Clear", command=self.clear_excluded).pack(
+            side=tk.LEFT, padx=8)
+
         self.status_var = tk.StringVar(value="")
         self._status_label = ttk.Label(outer, textvariable=self.status_var,
                                        foreground="red", wraplength=1100)
@@ -2070,25 +2138,100 @@ class SmartLevelDialog(OperationDialog):
             self.param_widgets[name].state(
                 ["!disabled"] if adaptive else ["disabled"])
 
+    # ---- areas excluded by hand ----
+
+    def get_params(self):
+        params = super().get_params()
+        if params is not None:
+            params["exclude"] = [list(r) for r in self.excluded]
+        return params
+
+    def clear_excluded(self):
+        self.excluded = []
+        self.update_preview()
+
+    def _attach_area_selector(self, ax):
+        """Drag-to-exclude on the result panel. Re-created on every draw
+        (the figure was cleared)."""
+        try:
+            self._area_selector = RectangleSelector(
+                ax, self._on_area_select, useblit=True, button=[1],
+                props=dict(fill=False, edgecolor="#ffd000", linestyle="--"),
+            )
+        except TypeError:
+            # Older matplotlib uses `rectprops`
+            self._area_selector = RectangleSelector(
+                ax, self._on_area_select, useblit=True, button=[1],
+                rectprops=dict(fill=False, edgecolor="#ffd000",
+                               linestyle="--"),
+            )
+
+    def _on_area_select(self, eclick, erelease):
+        if self._toolbar_busy():
+            return
+        coords = (eclick.xdata, erelease.xdata, eclick.ydata, erelease.ydata)
+        if any(c is None for c in coords):
+            return
+        x0, x1 = sorted(coords[:2])
+        y0, y1 = sorted(coords[2:])
+        if (x1 - x0) < 2 * self.app.dx or (y1 - y0) < 2 * self.app.dy:
+            return              # a click, not a drag
+        self.excluded.append([x0, x1, y0, y1])
+        self.update_preview()
+
+    def _on_click(self, event):
+        """Right-click takes back the area under the pointer, or if there is
+        none there, the nearest one."""
+        if event.button != 3 or event.inaxes is None or self._toolbar_busy():
+            return
+        if not self.excluded or event.xdata is None or event.ydata is None:
+            return
+        x, y = event.xdata, event.ydata
+        inside = [i for i, (x0, x1, y0, y1) in enumerate(self.excluded)
+                  if x0 <= x <= x1 and y0 <= y <= y1]
+        if inside:
+            # the smallest one, so a rectangle drawn inside another is
+            # reachable
+            pick = min(inside, key=lambda i: ((self.excluded[i][1]
+                                               - self.excluded[i][0])
+                                              * (self.excluded[i][3]
+                                                 - self.excluded[i][2])))
+        else:
+            pick = min(range(len(self.excluded)),
+                       key=lambda i: np.hypot(
+                           (self.excluded[i][0] + self.excluded[i][1]) / 2 - x,
+                           (self.excluded[i][2] + self.excluded[i][3]) / 2 - y))
+        del self.excluded[pick]
+        self.update_preview()
+
     def _compute(self, params):
         data = self._base_data()
-        self.result = gf.flatten(data, **_smart_kwargs(params))
+        self.result = _smart_flatten(data, params, self.app.dx, self.app.dy)
         # the same fit with nothing masked out: the ordinary levelling, kept
-        # for the comparison panel
+        # for the comparison panel. `auto` has settled on a direction by now,
+        # so the comparison is between the same two fits.
         self.plain = data - gf.fit_background(
             data, np.zeros(data.shape, dtype=bool),
-            fit=params["fit"], order=params["order"], window=params["window"])
+            fit=self.result["fit"], order=params["order"],
+            window=params["window"])
         return self.result["data"]
 
     def _report(self):
         res = self.result
         notes = [f"mask {100 * res['coverage']:.0f}% of the frame"]
+        if self.vars["fit"].get() == "auto":
+            notes.append(f"the scan lines run {res['fit']}, so the fit went "
+                         f"that way")
         if res["covered"] < 1.0:
             notes.append(f"sliding fit reached {100 * res['covered']:.0f}%, "
                          f"the rest from the whole-line fit")
         if res["starved"] > 0:
             notes.append(f"{100 * res['starved']:.0f}% of lines had no "
                          f"background left and were interpolated")
+        self.excluded_var.set(
+            "none" if not self.excluded
+            else f"{len(self.excluded)} area"
+                 f"{'s' if len(self.excluded) > 1 else ''} excluded by hand")
         warn = ""
         if res["coverage"] > 0.85:
             warn = ("  -- almost nothing is left to fit; loosen the "
@@ -2113,8 +2256,12 @@ class SmartLevelDialog(OperationDialog):
             ax1.contour(self.result["mask"].astype(float), [0.5],
                         colors="#ff30c0", linewidths=0.8, extent=extent,
                         origin="upper")
+        for x0, x1, y0, y1 in self.excluded:
+            ax1.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
+                                    edgecolor="#ffd000", lw=1.2))
         ax1.set_title("Result, with the excluded area outlined")
         ax1.set_ylabel(f"y ({app.spatial_units})")
+        self._attach_area_selector(ax1)
         self.figure.colorbar(im1, ax=ax1, fraction=0.046).set_label(app.z_units)
 
         im2 = ax2.imshow(removed, origin="upper", cmap="viridis",
@@ -2267,10 +2414,6 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
 
     def _redraw_zoom_source(self):
         self.update_preview()
-
-    def _toolbar_busy(self):
-        toolbar = getattr(self.canvas, "toolbar", None)
-        return toolbar is not None and getattr(toolbar, "mode", "")
 
     def _on_click(self, event):
         """Press handler: remember left presses (to tell clicks from

@@ -8,7 +8,7 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 
 * **`gwy_loader.py`**: A pure Python module for parsing and reading `.gwy` files. It extracts data fields, metadata, physical dimensions, and SI units.
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
-* **`gwy_flatten.py`**: Background subtraction that leaves the sample out of the fit — the cells, bubbles or pits are segmented and excluded first, so the polynomial cannot bend itself around them and leave trenches and uneven surfaces behind. After Wang et al. (2018), with the paper's sliding-window fit in closed form.
+* **`gwy_flatten.py`**: Background subtraction that leaves the sample out of the fit — the cells, bubbles or pits are segmented and excluded first, so the polynomial cannot bend itself around them and leave trenches and uneven surfaces behind. After Wang et al. (2018), with the paper's sliding-window fit in closed form; the fitting direction can be measured from the scan and areas can be excluded by hand, after Zhang et al. (2026).
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
 * **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
 * **`gwy_colormaps.py`**: Gwyddion's false-colour gradients (`Gray`, `Sky`, `Body`, `Rainbow2`, `Viridis`, ... 60 in all) as matplotlib colormaps, plus the application-wide selection used by the GUI.
@@ -87,11 +87,13 @@ adds a plain margin afterwards and `min_area` drops specks.
 
 **3. Fit what is left** (`fit_background`). `rows` fits a polynomial along each
 scan line (the paper's curve fitting), `columns` does the same down each column,
-`surface` fits one polynomial over the whole image. Masked pixels are simply not
-in the least-squares problem. `rows` is the default and is usually right: drift
-is slow compared with a scan line, so it lands between lines rather than along
-them, and only a per-line fit can take it out — the paper reaches the same
-conclusion by rotating an image 90° and watching the flattening get worse.
+`both` does one and then the other, `surface` fits one polynomial over the whole
+image, and `auto` measures which way the scan lines run and follows them. Masked
+pixels are simply not in the least-squares problem. `rows` is the default and is
+usually right: drift is slow compared with a scan line, so it lands between
+lines rather than along them, and only a per-line fit can take it out — the
+paper reaches the same conclusion by rotating an image 90° and watching the
+flattening get worse.
 
 Setting `window` above 0 switches on the paper's sliding-window fit (SWCF/SWSF)
 for backgrounds too complicated for one polynomial. A window of that many pixels
@@ -165,6 +167,65 @@ disagreement to exactly nothing across all 18 scans. Which features are on the
 sample is a fact about the sample, and should not change with how you intend to
 remove the background.
 
+#### The direction, and areas you exclude by hand
+
+A second paper describes a whole pipeline — classify the scan, segment the
+artifacts with a network, inpaint them — whose flattening stage is the same idea
+as Wang's with three additions:
+
+> J. Zhang, A. Biswas, J. Rade, C. Shukla, J. Ren, A. Sarkar, A. Krishnamurthy
+> and A. Balu, *Artifact Removal and Image Restoration in AFM: A Structured
+> Mask-Guided Directional Inpainting Approach*,
+> [arXiv:2602.04051](https://arxiv.org/abs/2602.04051) (2026).
+
+Those three are here; the rest of it is not (its exclusion mask is a global
+`|z − mean| > kσ` threshold plus a dilation, its fallback for a line with too
+few background pixels is that line's median, and its classifier, segmentation
+network and Telea inpainting are about repairing artifacts rather than
+levelling).
+
+**`fit="auto"` measures which way the scan lines run** (`choose_direction`). The
+paper picks the direction from "the dominant slope direction"; taken literally
+that is the wrong statistic, because a smooth tilt is removed just as well
+either way, so the slope cannot decide between them. What only a line-by-line
+fit can remove is the part of the background that is *incoherent* between
+neighbouring lines — the offset the scanner has drifted to by the time it starts
+the next one. So that is what is measured: the spread of the step from one line
+to the next, with the part of it the noise inside the lines already explains
+subtracted back out, compared both ways. It picks `rows` on all 18 test scans
+and `columns` on every one of them transposed.
+
+Worth having, because the wrong direction is not a small loss. Over 17 scans
+(the 18th is 99 % cells and has no background left for anything to work with),
+medians:
+
+| `fit` | background rms | feature height above the substrate beside it |
+| --- | --- | --- |
+| `rows` | 5.74 nm | 3.19 nm |
+| `columns` | 42.74 nm | 0.14 nm |
+| `both` | 5.31 nm | 2.95 nm |
+
+Fitting these scans down columns leaves seven times the background roughness
+*and* wipes 96 % of the feature height, because a column crossing a cell has to
+interpolate across it and the polynomial that does so passes through the cell.
+
+**`fit="both"`** is the paper's two-step: a polynomial off every row, then one
+off every column of what is left. The second fit sees no row-to-row drift, so
+what it removes is the column-to-column part, which a single line fit cannot
+reach. It costs what the table shows — 5 % less background roughness for 3 % of
+the feature height on median, but as much as half of it on one scan — so it is
+not the default. Use it when there is genuine drift both ways, and watch the
+third panel of the dialog while you do.
+
+**`exclude`** is a mask, or in the GUI a rectangle dragged on the image, that is
+kept out of the fit whatever the threshold thinks of it: a step edge, a piece of
+debris, the corner where the tip crashed — anything a threshold has no way of
+recognising. It is fed to the seed as well as to the final fit, so the excluded
+area cannot bend the image the features are looked for on either. On a synthetic
+scan with a trench across every line and `detect="convex"` (which cannot see a
+pit), the fitted background follows the trench 26 nm away from the truth;
+marking it by hand brings that to 0.26 nm.
+
 **Nothing here rescales z.** The result is `data - background`, a subtraction,
 so a height measured on the result is the height that was measured on the
 sample. Multiplying the input by three multiplies the output by exactly three,
@@ -190,9 +251,13 @@ where it is bright, that is how much of the sample the ordinary fit was
 subtracting from itself. Underneath, the mask's share of the frame is reported,
 with a warning if almost nothing is left to fit, if nothing was masked at all,
 or if any scan lines had no background left and had to be interpolated from
-their neighbours.
+their neighbours. A fourth row of controls covers the manual exclusion: **drag
+on the result panel** to keep that rectangle out of the fit, right-click one to
+take it back. The rectangles are carried in physical units, so they survive into
+the pipeline, the log and a batch replay.
 
 ```python
+import numpy as np
 import gwy_flatten as gf
 
 result = gf.flatten(image, threshold="otsu", detect="convex",
@@ -200,6 +265,12 @@ result = gf.flatten(image, threshold="otsu", detect="convex",
 flat = result["data"]          # the levelled image
 result["mask"]                 # what was kept out of the fit
 result["coverage"]             # how much of the frame that was
+
+# let the scan choose the direction, and exclude a corner by hand
+corner = np.zeros(image.shape, dtype=bool)
+corner[:64, :64] = True
+result = gf.flatten(image, fit="auto", exclude=corner)
+result["fit"]                  # "rows" or "columns", whichever it measured
 ```
 
 ### Stripe Removal (`gwy_destripe.py`)
