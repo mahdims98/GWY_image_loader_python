@@ -13,10 +13,14 @@ Provides an interactive Qt application to:
         bubbles or pits are segmented first and excluded, so the fit
         cannot bend itself around them and leave the trenches and
         uneven surfaces that ordinary levelling does; after Wang et
-        al., Beilstein J. Nanotechnol. 2018, 9, 975. The direction can
+        al., Beilstein J. Nanotechnol. 2018, 9, 975. What counts as
+        sample is decided by either of two height thresholds or by the
+        3D viewer's segmentation (gwy_segment) - the frame walled off
+        along its own edges, which finds an object whose parts sit at
+        different heights whole. The direction can
         be picked by the scan itself, rows and columns can be done in
-        turn, and areas the threshold has no way of recognising can be
-        dragged out by hand; after Zhang et al., arXiv:2602.04051
+        turn, and areas the segmentation has no way of recognising can
+        be dragged out by hand; after Zhang et al., arXiv:2602.04051
       * Align rows: median of differences / polynomial (align_rows)
       * Percentile range clipping (filter_by_percentile), re-editable:
         a clip opened right after another one edits that same step, so
@@ -996,6 +1000,25 @@ class SmartLevelDialog(OperationDialog):
     contour, an outline stopping short of the foot shows up as a trench
     beside each feature, and a bad fit shows up in the background panel.
 
+    "Find by" chooses between three ways of deciding what a feature is, and
+    the first row changes with it - the settings of a route that is not
+    running are greyed out rather than left there to be adjusted to no
+    effect. `shape` is the 3D viewer's segmentation (gwy_segment): it walls
+    the frame off along its own edges and keeps the patches that are large
+    and smooth, so an object whose parts sit at different heights comes out
+    whole instead of cut at the height a threshold happened to be set to.
+    Three settings drive it - the scale the edges are measured at, how
+    strong a rim has to be, and how much smoother than the frame a patch has
+    to be - and it has no `Features` setting, because a rim is a rim whether
+    it goes up or down. It encloses the whole sample, which is what a
+    segmentation should do and not always what a fit can live with, so watch
+    the coverage the window reports: on a scan whose sample covers the frame
+    it will say so, and there is then nothing left to fit through.
+
+    `Smoothness` is the one to reach for when the contour looks inverted -
+    it is what decides which side of a boundary is the sample, and it starts
+    out assuming the sample is the smooth thing on a textured field.
+
     A fourth row is the manual override from Zhang et al.: DRAG on the result
     panel to exclude that rectangle from the fit whatever the threshold
     thinks of it, and right-click one to take it back. It is there for what a
@@ -1009,13 +1032,25 @@ class SmartLevelDialog(OperationDialog):
 
     GROUPS = (
         ("1. Find the features",
-         ("detect", "threshold", "feature_size", "neighbourhood",
-          "sensitivity")),
+         ("detect", "threshold", "detail", "edge_level", "smoothness",
+          "feature_size", "neighbourhood", "sensitivity")),
         ("2. Take the outline out to the foot of each one",
          ("min_area", "expand", "edge", "grow")),
         ("3. Fit the background to what is left",
          ("fit", "order", "window", "passes")),
     )
+    #: Which of the first group belong to which route. Everything named here
+    #: is greyed out when another route is chosen, so the window always shows
+    #: what is actually being used - the settings of a route that is not
+    #: running are the ones people change and then wonder at.
+    BY_THRESHOLD = {
+        "shape": ("detail", "edge_level", "smoothness"),
+        "adaptive": ("detect", "neighbourhood", "sensitivity"),
+        "otsu": ("detect", "feature_size"),
+    }
+    # The same thing said the other way round, for the routes that need to be
+    # named one at a time.
+    SHAPE_ONLY = ("detail", "edge_level", "smoothness")
     ADAPTIVE_ONLY = ("neighbourhood", "sensitivity")
     OTSU_ONLY = ("feature_size",)
 
@@ -1046,7 +1081,7 @@ class SmartLevelDialog(OperationDialog):
         self.excluded_var.trace_add(
             lambda: excluded.setText(self.excluded_var.get()))
         self._layout.addWidget(gq.group(
-            "4. Anything the threshold missed",
+            "4. Anything the segmentation missed",
             gq.row(QtWidgets.QLabel(
                 "Drag on the result panel to keep an area out of the fit; "
                 "right-click one to take it back."),
@@ -1063,14 +1098,18 @@ class SmartLevelDialog(OperationDialog):
         self._sync_threshold()
 
     def _sync_threshold(self):
-        """Otsu takes one threshold for the whole image, so the adaptive
-        neighbourhood and offset have nothing to act on - and the other way
-        round for the blur the single threshold is taken on."""
-        adaptive = self.vars["threshold"].get() == "adaptive"
-        for name in self.ADAPTIVE_ONLY:
-            self.param_widgets[name].setEnabled(adaptive)
-        for name in self.OTSU_ONLY:
-            self.param_widgets[name].setEnabled(not adaptive)
+        """Show only the settings the chosen route actually reads.
+
+        The three routes share nothing below the combo box: Otsu takes one
+        threshold for the whole image, so the adaptive neighbourhood and
+        offset have nothing to act on; the other way round for the blur the
+        single threshold is taken on; and the outlines read neither, nor
+        `Features`, since a rim tells a pit and a bump apart from the field
+        without telling them apart from each other."""
+        wanted = self.BY_THRESHOLD.get(self.vars["threshold"].get(), ())
+        for names in self.BY_THRESHOLD.values():
+            for name in names:
+                self.param_widgets[name].setEnabled(name in wanted)
 
     # ---- areas excluded by hand ----
 

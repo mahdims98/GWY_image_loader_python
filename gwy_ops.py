@@ -63,6 +63,9 @@ def _smart_kwargs(params):
     return dict(
         detect=str(params.get("detect", gf.DEFAULTS["detect"])),
         threshold=str(params.get("threshold", gf.DEFAULTS["threshold"])),
+        detail=float(params.get("detail", gf.DEFAULTS["detail"])),
+        edge_level=float(params.get("edge_level", gf.DEFAULTS["edge_level"])),
+        smoothness=float(params.get("smoothness", gf.DEFAULTS["smoothness"])),
         feature_size=float(params.get("feature_size",
                                       gf.DEFAULTS["feature_size"])),
         neighbourhood=float(params.get("neighbourhood",
@@ -103,10 +106,14 @@ def _exclusion_mask(shape, rects, dx, dy):
 
 def _smart_flatten(data, params, dx, dy):
     """The whole `gwy_flatten` result, so the dialog can show the mask and
-    the direction `auto` settled on; the operation itself keeps the image."""
+    the direction `auto` settled on; the operation itself keeps the image.
+
+    The pixel size goes through as well as the rectangles: the shape route
+    measures its filters in fractions of the frame, and a scan whose pixels
+    are not square needs a different number of them along each axis."""
     exclude = _exclusion_mask(data.shape, params.get("exclude"), dx, dy)
     return gf.flatten(data, exclude=exclude if exclude.any() else None,
-                      **_smart_kwargs(params))
+                      dx=dx, dy=dy, **_smart_kwargs(params))
 
 
 def _op_smart_level(data, params, dx, dy):
@@ -119,6 +126,12 @@ def _validate_smart(params):
                 "it. Choose convex or concave, or use the adaptive threshold.")
     if not 0.0 < params.get("feature_size", 1.0) <= 100.0:
         return "The feature size is a percentage of the image, above 0"
+    if not 0.0 < params.get("detail", 1.0) <= 100.0:
+        return "The edge scale is a percentage of the frame, above 0"
+    if params.get("edge_level", 0.0) < 0:
+        return "The wall level cannot be negative"
+    if params.get("smoothness", 0.0) < 0:
+        return "The smoothness cannot be negative (0 turns the test off)"
     if not 0.0 < params["neighbourhood"] <= 100.0:
         return "The neighbourhood is a percentage of the image, above 0"
     if params["sensitivity"] <= 0:
@@ -142,7 +155,12 @@ def _describe_smart(params):
                  params.get("fit", "rows"), "?")
     window = params.get("window", 0)
     drawn = len(params.get("exclude") or ())
-    return (f"{params.get('threshold', '?')}/{params.get('detect', '?')} mask, "
+    # `detect` says nothing about a mask the outlines found - it is not asked
+    # for, and printing it would read as a claim that only bumps were taken.
+    found = ("shape mask" if params.get("threshold") == "shape"
+             else f"{params.get('threshold', '?')}/"
+                  f"{params.get('detect', '?')} mask")
+    return (f"{found}, "
             f"order {params.get('order', 0)} {where}"
             + (f", {window}px window" if window else "")
             + f", {params.get('passes', 1)} passes"
@@ -638,6 +656,14 @@ OPERATIONS = {
              "default": gf.DEFAULTS["detect"], "values": list(gf.DETECT)},
             {"name": "threshold", "label": "Find by", "type": "choice",
              "default": gf.DEFAULTS["threshold"], "values": list(gf.THRESHOLDS)},
+            {"name": "detail", "label": "Edge scale (%)", "type": "float",
+             "default": gf.DEFAULTS["detail"], "min": 0.0, "max": 100.0},
+            {"name": "edge_level", "label": "Wall level (sigma)",
+             "type": "float", "default": gf.DEFAULTS["edge_level"],
+             "min": 0.0, "max": 100.0},
+            {"name": "smoothness", "label": "Smoothness (x frame)",
+             "type": "float", "default": gf.DEFAULTS["smoothness"],
+             "min": 0.0, "max": 10.0},
             {"name": "feature_size", "label": "Feature size (%)",
              "type": "float", "default": gf.DEFAULTS["feature_size"],
              "min": 0.0, "max": 100.0},

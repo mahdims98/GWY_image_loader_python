@@ -37,6 +37,75 @@ in two steps:
      the paper's curve fitting), along each column, or over the whole image
      at once (`fit="surface"`).
 
+
+Finding the features by shape instead of by height
+--------------------------------------------------
+
+Both of the paper's thresholds ask the same question - is this pixel high?
+- and that question has a wrong answer on any object whose parts sit at
+different levels, which is most real samples. An object tilted in the scan,
+an object with a dip in its middle, two objects of the same kind on an
+uneven substrate: one threshold takes a bite out of every one of them, and
+the bite it takes is put back into the background fit. The levelling this
+module exists to do is then bent by exactly the features it was trying to
+leave out.
+
+`threshold="shape"` asks a different question, and it is the question
+`gwy_segment` - the segmentation behind the 3D viewer - was written to
+answer. It never looks at a height. It looks at where the height *changes*:
+the gradient is large along the rim of an object and small anywhere the
+surface is merely smooth, whatever level that smooth surface sits at, so
+thresholding it gives a set of walls, the frame is divided by those walls
+into patches, and a patch is a feature when it is large enough and smoother
+inside than the frame is on average. A watershed then hands each feature
+the half of its rim that faces it, so an object keeps its own flank and its
+neighbour keeps the other.
+
+Because no height is consulted, two objects of the same kind at different
+levels are found equally well, and that is the case a single threshold
+cannot survive. Put two discs on a textured field, one 3 nm up and one 90:
+the outlines return both of them entire, while Otsu - which has to put its
+one cut somewhere - keeps the tall one and loses every pixel of the short
+one, and the adaptive threshold loses it too. Neither is misbehaving. There
+is simply no height that separates a 3 nm disc from the substrate and a
+90 nm disc from the same substrate at the same time, and the whole of the
+lost disc then goes into the background fit.
+
+Three things to know before choosing it.
+
+  * Nothing about it knows which way is up, so a pit is found by the same
+    rim that finds a bump and `detect` has nothing to select between. It is
+    ignored when this route is in use.
+  * `smoothness` decides which side of a boundary is the sample, and it
+    starts out assuming the sample is the smooth thing on a textured field.
+    That is a fact about a specimen and not about specimens; on a substrate
+    rougher than what lies on it the assumption is the wrong way round, and
+    raising the setting past 1 swaps the two over. It is the one control
+    here that repays a look at the contour before the result is trusted.
+  * It answers what a segmentation should answer and not what a fit needs
+    to hear, and the difference matters. Its job is to enclose the whole
+    sample; a fit's need is for whatever is left over to be enough to fit
+    through. Over 30 of the scans here it marked more than 85 % of the
+    frame on 20 and left at least one scan line with no background at all
+    on 23, against 10 and 11 for Otsu and none for the adaptive threshold -
+    not because it was wrong, but because on these samples the cells really
+    do cover the frame. That is why it is offered rather than assumed:
+    `otsu` is still the default.
+
+`threshold="adaptive"` and `threshold="otsu"` are unchanged. A local median
+is the cheaper answer on a frame of nanobubbles all at one level, and
+Otsu's single split is what handles a feature so large the local median
+follows it.
+
+Three settings drive the shape route, against the thirteen `gwy_segment`
+offers its own editor. The ten it is not given are fixed at that module's
+defaults, and they are of two kinds: the ones about telling one object from
+another, which a background fit never asks since it only ever wants the
+union, and the ones belonging to the two detectors that are not run.
+`gwy_segment` also looks for thin ridges and for small raised specks; a
+background fit wants the things that have area, and anything with a rim is
+already walled off by the outlines.
+
 The second step has a sliding-window form for backgrounds too complicated
 for one polynomial (the paper's SWCF and SWSF). A window of `window` pixels
 is stepped one pixel at a time; at each position a polynomial is fitted to
@@ -114,11 +183,15 @@ import numpy as np
 from scipy import ndimage
 
 import gwy_balance as gb
+import gwy_segment as gs
 
 # Defaults, shared with the GUI so both agree on what the buttons mean.
 DEFAULTS = {
-    "detect": "convex",        # which features to exclude
+    "detect": "convex",        # which features to exclude (not for `shape`)
     "threshold": "otsu",       # how the first outline is found
+    "detail": gs.DEFAULTS["detail"],          # shape: edge scale, % of frame
+    "edge_level": gs.DEFAULTS["edge_level"],  # shape: wall level, robust sigmas
+    "smoothness": gs.DEFAULTS["smoothness"],  # shape: patch against the frame
     "feature_size": 3.0,       # otsu blur, % of the shorter side
     "neighbourhood": 25.0,     # adaptive window, % of the shorter side
     "sensitivity": 3.0,        # threshold offset, in robust sigmas
@@ -133,7 +206,7 @@ DEFAULTS = {
 }
 
 DETECT = ("convex", "concave", "both")
-THRESHOLDS = ("adaptive", "otsu")
+THRESHOLDS = ("shape", "adaptive", "otsu")
 FITS = ("rows", "columns", "both", "surface", "auto")
 LINES = ("rows", "columns")   # the fits that are one polynomial per scan line
 
@@ -327,6 +400,86 @@ def expand_contour(data, mask, steps=DEFAULTS["expand"],
     return mask
 
 
+def _square_side(min_area, x_real, y_real):
+    """
+    A smallest-feature area, as the side of the square of that area.
+
+    This module measures a size as a share of the frame's *area*, because
+    that is what a fit cares about - how much of the image a feature takes
+    away from it. `gwy_segment` measures every size as a length, a share of
+    the frame's longer side, because its filters are convolutions and a
+    convolution has a width. The two say the same thing about the same
+    feature, and this is where one is turned into the other.
+    """
+    frame = max(x_real, y_real)
+    if frame <= 0.0:
+        return 0.0
+    side = float(np.sqrt(max(0.0, min_area) / 100.0 * x_real * y_real))
+    return 100.0 * side / frame
+
+
+def outline_mask(data, detail=DEFAULTS["detail"],
+                 edge_level=DEFAULTS["edge_level"],
+                 smoothness=DEFAULTS["smoothness"],
+                 min_area=DEFAULTS["min_area"], dx=None, dy=None):
+    """
+    Mark the features by their outlines, without looking at their heights.
+
+    The work is `gwy_segment.find_outlines`, reached through
+    `gwy_segment.segment`; the module docstring above says why an edge is a
+    better boundary than a height, and that module's says how the edges are
+    found and how a patch is judged. What is decided here is only what to
+    ask it for.
+
+    One detector, and no separation of one object from the next: a fit never
+    asks which object a pixel belongs to, only whether it belongs to one, so
+    everything `gwy_segment` does to tell two touching objects apart is work
+    whose answer would be thrown away. What comes back is the union of the
+    regions - which is also why `detect` has nothing to select here. The
+    outlines find a pit by the same rim that finds a bump.
+
+    Args:
+        data (np.ndarray): A 2D image.
+        detail (float): The scale the edges are measured at, as a percentage
+            of the frame - roughly the width of the thinnest rim worth
+            seeing. Larger ignores fine texture and rounds off corners.
+        edge_level (float): How far above the frame's typical edge strength
+            a rim has to be, in robust sigmas. Lower walls off more.
+        smoothness (float): A patch is a feature when its own edge strength
+            is below this multiple of the frame's median - when it is
+            smoother than the frame is on average. This is the setting that
+            decides which side of a boundary is the sample, and it is worth
+            knowing which way round: it assumes the sample is the smooth
+            thing and the field is the textured one. On a substrate rougher
+            than what lies on it, raise it past 1 to swap the two over. 0
+            turns the test off and keeps every patch that is large enough,
+            which on any real scan is the whole frame.
+        min_area (float): Smallest feature kept, as a percentage of the
+            frame.
+        dx, dy (float): Pixel size. Only their ratio matters, and it matters
+            whenever the pixels are not square - a scan of 1024 x 512 pixels
+            over a square frame needs a filter twice as wide in one
+            direction as the other. Without them the frame is measured in
+            pixels, which is right for a square-pixel scan and wrong by that
+            ratio for any other.
+
+    Returns:
+        np.ndarray: A boolean mask, True on the foreground.
+    """
+    data = np.asarray(data, dtype=float)
+    ny, nx = data.shape
+    x_real = nx * float(dx) if dx else float(nx)
+    y_real = ny * float(dy) if dy else float(ny)
+    found = gs.segment(
+        data, x_real, y_real, methods=("outline",),
+        detail=float(detail), edge_level=float(edge_level),
+        smoothness=float(smoothness),
+        min_size=_square_side(min_area, x_real, y_real),
+        separate=0.0,
+    )
+    return found.mask()
+
+
 def segment_foreground(data, detect=DEFAULTS["detect"],
                        threshold=DEFAULTS["threshold"],
                        neighbourhood=DEFAULTS["neighbourhood"],
@@ -334,32 +487,48 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
                        expand=DEFAULTS["expand"], edge=DEFAULTS["edge"],
                        grow=DEFAULTS["grow"],
                        min_area=DEFAULTS["min_area"],
-                       feature_size=DEFAULTS["feature_size"]):
+                       feature_size=DEFAULTS["feature_size"],
+                       detail=DEFAULTS["detail"],
+                       edge_level=DEFAULTS["edge_level"],
+                       smoothness=DEFAULTS["smoothness"],
+                       dx=None, dy=None):
     """
     Mark everything that is sample rather than background.
 
-    Threshold, drop the specks, push each outline out to the foot of its
-    feature, fill what is enclosed, and add a margin. Holes are filled after
-    the expansion as well as before it: a dip in the middle of a cell is
-    still cell, and letting the fit see it would put a piece of the sample
-    back into the background.
+    Find the features, drop the specks, push each outline out to the foot of
+    its feature, fill what is enclosed, and add a margin. Holes are filled
+    after the expansion as well as before it: a dip in the middle of a cell
+    is still cell, and letting the fit see it would put a piece of the
+    sample back into the background.
+
+    The expansion is worth having whichever route found the features, and
+    for slightly different reasons. A threshold cuts a bump partway up its
+    flank and stops short of the foot. The shape route stops on the crest of
+    the rim, which is the steepest point of the flank rather than its end.
+    Both leave the foot of the feature outside the mask, and the foot is the
+    worst thing a background fit can be given.
 
     Args:
         data (np.ndarray): A 2D image.
-        detect (str): `convex`, `concave` or `both`.
-        threshold (str): `adaptive` (local mean, see `adaptive_threshold`)
-            or `otsu` (one threshold for the whole image, on a heavily
-            smoothed copy - the split that works on images whose features
-            are large, such as cells).
+        detect (str): `convex`, `concave` or `both`. Ignored by the `shape`
+            route, which finds a pit by the same rim that finds a bump.
+        threshold (str): `shape` (patches walled off by the image's own
+            edges - see `outline_mask` and the module docstring),
+            `adaptive` (local median, see `adaptive_threshold`) or `otsu`
+            (one threshold for the whole image, on a heavily smoothed copy -
+            the split that works on images whose features are large, such as
+            cells).
+        detail, edge_level, smoothness: Passed to `outline_mask`; unused
+            unless `threshold` is `shape`.
         neighbourhood, sensitivity: Passed to `adaptive_threshold`; unused
-            when `threshold` is `otsu`.
+            unless `threshold` is `adaptive`.
         expand, edge: Passed to `expand_contour`.
         grow (int): Plain dilation applied at the end, in pixels.
         min_area (float): Smallest feature kept, as a percentage of the
             frame.
         feature_size (float): How much the image is blurred before the
             single `otsu` threshold, as a percentage of the shorter side;
-            unused when `threshold` is `adaptive`. One threshold for the
+            unused unless `threshold` is `otsu`. One threshold for the
             whole image has to be taken on a smoothed copy, or the texture
             of the sample splits instead of the sample, and this sets that
             scale. It also sets the finest shape the mask can take, because
@@ -369,6 +538,8 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
             1.00, the difference being background swallowed at the corners.
             Lower it to follow real edges and catch thin structure, raise it
             to ignore texture and keep only the large features.
+        dx, dy (float): Pixel size, for the `shape` route; see
+            `outline_mask`.
 
     Returns:
         np.ndarray: A boolean mask, True on the foreground.
@@ -381,20 +552,27 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
         raise ValueError(f"unknown detect {detect!r}, expected one of "
                          f"{list(DETECT)}")
 
-    if threshold == "otsu":
-        blur = max(1e-6, feature_size / 100.0)
-        above = gb.segment_cells(data, cell_fraction=blur,
-                                 min_area=min_area / 100.0)
-        below = gb.segment_cells(-data, cell_fraction=blur,
-                                 min_area=min_area / 100.0)
+    if threshold == "shape":
+        # One mask rather than a convex one and a concave one, and `detect`
+        # left out of it: the outlines cannot tell a bump from a pit, so
+        # they return both and there is nothing to choose between.
+        parts = [outline_mask(data, detail, edge_level, smoothness, min_area,
+                              dx, dy)]
     else:
-        above, below = adaptive_threshold(data, neighbourhood, sensitivity)
+        if threshold == "otsu":
+            blur = max(1e-6, feature_size / 100.0)
+            above = gb.segment_cells(data, cell_fraction=blur,
+                                     min_area=min_area / 100.0)
+            below = gb.segment_cells(-data, cell_fraction=blur,
+                                     min_area=min_area / 100.0)
+        else:
+            above, below = adaptive_threshold(data, neighbourhood, sensitivity)
 
-    parts = []
-    if detect in ("convex", "both"):
-        parts.append(above)
-    if detect in ("concave", "both"):
-        parts.append(below)
+        parts = []
+        if detect in ("convex", "both"):
+            parts.append(above)
+        if detect in ("concave", "both"):
+            parts.append(below)
 
     mask = np.zeros(data.shape, dtype=bool)
     for part in parts:
@@ -899,7 +1077,9 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
             min_area=DEFAULTS["min_area"], fit=DEFAULTS["fit"],
             order=DEFAULTS["order"], window=DEFAULTS["window"],
             passes=DEFAULTS["passes"], exclude=None,
-            feature_size=DEFAULTS["feature_size"]):
+            feature_size=DEFAULTS["feature_size"],
+            detail=DEFAULTS["detail"], edge_level=DEFAULTS["edge_level"],
+            smoothness=DEFAULTS["smoothness"], dx=None, dy=None):
     """
     Segment the foreground, fit the background to what is left, subtract it.
 
@@ -949,7 +1129,8 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
     Args:
         data (np.ndarray): A 2D image.
         detect, threshold, neighbourhood, sensitivity, expand, edge, grow,
-        min_area, feature_size: Passed to `segment_foreground`.
+        min_area, feature_size, detail, edge_level, smoothness, dx, dy:
+            Passed to `segment_foreground`.
         fit, order, window: Passed to `fit_background`.
         passes (int): How many times to look for the features.
         exclude (np.ndarray): Optional boolean mask, True on pixels to keep
@@ -992,7 +1173,8 @@ def flatten(data, detect=DEFAULTS["detect"], threshold=DEFAULTS["threshold"],
             data - seed, detect=detect, threshold=threshold,
             neighbourhood=neighbourhood, sensitivity=sensitivity,
             expand=expand, edge=edge, grow=grow, min_area=min_area,
-            feature_size=feature_size,
+            feature_size=feature_size, detail=detail, edge_level=edge_level,
+            smoothness=smoothness, dx=dx, dy=dy,
         )
         if exclude is not None:
             mask = mask | exclude
