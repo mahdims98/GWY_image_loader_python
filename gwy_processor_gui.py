@@ -1,8 +1,7 @@
-
 """
 GUI front-end for gwy_processing.py
 
-Provides an interactive Tkinter application to:
+Provides an interactive Qt application to:
   - Load Gwyddion (.gwy) files via gwy_loader and select a channel
   - Apply processing steps from gwy_processing, each in its own dialog
     window with a live preview of the result AND the removed component:
@@ -62,29 +61,32 @@ the state they are edited through. What the steps *are* - the operations,
 their parameters, their validation and the sentences that describe them -
 lives in gwy_ops, and getting a result back out lives in gwy_export. Neither
 of those imports a GUI toolkit, so a batch script can replay a pipeline
-without a screen and a front end written in something else would start from
-them unchanged.
+without a screen.
+
+The toolkit is Qt, through qtpy, which is the same binding the 3D viewer and
+the segmentation window use - so all of this program's windows are now one
+kind of window, and a channel can be sent from here to a GPU surface view
+without leaving the process. What Qt does not offer in the shape these
+dialogs want - an observable value that tolerates being typed into, a
+restartable debounce timer, a window that says whether it is still open -
+is in gwy_qt.
 
 Run with:  python gwy_processor_gui.py
 """
 
 import os
 import re
+import sys
 import threading
 import traceback
 from datetime import datetime
 
 import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+
+import gwy_qt as gq
+from gwy_qt import QtCore, QtWidgets
 
 import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import (
-    FigureCanvasTkAgg,
-    NavigationToolbar2Tk,
-)
-from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import RectangleSelector, SpanSelector
 
@@ -106,12 +108,16 @@ from gwy_export import (
     render_annotated_figure, save_channel_to_gwy, save_pure_image,
 )
 
+APP_NAME = "GWY Processor"
+
+GWY_FILTER = "Gwyddion files (*.gwy);;All files (*)"
+
 
 # ---------------------------------------------------------------------------
 # Zoom on a selected area (shared by the dialogs that preview images)
 # ---------------------------------------------------------------------------
 
-class ZoomWindow(tk.Toplevel):
+class ZoomWindow(gq.ToolWindow):
     """A large side-by-side view of one region of the previewed images, so
     small features can be inspected close up. The region is picked by
     dragging a rectangle on one panel of the parent dialog; until one is
@@ -120,16 +126,14 @@ class ZoomWindow(tk.Toplevel):
     update and display-leveling change."""
 
     def __init__(self, dialog, source="Forward"):
-        super().__init__(dialog)
-        self.title(f"Zoom - drag a rectangle on the {source} panel "
-                   "to pick the area")
-        self.geometry("1500x600")
-        self.figure = Figure(figsize=(15, 5.4), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        super().__init__(dialog,
+                         f"Zoom - drag a rectangle on the {source} panel "
+                         "to pick the area", (1500, 600))
+        self.figure, self.canvas, toolbar = gq.figure_panel(self, (15, 5.4))
+        self.setLayout(gq.column(self.canvas, toolbar))
+        self.show()
 
-    def show(self, panels, extent, subtitle, z_units):
+    def show_panels(self, panels, extent, subtitle, z_units):
         """panels: [(title, image), ...], all the same shape."""
         self.figure.clf()
         axes = np.atleast_1d(self.figure.subplots(1, len(panels),
@@ -150,7 +154,7 @@ class ZoomWindow(tk.Toplevel):
         self.canvas.draw()
 
 
-class DestripeSweepWindow(tk.Toplevel):
+class DestripeSweepWindow(gq.ToolWindow):
     """
     A grid of stripe-removal results over two chosen parameters, for finding
     the setting that takes the stripes out without eating the structures.
@@ -193,14 +197,13 @@ class DestripeSweepWindow(tk.Toplevel):
                     "DESTRIPE": ("cvar_k", "min_run")}
 
     def __init__(self, dialog):
-        super().__init__(dialog)
+        super().__init__(dialog, "Stripe removal parameter sweep - "
+                                 "click a cell to use its values",
+                         (1250, 900))
         self.dialog = dialog
         self.app = dialog.app
-        self.title("Stripe removal parameter sweep - "
-                   "click a cell to use its values")
-        self.geometry("1250x900")
 
-        self._after_id = None
+        self._timer = gq.Timer(self, self._step)
         self._tasks = []
         self._cells = {}            # axes -> ((name, value), (name, value))
         self._vlim = None
@@ -209,80 +212,84 @@ class DestripeSweepWindow(tk.Toplevel):
         self._specs = {p["name"]: p
                        for p in OPERATIONS[dialog.op_key]["params"]}
 
-        self._build_controls()
-        self.figure = Figure(figsize=(12, 8), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        self.figure, self.canvas, toolbar = gq.figure_panel(self, (12, 8))
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.setLayout(gq.column(self._build_controls(), self.canvas, toolbar,
+                                 margins=(8, 8, 8, 6)))
         self.sync_method()
         self.status_var.set("Press Run to compute the grid")
+        self.show()
 
     # ---- controls ----
 
     def _build_controls(self):
-        top = ttk.Frame(self, padding=(8, 8, 8, 0))
-        top.pack(side=tk.TOP, fill=tk.X)
-        bottom = ttk.Frame(self, padding=(8, 4, 8, 6))
-        bottom.pack(side=tk.TOP, fill=tk.X)
-
-        self.row_var = tk.StringVar()
-        self.col_var = tk.StringVar()
-        self.row_step_var = tk.DoubleVar(value=2.0)
-        self.col_step_var = tk.DoubleVar(value=2.0)
-        self.row_mode_var = tk.StringVar(value="x")
-        self.col_mode_var = tk.StringVar(value="x")
-        self.link_var = tk.BooleanVar(value=True)
-        self.size_var = tk.IntVar(value=3)
-        self.zoom_var = tk.BooleanVar(value=True)
+        self.row_var = gq.StringVar()
+        self.col_var = gq.StringVar()
+        self.row_step_var = gq.FloatVar(2.0)
+        self.col_step_var = gq.FloatVar(2.0)
+        self.row_mode_var = gq.StringVar("x")
+        self.col_mode_var = gq.StringVar("x")
+        self.link_var = gq.BoolVar(True)
+        self.size_var = gq.IntVar(3)
+        self.zoom_var = gq.BoolVar(True)
         try:
             iters = int(self.dialog.vars["iterations"].get())
-        except (tk.TclError, KeyError):
+        except (gq.VarError, KeyError):
             iters = gd.GSR_DEFAULTS["iterations"]
-        self.iter_var = tk.IntVar(value=iters)
+        self.iter_var = gq.IntVar(iters)
 
-        ttk.Label(top, text="Rows:").pack(side=tk.LEFT)
-        self.row_combo = ttk.Combobox(top, textvariable=self.row_var, width=20,
-                                      state="readonly")
-        self.row_combo.pack(side=tk.LEFT, padx=(2, 6))
-        ttk.Label(top, text="step").pack(side=tk.LEFT)
-        ttk.Label(top, textvariable=self.row_mode_var,
-                  width=2).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Entry(top, textvariable=self.row_step_var,
-                  width=6).pack(side=tk.LEFT, padx=(0, 16))
+        self.row_combo = QtWidgets.QComboBox()
+        self.row_combo.setMinimumWidth(150)
+        gq.bind_combo(self.row_combo, self.row_var)
+        self.col_combo = QtWidgets.QComboBox()
+        self.col_combo.setMinimumWidth(150)
+        gq.bind_combo(self.col_combo, self.col_var)
 
-        ttk.Label(top, text="Columns:").pack(side=tk.LEFT)
-        self.col_combo = ttk.Combobox(top, textvariable=self.col_var, width=20,
-                                      state="readonly")
-        self.col_combo.pack(side=tk.LEFT, padx=(2, 6))
-        ttk.Label(top, text="step").pack(side=tk.LEFT)
-        ttk.Label(top, textvariable=self.col_mode_var,
-                  width=2).pack(side=tk.LEFT, padx=(4, 0))
-        self.col_step_entry = ttk.Entry(top, textvariable=self.col_step_var,
-                                        width=6)
-        self.col_step_entry.pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Checkbutton(top, text="Same rate", variable=self.link_var,
-                        command=self._sync_link).pack(side=tk.LEFT)
+        row_mode = gq.label()
+        self.row_mode_var.trace_add(
+            lambda: row_mode.setText(self.row_mode_var.get()))
+        col_mode = gq.label()
+        self.col_mode_var.trace_add(
+            lambda: col_mode.setText(self.col_mode_var.get()))
 
-        ttk.Label(bottom, text="Grid:").pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Spinbox(bottom, from_=2, to=5, width=3,
-                    textvariable=self.size_var).pack(side=tk.LEFT)
-        self._iter_frame = ttk.Frame(bottom)
-        ttk.Label(self._iter_frame, text="Iterations:").pack(side=tk.LEFT,
-                                                             padx=(12, 2))
-        ttk.Entry(self._iter_frame, textvariable=self.iter_var,
-                  width=7).pack(side=tk.LEFT)
-        self._zoom_check = ttk.Checkbutton(bottom, text="Zoom area only",
-                                           variable=self.zoom_var)
-        self._zoom_check.pack(side=tk.LEFT, padx=12)
-        ttk.Button(bottom, text="Run", command=self.run).pack(side=tk.LEFT)
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT,
-                                                             padx=12)
+        row_step = gq.bind_edit(QtWidgets.QLineEdit(), self.row_step_var)
+        row_step.setFixedWidth(60)
+        self.col_step_entry = gq.bind_edit(QtWidgets.QLineEdit(),
+                                           self.col_step_var)
+        self.col_step_entry.setFixedWidth(60)
+        link = gq.bind_check(QtWidgets.QCheckBox("Same rate"), self.link_var)
+        link.toggled.connect(lambda *_a: self._sync_link())
 
-        self.row_var.trace_add("write", lambda *a: self._on_axis_change("row"))
-        self.col_var.trace_add("write", lambda *a: self._on_axis_change("col"))
-        self.row_step_var.trace_add("write", lambda *a: self._mirror_step())
+        top = gq.row(
+            QtWidgets.QLabel("Rows:"), self.row_combo,
+            QtWidgets.QLabel("step"), row_mode, row_step,
+            16,
+            QtWidgets.QLabel("Columns:"), self.col_combo,
+            QtWidgets.QLabel("step"), col_mode, self.col_step_entry,
+            link, stretch_at_end=True)
+
+        size = QtWidgets.QSpinBox()
+        size.setRange(2, 5)
+        gq.bind_spin(size, self.size_var)
+        self._iter_label = QtWidgets.QLabel("Iterations:")
+        self._iter_entry = gq.bind_edit(QtWidgets.QLineEdit(), self.iter_var)
+        self._iter_entry.setFixedWidth(70)
+        self._zoom_check = gq.bind_check(
+            QtWidgets.QCheckBox("Zoom area only"), self.zoom_var)
+        self.status_var = gq.StringVar("")
+        status = gq.label()
+        self.status_var.trace_add(lambda: status.setText(self.status_var.get()))
+
+        bottom = gq.row(QtWidgets.QLabel("Grid:"), size,
+                        self._iter_label, self._iter_entry,
+                        self._zoom_check,
+                        gq.button("Run", self.run), status,
+                        stretch_at_end=True)
+
+        self.row_var.trace_add(lambda: self._on_axis_change("row"))
+        self.col_var.trace_add(lambda: self._on_axis_change("col"))
+        self.row_step_var.trace_add(self._mirror_step)
+        return gq.column(top, bottom)
 
     def _label(self, name):
         return self._specs.get(name, {}).get("label", name)
@@ -300,8 +307,8 @@ class DestripeSweepWindow(tk.Toplevel):
         row, col = self.DEFAULT_AXES.get(method, tuple(names[:2]))
         self._syncing = True
         try:
-            self.row_combo["values"] = list(self._names)
-            self.col_combo["values"] = list(self._names)
+            gq.set_items(self.row_combo, list(self._names), keep=False)
+            gq.set_items(self.col_combo, list(self._names), keep=False)
             self.row_var.set(self._label(row))
             self.col_var.set(self._label(col))
         finally:
@@ -311,12 +318,12 @@ class DestripeSweepWindow(tk.Toplevel):
 
         # only GSR has an iteration count, and it is worth lowering for a
         # sweep without disturbing the dialog
-        self._iter_frame.pack_forget()
+        for widget in (self._iter_label, self._iter_entry):
+            widget.setVisible(method == "GSR")
         if method == "GSR":
-            self._iter_frame.pack(side=tk.LEFT, before=self._zoom_check)
             try:                        # start from the dialog's count
                 self.iter_var.set(int(self.dialog.vars["iterations"].get()))
-            except (tk.TclError, KeyError):
+            except (gq.VarError, KeyError):
                 pass
         return True
 
@@ -365,7 +372,7 @@ class DestripeSweepWindow(tk.Toplevel):
         if not same:
             self.link_var.set(False)
         linked = same and self.link_var.get()
-        self.col_step_entry.state(["disabled"] if linked else ["!disabled"])
+        self.col_step_entry.setEnabled(not linked)
         self._mirror_step()
 
     def _mirror_step(self):
@@ -374,7 +381,7 @@ class DestripeSweepWindow(tk.Toplevel):
         self._syncing = True
         try:
             self.col_step_var.set(self.row_step_var.get())
-        except tk.TclError:
+        except gq.VarError:
             pass
         finally:
             self._syncing = False
@@ -405,9 +412,7 @@ class DestripeSweepWindow(tk.Toplevel):
 
     def run(self):
         """(Re)start the sweep with the current settings."""
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-            self._after_id = None
+        self._timer.cancel()
         self.sync_method()
         params = self.dialog.get_params()
         if params is None:
@@ -425,7 +430,7 @@ class DestripeSweepWindow(tk.Toplevel):
             n = max(2, min(5, int(self.size_var.get())))
             steps = {row: float(self.row_step_var.get()),
                      col: float(self.col_step_var.get())}
-        except tk.TclError:
+        except gq.VarError:
             return
         for name, step in steps.items():
             if self.SWEEP_STEPS[name][0] == "mul" and step <= 1.0:
@@ -438,7 +443,7 @@ class DestripeSweepWindow(tk.Toplevel):
         if self._method == "GSR":
             try:
                 params["iterations"] = max(1, int(self.iter_var.get()))
-            except tk.TclError:
+            except gq.VarError:
                 pass
 
         self._row, self._col = row, col
@@ -480,7 +485,7 @@ class DestripeSweepWindow(tk.Toplevel):
         self._axes = axes
         self._tasks = [(i, j) for i in range(n) for j in range(n)]
         self._data = data
-        self._after_id = self.after(10, self._step)
+        self._timer.start(10)
 
     def _crop(self, image):
         if self._slices is None:
@@ -490,14 +495,13 @@ class DestripeSweepWindow(tk.Toplevel):
 
     def _step(self):
         """Compute and draw one cell, then queue the next."""
-        self._after_id = None
         if not self._tasks:
             self.status_var.set("Done - click a cell to use its values")
             return
         i, j = self._tasks.pop(0)
         total = len(self._row_values) * len(self._col_values)
         self.status_var.set(f"Computing {total - len(self._tasks)}/{total} ...")
-        self.update_idletasks()
+        gq.process_events()
 
         op = OPERATIONS[self.dialog.op_key]
         params = dict(self._params)
@@ -516,7 +520,7 @@ class DestripeSweepWindow(tk.Toplevel):
                       cmap=gcm.current(), extent=self._extent(),
                       aspect="equal", vmin=self._vlim[0], vmax=self._vlim[1])
         self.canvas.draw()
-        self._after_id = self.after(1, self._step)
+        self._timer.start(1)
 
     def _extent(self):
         app = self.app
@@ -548,16 +552,14 @@ class DestripeSweepWindow(tk.Toplevel):
                     var.set(int(value))
                 else:
                     var.set(round(float(value), 6))
-        except tk.TclError:
+        except gq.VarError:
             return
         self.status_var.set("Using " + ", ".join(f"{n}={v:.4g}"
                                                  for n, v in cell))
 
-    def destroy(self):
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-            self._after_id = None
-        super().destroy()
+    def closeEvent(self, event):
+        self._timer.cancel()
+        super().closeEvent(event)
 
 
 class ZoomAreaMixin:
@@ -594,10 +596,10 @@ class ZoomAreaMixin:
 
     def open_zoom_window(self):
         """Open (or raise) the large zoom view of the selected area."""
-        if self._zoom_win is None or not self._zoom_win.winfo_exists():
+        if not gq.is_open(self._zoom_win):
             self._zoom_win = ZoomWindow(self, self.ZOOM_SOURCE)
         else:
-            self._zoom_win.lift()
+            self._zoom_win.raise_window()
         self._update_zoom_window()
 
     def _attach_zoom_selector(self, ax):
@@ -658,7 +660,7 @@ class ZoomAreaMixin:
                 edgecolor="red", lw=1.2))
 
     def _update_zoom_window(self):
-        if self._zoom_win is None or not self._zoom_win.winfo_exists():
+        if not gq.is_open(self._zoom_win):
             return
         panels = self._zoom_panels()
         if panels is None:
@@ -680,21 +682,53 @@ class ZoomAreaMixin:
             where = (f"area {cols.stop - cols.start}x{rows.stop - rows.start}"
                      f" px at ({extent[0]:.3g}, {extent[2]:.3g}) "
                      f"{self.app.spatial_units}")
-        self._zoom_win.show([(t, img) for (t, _), img in zip(panels, images)],
-                            extent, f"{where}{tag}", self.app.z_units)
+        self._zoom_win.show_panels(
+            [(t, img) for (t, _), img in zip(panels, images)],
+            extent, f"{where}{tag}", self.app.z_units)
 
-    def destroy(self):
-        win = getattr(self, "_zoom_win", None)
-        if win is not None and win.winfo_exists():
-            win.destroy()
-        super().destroy()
+    def closeEvent(self, event):
+        if gq.is_open(getattr(self, "_zoom_win", None)):
+            self._zoom_win.close()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
 # Operation dialog with live preview
 # ---------------------------------------------------------------------------
 
-class OperationDialog(tk.Toplevel):
+def param_widget(p):
+    """The value and the widget for one parameter declared in gwy_ops.
+
+    Four kinds, and the type in the declaration picks which. A float gets a
+    plain text box rather than a spin box on purpose: the ranges here span
+    orders of magnitude and are typed, not clicked, and a text box is the one
+    widget that lets a value be half-written - `gwy_qt.Var` keeps the
+    half-written text and reports it as invalid until it parses.
+    """
+    if p["type"] == "int":
+        var = gq.IntVar(p["default"])
+        widget = QtWidgets.QSpinBox()
+        widget.setRange(int(p.get("min", 0)), int(p.get("max", 100)))
+        widget.setFixedWidth(76)
+        gq.bind_spin(widget, var)
+    elif p["type"] == "float":
+        var = gq.FloatVar(p["default"])
+        widget = gq.bind_edit(QtWidgets.QLineEdit(), var)
+        widget.setFixedWidth(84)
+    elif p["type"] == "choice":
+        var = gq.StringVar(p["default"])
+        widget = QtWidgets.QComboBox()
+        widget.addItems([str(v) for v in p["values"]])
+        gq.bind_combo(widget, var)
+    elif p["type"] == "bool":
+        var = gq.BoolVar(p["default"])
+        widget = gq.bind_check(QtWidgets.QCheckBox(), var)
+    else:
+        raise ValueError(f"Unknown param type: {p['type']}")
+    return var, widget
+
+
+class OperationDialog(gq.ToolWindow):
     """
     A per-operation window: parameter widgets on top, a live preview of
     the processed result and of the removed component below, and
@@ -705,108 +739,86 @@ class OperationDialog(tk.Toplevel):
     """
 
     PREVIEW_DEBOUNCE_MS = 400
+    SIZE = (1050, 560)
+    FIGSIZE = (10, 4.2)
 
     def __init__(self, app, op_key):
-        super().__init__(app)
+        self.spec = OPERATIONS[op_key]
+        super().__init__(app, self.spec["label"], self.SIZE)
         self.app = app
         self.op_key = op_key
-        self.spec = OPERATIONS[op_key]
-        self.title(self.spec["label"])
-        self.geometry("1050x560")
 
-        self._after_id = None
+        self._timer = gq.Timer(self, self.update_preview)
         self.vars = {}
 
+        self._layout = QtWidgets.QVBoxLayout(self)
         self._build_params()
         self._build_figure()
         self._build_buttons()
 
         self.update_preview()
+        self.show()
 
     # ---- UI construction ----
 
     def _build_params(self):
-        frame = ttk.Frame(self, padding=8)
-        frame.pack(side=tk.TOP, fill=tk.X)
-        self.params_frame = frame
+        self.params_layout = QtWidgets.QHBoxLayout()
         self.param_widgets = {}
         self.param_labels = {}
 
         if not self.spec["params"]:
-            ttk.Label(frame, text="No parameters for this operation.").pack(side=tk.LEFT)
+            self.params_layout.addWidget(
+                QtWidgets.QLabel("No parameters for this operation."))
 
         for p in self.spec["params"]:
-            self._make_param(frame, p)
+            self._make_param(self.params_layout, p)
+        self.params_layout.addStretch(1)
+        self._layout.addLayout(self.params_layout)
 
-        self.status_var = tk.StringVar(value="")
-        self._status_label = ttk.Label(frame, textvariable=self.status_var,
-                                       foreground="red")
-        self._status_label.pack(side=tk.RIGHT, padx=8)
+        self.status_var = gq.StringVar("")
+        self._status_label = gq.label(wrap=True, colour="red")
+        self.status_var.trace_add(
+            lambda: self._status_label.setText(self.status_var.get()))
+        self._layout.addWidget(self._status_label)
 
-    def _make_param(self, parent, p):
-        """Build the label and the widget for one parameter inside `parent`.
+    def _make_param(self, layout, p):
+        """Build the label and the widget for one parameter inside `layout`.
 
         Kept separate from `_build_params` so a dialog with more parameters
-        than fit on one line can put them in several frames; `_show_params`
-        works either way, because packing a widget again puts it back in the
-        frame it was built in."""
-        label = ttk.Label(parent, text=p["label"] + ":")
-        label.pack(side=tk.LEFT, padx=(8, 2))
-        self.param_labels[p["name"]] = label
-        if p["type"] == "int":
-            var = tk.IntVar(value=p["default"])
-            widget = ttk.Spinbox(
-                parent, from_=p.get("min", 0), to=p.get("max", 100),
-                width=5, textvariable=var,
-            )
-        elif p["type"] == "float":
-            var = tk.DoubleVar(value=p["default"])
-            widget = ttk.Entry(parent, textvariable=var, width=8)
-        elif p["type"] == "choice":
-            var = tk.StringVar(value=p["default"])
-            widget = ttk.Combobox(
-                parent, textvariable=var, values=p["values"],
-                state="readonly", width=max(len(v) for v in p["values"]) + 2,
-            )
-        elif p["type"] == "bool":
-            var = tk.BooleanVar(value=p["default"])
-            widget = ttk.Checkbutton(parent, variable=var)
-        else:
-            raise ValueError(f"Unknown param type: {p['type']}")
-        widget.pack(side=tk.LEFT)
+        than fit on one line can put them in several boxes; `_show_params`
+        works either way, because a hidden widget takes no room in a Qt
+        layout and reappears where it was built."""
+        label = QtWidgets.QLabel(p["label"] + ":")
+        var, widget = param_widget(p)
+        layout.addWidget(label)
+        layout.addWidget(widget)
 
-        var.trace_add("write", self._on_param_change)
+        var.trace_add(self._on_param_change)
+        self.param_labels[p["name"]] = label
         self.vars[p["name"]] = var
         self.param_widgets[p["name"]] = widget
         return widget
 
     def _show_params(self, names):
-        """Show only these parameter widgets, keeping the declared order.
-        Used by dialogs whose parameters depend on a selected method."""
+        """Show only these parameter widgets. Used by dialogs whose
+        parameters depend on a selected method."""
         for name, label in self.param_labels.items():
-            label.pack_forget()
-            self.param_widgets[name].pack_forget()
-        self._status_label.pack_forget()
-        for p in self.spec["params"]:
-            if p["name"] in names:
-                self.param_labels[p["name"]].pack(side=tk.LEFT, padx=(8, 2))
-                self.param_widgets[p["name"]].pack(side=tk.LEFT)
-        self._status_label.pack(side=tk.RIGHT, padx=8)
+            visible = name in names
+            label.setVisible(visible)
+            self.param_widgets[name].setVisible(visible)
 
     def _build_figure(self):
-        self.figure = Figure(figsize=(10, 4.2), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        self.figure, self.canvas, self.toolbar = gq.figure_panel(
+            self, self.FIGSIZE)
+        self._layout.addWidget(self.canvas, 1)
 
     def _build_buttons(self):
-        frame = ttk.Frame(self, padding=8)
-        frame.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(frame, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(frame, text="Apply", command=self.apply).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(frame, text="Update preview", command=self.update_preview).pack(
-            side=tk.RIGHT, padx=4
-        )
+        self._layout.addLayout(gq.row(
+            1,
+            gq.button("Update preview", self.update_preview),
+            gq.button("Apply", self.apply),
+            gq.button("Cancel", self.close)))
+        self._layout.addWidget(self.toolbar)
 
     # ---- Parameters ----
 
@@ -817,14 +829,12 @@ class OperationDialog(tk.Toplevel):
         for p in self.spec["params"]:
             try:
                 params[p["name"]] = self.vars[p["name"]].get()
-            except tk.TclError:
+            except gq.VarError:
                 return None
         return params
 
     def _on_param_change(self, *args):
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-        self._after_id = self.after(self.PREVIEW_DEBOUNCE_MS, self.update_preview)
+        self._timer.start(self.PREVIEW_DEBOUNCE_MS, self.update_preview)
 
     def _base_data(self):
         """The image the operation is previewed on. Normally the current
@@ -853,7 +863,7 @@ class OperationDialog(tk.Toplevel):
             err = validate(params)
             if err:
                 if show_error:
-                    messagebox.showerror("Invalid parameters", err, parent=self)
+                    gq.show_error(self, "Invalid parameters", err)
                 else:
                     self.status_var.set(err)
                 return None
@@ -863,7 +873,7 @@ class OperationDialog(tk.Toplevel):
     # ---- Preview ----
 
     def update_preview(self):
-        self._after_id = None
+        self._timer.cancel()
         params = self._validated_params()
         if params is None:
             return
@@ -908,7 +918,11 @@ class OperationDialog(tk.Toplevel):
         if params is None:
             return
         self.app.apply_operation(self.op_key, params)
-        self.destroy()
+        self.close()
+
+    def closeEvent(self, event):
+        self._timer.cancel()
+        super().closeEvent(event)
 
 
 class PolynomialDialog(OperationDialog):
@@ -919,28 +933,28 @@ class PolynomialDialog(OperationDialog):
 
     def _build_params(self):
         super()._build_params()
-        self.sync_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            self.params_frame, text="Sync x/y", variable=self.sync_var,
-            command=self._on_sync_toggle,
-        ).pack(side=tk.LEFT, padx=(12, 0))
-        self.vars["x_order"].trace_add("write", self._on_x_change)
+        self.sync_var = gq.BoolVar(False)
+        check = gq.bind_check(QtWidgets.QCheckBox("Sync x/y"), self.sync_var)
+        check.toggled.connect(lambda *_a: self._on_sync_toggle())
+        # before the trailing stretch, so it sits next to the two orders
+        self.params_layout.insertWidget(self.params_layout.count() - 1, check)
+        self.vars["x_order"].trace_add(self._on_x_change)
 
     def _on_sync_toggle(self):
         if self.sync_var.get():
             try:
                 self.vars["y_order"].set(self.vars["x_order"].get())
-            except tk.TclError:
+            except gq.VarError:
                 pass
-            self.param_widgets["y_order"].state(["disabled"])
+            self.param_widgets["y_order"].setEnabled(False)
         else:
-            self.param_widgets["y_order"].state(["!disabled"])
+            self.param_widgets["y_order"].setEnabled(True)
 
     def _on_x_change(self, *args):
         if self.sync_var.get():
             try:
                 self.vars["y_order"].set(self.vars["x_order"].get())
-            except tk.TclError:
+            except gq.VarError:
                 pass
 
 
@@ -971,6 +985,8 @@ class SmartLevelDialog(OperationDialog):
     looked for on either.
     """
 
+    SIZE = (1180, 760)
+
     GROUPS = (
         ("1. Find the features",
          ("detect", "threshold", "feature_size", "neighbourhood",
@@ -988,44 +1004,44 @@ class SmartLevelDialog(OperationDialog):
         self.excluded = []           # [x0, x1, y0, y1] in physical units
         self._area_selector = None
         super().__init__(app, op_key)
-        self.geometry("1180x760")
         self.canvas.mpl_connect("button_press_event", self._on_click)
 
     def _build_params(self):
-        outer = ttk.Frame(self, padding=(8, 8, 8, 0))
-        outer.pack(side=tk.TOP, fill=tk.X)
-        self.params_frame = outer
         self.param_widgets = {}
         self.param_labels = {}
 
-        frames = {}
+        layouts, rows = {}, []
         for title, names in self.GROUPS:
-            frame = ttk.LabelFrame(outer, text=title, padding=4)
-            frame.pack(fill=tk.X, pady=(0, 4))
+            layout = QtWidgets.QHBoxLayout()
+            rows.append(layout)
             for name in names:
-                frames[name] = frame
+                layouts[name] = layout
+            self._layout.addWidget(gq.group(title, layout))
 
         for p in self.spec["params"]:
-            self._make_param(frames[p["name"]], p)
+            self._make_param(layouts[p["name"]], p)
+        for layout in rows:
+            layout.addStretch(1)
 
-        hand = ttk.LabelFrame(outer, text="4. Anything the threshold missed",
-                              padding=4)
-        hand.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(hand, text="Drag on the result panel to keep an area out "
-                             "of the fit; right-click one to take it back.").pack(
-            side=tk.LEFT, padx=(8, 2))
-        self.excluded_var = tk.StringVar(value="none")
-        ttk.Label(hand, textvariable=self.excluded_var).pack(side=tk.LEFT,
-                                                             padx=(8, 2))
-        ttk.Button(hand, text="Clear", command=self.clear_excluded).pack(
-            side=tk.LEFT, padx=8)
+        self.excluded_var = gq.StringVar("none")
+        excluded = gq.label("none")
+        self.excluded_var.trace_add(
+            lambda: excluded.setText(self.excluded_var.get()))
+        self._layout.addWidget(gq.group(
+            "4. Anything the threshold missed",
+            gq.row(QtWidgets.QLabel(
+                "Drag on the result panel to keep an area out of the fit; "
+                "right-click one to take it back."),
+                excluded, gq.button("Clear", self.clear_excluded),
+                stretch_at_end=True)))
 
-        self.status_var = tk.StringVar(value="")
-        self._status_label = ttk.Label(outer, textvariable=self.status_var,
-                                       foreground="red", wraplength=1100)
-        self._status_label.pack(side=tk.TOP, fill=tk.X)
+        self.status_var = gq.StringVar("")
+        self._status_label = gq.label(wrap=True, colour="red")
+        self.status_var.trace_add(
+            lambda: self._status_label.setText(self.status_var.get()))
+        self._layout.addWidget(self._status_label)
 
-        self.vars["threshold"].trace_add("write", lambda *a: self._sync_threshold())
+        self.vars["threshold"].trace_add(self._sync_threshold)
         self._sync_threshold()
 
     def _sync_threshold(self):
@@ -1034,11 +1050,9 @@ class SmartLevelDialog(OperationDialog):
         round for the blur the single threshold is taken on."""
         adaptive = self.vars["threshold"].get() == "adaptive"
         for name in self.ADAPTIVE_ONLY:
-            self.param_widgets[name].state(
-                ["!disabled"] if adaptive else ["disabled"])
+            self.param_widgets[name].setEnabled(adaptive)
         for name in self.OTSU_ONLY:
-            self.param_widgets[name].state(
-                ["disabled"] if adaptive else ["!disabled"])
+            self.param_widgets[name].setEnabled(not adaptive)
 
     # ---- areas excluded by hand ----
 
@@ -1150,8 +1164,8 @@ class SmartLevelDialog(OperationDialog):
                     "lines are being levelled by different curves. Lower the "
                     "order.")
         self.status_var.set(", ".join(notes) + warn)
-        self._status_label.configure(
-            foreground="red" if warn else "#404040")
+        self._status_label.setStyleSheet(
+            "color: red;" if warn else f"color: {gq.muted_colour()};")
 
     def _draw(self, result, removed):
         app = self.app
@@ -1226,6 +1240,7 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
     """
 
     ZOOM_SOURCE = "result"
+    SIZE = (1500, 850)
 
     def __init__(self, app, op_key="fft_filter"):
         self.notches = []       # list of [fx, fy] circular notches
@@ -1239,7 +1254,6 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
         self._last_result = None
         self._init_zoom()
         super().__init__(app, op_key)
-        self.geometry("1500x850")
         self.canvas.mpl_connect("button_press_event", self._on_click)
         self.canvas.mpl_connect("button_release_event", self._on_release)
 
@@ -1247,38 +1261,32 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
 
     def _build_params(self):
         super()._build_params()
-        self.vars["mode"].trace_add("write", lambda *a: self._sync_cutoff_state())
+        self.vars["mode"].trace_add(self._sync_cutoff_state)
         self._sync_cutoff_state()
-        btns = ttk.Frame(self, padding=(8, 0, 8, 4))
-        btns.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(btns, text="Auto-detect", command=self.auto_detect).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(btns, text="Clear notches", command=self.clear_notches).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(btns, text="Zoom window...",
-                   command=self.open_zoom_window).pack(side=tk.LEFT, padx=2)
-        ttk.Label(btns, text="Click sets:").pack(side=tk.LEFT, padx=(12, 2))
-        self.click_mode_var = tk.StringVar(value="circle notch")
-        ttk.Combobox(
-            btns, textvariable=self.click_mode_var,
-            values=["cutoff", "circle notch", "vertical band", "horizontal band"],
-            state="readonly", width=15,
-        ).pack(side=tk.LEFT)
-        ttk.Label(
-            btns,
-            text="Left-click: set/add  |  Drag: notch rectangle  |  "
-                 "Right-click: remove nearest",
-        ).pack(side=tk.LEFT, padx=12)
 
-    def _sync_cutoff_state(self):
+        self.click_mode_var = gq.StringVar("circle notch")
+        combo = QtWidgets.QComboBox()
+        combo.addItems(["cutoff", "circle notch", "vertical band",
+                        "horizontal band"])
+        gq.bind_combo(combo, self.click_mode_var)
+
+        self._layout.addLayout(gq.row(
+            gq.button("Auto-detect", self.auto_detect),
+            gq.button("Clear notches", self.clear_notches),
+            gq.button("Zoom window...", self.open_zoom_window),
+            QtWidgets.QLabel("Click sets:"), combo,
+            QtWidgets.QLabel(
+                "Left-click: set/add  |  Drag: notch rectangle  |  "
+                "Right-click: remove nearest"),
+            stretch_at_end=True))
+
+    def _sync_cutoff_state(self, *args):
         """The cutoff entry only matters while a pass filter is selected."""
         try:
             on = self.vars["mode"].get() in ("lowpass", "highpass")
-        except tk.TclError:
+        except gq.VarError:
             return
-        self.param_widgets["cutoff"].state(["!disabled"] if on else ["disabled"])
+        self.param_widgets["cutoff"].setEnabled(bool(on))
 
     def get_params(self):
         params = super().get_params()
@@ -1373,7 +1381,7 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
         if mode == "cutoff":
             try:
                 pass_on = self.vars["mode"].get() in ("lowpass", "highpass")
-            except tk.TclError:
+            except gq.VarError:
                 pass_on = False
             if not pass_on:
                 self.status_var.set(
@@ -1381,7 +1389,7 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
                 )
                 return
             self.vars["cutoff"].set(round(float(np.hypot(x, y)), 3))
-            # trace on the variable triggers the debounced preview update
+            # the listener on the variable triggers the debounced update
             return
         if mode == "vertical band":
             self.x_bands.append(abs(x))
@@ -1465,7 +1473,7 @@ class FFTFilterDialog(ZoomAreaMixin, OperationDialog):
             cutoff = self.vars["cutoff"].get()
             radius = self.vars["radius"].get()
             protect = self.vars["protect_radius"].get()
-        except tk.TclError:
+        except gq.VarError:
             pass_on, cutoff, radius, protect = False, None, None, None
         if pass_on and cutoff:
             ax0.add_patch(Circle((0, 0), cutoff, fill=False,
@@ -1560,6 +1568,7 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
 
     ZOOM_SOURCE = "result"
     PREVIEW_DEBOUNCE_MS = 700          # GSR runs an iteration for each pixel
+    SIZE = (1500, 850)
 
     # Which parameters belong to which method
     METHOD_PARAMS = {
@@ -1576,45 +1585,41 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
         self._sweep_win = None
         self._init_zoom()
         super().__init__(app, op_key)
-        self.geometry("1500x850")
 
     def _build_params(self):
         super()._build_params()
-        self.vars["method"].trace_add("write", lambda *a: self._sync_method())
-        btns = ttk.Frame(self, padding=(8, 0, 8, 4))
-        btns.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(btns, text="Zoom window...",
-                   command=self.open_zoom_window).pack(side=tk.LEFT, padx=2)
-        self._sweep_btn = ttk.Button(btns, text="Parameter sweep...",
-                                     command=self.open_sweep_window)
-        self._sweep_btn.pack(side=tk.LEFT, padx=2)
-        self.hint_var = tk.StringVar(value="")
-        ttk.Label(btns, textvariable=self.hint_var).pack(side=tk.LEFT, padx=12)
+        self.vars["method"].trace_add(self._sync_method)
+        self.hint_var = gq.StringVar("")
+        hint = gq.label()
+        self.hint_var.trace_add(lambda: hint.setText(self.hint_var.get()))
+        self._layout.addLayout(gq.row(
+            gq.button("Zoom window...", self.open_zoom_window),
+            gq.button("Parameter sweep...", self.open_sweep_window),
+            hint, stretch_at_end=True))
         self._sync_method()
 
     def open_sweep_window(self):
         """Open (or raise) the parameter sweep. It does not compute anything
         until its 'Run' is pressed."""
-        if self._sweep_win is None or not self._sweep_win.winfo_exists():
+        if not gq.is_open(self._sweep_win):
             self._sweep_win = DestripeSweepWindow(self)
         else:
-            self._sweep_win.lift()
+            self._sweep_win.raise_window()
             self._sweep_win.sync_method()
 
     def _method(self):
         try:
             return str(self.vars["method"].get()).upper()
-        except tk.TclError:
+        except gq.VarError:
             return "MDSR"
 
-    def _sync_method(self):
+    def _sync_method(self, *args):
         """Show only the parameters of the selected method."""
         method = self._method()
         self._show_params(self.METHOD_PARAMS.get(method,
                                                  self.METHOD_PARAMS["MDSR"]))
-        win = getattr(self, "_sweep_win", None)
-        if win is not None and win.winfo_exists():
-            win.sync_method()          # offer the new method's parameters
+        if gq.is_open(getattr(self, "_sweep_win", None)):
+            self._sweep_win.sync_method()   # offer the new method's parameters
         if hasattr(self, "hint_var"):
             hints = {
                 "GSR": "  |  GSR: more iterations = better converged, slower",
@@ -1642,11 +1647,10 @@ class DestripeDialog(ZoomAreaMixin, OperationDialog):
     def _redraw_zoom_source(self):
         self.update_preview()
 
-    def destroy(self):
-        win = getattr(self, "_sweep_win", None)
-        if win is not None and win.winfo_exists():
-            win.destroy()
-        super().destroy()
+    def closeEvent(self, event):
+        if gq.is_open(getattr(self, "_sweep_win", None)):
+            self._sweep_win.close()
+        super().closeEvent(event)
 
     # ---- drawing ----
 
@@ -1760,10 +1764,11 @@ class CropDialog(OperationDialog):
     dragged rectangle.
     """
 
+    SIZE = (1150, 560)
+
     def __init__(self, app, op_key="crop"):
         self._rect_selector = None
         super().__init__(app, op_key)
-        self.geometry("1150x560")
 
     def _build_params(self):
         super()._build_params()
@@ -1780,12 +1785,12 @@ class CropDialog(OperationDialog):
         self.vars["x1"].set(round(min(self.app.x_real, x1), 4))
         self.vars["y0"].set(round(max(0.0, y0), 4))
         self.vars["y1"].set(round(min(self.app.y_real, y1), 4))
-        # variable traces trigger the debounced preview update
+        # the listeners on the variables trigger the debounced update
 
     def update_preview(self):
         # The base implementation computes `data - result`, which is
         # meaningless for crop (shapes differ) - draw directly instead.
-        self._after_id = None
+        self._timer.cancel()
         params = self._validated_params()
         if params is None:
             return
@@ -1814,12 +1819,11 @@ class CropDialog(OperationDialog):
         try:
             x0, x1 = self.vars["x0"].get(), self.vars["x1"].get()
             y0, y1 = self.vars["y0"].get(), self.vars["y1"].get()
-            from matplotlib.patches import Rectangle
             ax1.add_patch(Rectangle(
                 (x0, y0), x1 - x0, y1 - y0,
                 fill=False, edgecolor="red", linewidth=1.5,
             ))
-        except tk.TclError:
+        except gq.VarError:
             pass
 
         # Re-attach the rectangle selector (figure was cleared)
@@ -1863,6 +1867,8 @@ class PercentileDialog(OperationDialog):
     ever narrow the range, and the values outside it are already gone.
     """
 
+    SIZE = (1350, 560)
+
     def __init__(self, app, op_key="percentile"):
         self._reedit = bool(app.pipeline and app.undo_stack
                             and app.pipeline[-1][0] == op_key)
@@ -1871,7 +1877,6 @@ class PercentileDialog(OperationDialog):
         self._sorted = np.sort(self._base.ravel())
         self._span = None
         super().__init__(app, op_key)
-        self.geometry("1350x560")
         if self._reedit:
             self.status_var.set("Editing the previous clip - full range shown")
 
@@ -1895,7 +1900,7 @@ class PercentileDialog(OperationDialog):
             self.app.reapply_last_operation(self.op_key, params)
         else:
             self.app.apply_operation(self.op_key, params)
-        self.destroy()
+        self.close()
 
     # ---- value <-> percentile conversion ----
 
@@ -1912,7 +1917,7 @@ class PercentileDialog(OperationDialog):
         pmax = self._value_to_percentile(vmax)
         if pmax <= pmin:
             return
-        # Setting the vars triggers the debounced preview via their traces
+        # Setting the vars triggers the debounced preview via their listeners
         self.vars["min"].set(round(pmin, 2))
         self.vars["max"].set(round(pmax, 2))
 
@@ -1945,7 +1950,7 @@ class PercentileDialog(OperationDialog):
             ax0.axvline(vmin, color="red", linewidth=1.5)
             ax0.axvline(vmax, color="red", linewidth=1.5)
             ax0.axvspan(vmin, vmax, color="red", alpha=0.08)
-        except tk.TclError:
+        except gq.VarError:
             pass
 
         # Re-attach the span selector (the figure was cleared)
@@ -1993,7 +1998,7 @@ DIALOG_CLASSES = {
 }
 
 
-class CorrelationWindow(tk.Toplevel):
+class CorrelationWindow(gq.ToolWindow):
     """Diagnostics of the correlation-gated merge, in its own big window:
     the local forward/backward height correlation with the margin, the
     per-pixel decision, the referee score that picks the winning direction on
@@ -2002,15 +2007,13 @@ class CorrelationWindow(tk.Toplevel):
     zooming and the window follows every preview update of the dialog."""
 
     def __init__(self, dialog):
-        super().__init__(dialog)
-        self.title("Correlation merge - details")
-        self.geometry("1400x780")
-        self.figure = Figure(figsize=(14, 7.6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        super().__init__(dialog, "Correlation merge - details", (1400, 780))
+        self.figure, self.canvas, toolbar = gq.figure_panel(self, (14, 7.6))
+        self.setLayout(gq.column(self.canvas, toolbar))
+        self.show()
 
-    def show(self, res, margin, aux_names, extent, merged_d, tag, z_units):
+    def show_details(self, res, margin, aux_names, extent, merged_d, tag,
+                     z_units):
         fig = self.figure
         fig.clf()
         if res is None or getattr(res, "corr_map", None) is None:
@@ -2086,7 +2089,7 @@ class CorrelationWindow(tk.Toplevel):
         self.canvas.draw()
 
 
-class StripeWindow(tk.Toplevel):
+class StripeWindow(gq.ToolWindow):
     """Diagnostics of the stripe-gated merge, in its own big window: the
     per-scan stripe evidence (same-sign vertical jump in robust-sigma units,
     which the threshold cuts), the detected artifact segments, the per-pixel
@@ -2094,15 +2097,12 @@ class StripeWindow(tk.Toplevel):
     linked for zooming and the window follows every preview update."""
 
     def __init__(self, dialog):
-        super().__init__(dialog)
-        self.title("Stripe merge - details")
-        self.geometry("1400x780")
-        self.figure = Figure(figsize=(14, 7.6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        super().__init__(dialog, "Stripe merge - details", (1400, 780))
+        self.figure, self.canvas, toolbar = gq.figure_panel(self, (14, 7.6))
+        self.setLayout(gq.column(self.canvas, toolbar))
+        self.show()
 
-    def show(self, res, thresh, pref, extent, merged_d, tag, z_units):
+    def show_details(self, res, thresh, pref, extent, merged_d, tag, z_units):
         fig = self.figure
         fig.clf()
         if res is None or getattr(res, "stripe_mask_fwd", None) is None:
@@ -2176,10 +2176,10 @@ class StripeWindow(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
-# Main application
+# Two-way merge
 # ---------------------------------------------------------------------------
 
-class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
+class TwoWayDialog(ZoomAreaMixin, gq.ToolWindow):
     """Forward/backward scan merging: hysteresis-and-lag alignment and the
     per-pixel combination of the two scans, with every hyper-parameter
     exposed. Shows the two raw scans, their opacity/anaglyph overlay, the
@@ -2195,6 +2195,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
 
     PREVIEW_DEBOUNCE_MS = 500
     DETECT = False           # ParachuteDialog overrides this
+    SIZE = (1350, 900)
 
     # parameter names grouped into the panels of the dialog
     GROUPS = [
@@ -2211,14 +2212,13 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
     ]
 
     def __init__(self, app, op_key="two_way"):
-        super().__init__(app)
+        self.spec = OPERATIONS[op_key]
+        super().__init__(app, self.spec["label"], self.SIZE)
         self.app = app
         self.op_key = op_key
-        self.spec = OPERATIONS[op_key]
-        self.title(self.spec["label"])
-        self.geometry("1350x900")
+        self.aborted = False
 
-        self._after_id = None
+        self._timer = gq.Timer(self, self.update_preview)
         self._busy = False
         self.vars = {}
         self.result = None
@@ -2231,176 +2231,141 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         self.fwd_title, self.bwd_title = gtw.find_pair(
             app.channels, app.channel_var.get())
         if self.bwd_title is None:
-            messagebox.showerror(
-                "No backward channel",
+            gq.show_error(
+                app, "No backward channel",
                 f"No backward channel matching '{self.fwd_title}' was found in "
                 f"this file.\nAvailable channels:\n  "
-                + "\n  ".join(app.channels),
-                parent=app,
-            )
-            self.destroy()
+                + "\n  ".join(app.channels))
+            self.aborted = True
             return
 
         z = app.z_factor
         self.fwd = app.channels[self.fwd_title].data.astype(np.float64) * z
         self.bwd = app.channels[self.bwd_title].data.astype(np.float64) * z
 
-        # Buttons are packed before the figure: the canvas expands to fill
-        # whatever is left, so anything packed after it can get squeezed out
-        # of the window.
+        self._layout = QtWidgets.QVBoxLayout(self)
         self._build_params()
-        self._build_buttons()
         self._build_figure()
+        self._build_buttons()
         self.update_preview()
+        self.show()
 
     # ---- UI construction ----
 
     def _build_params(self):
-        outer = ttk.Frame(self, padding=6)
-        outer.pack(side=tk.TOP, fill=tk.X)
+        outer = QtWidgets.QHBoxLayout()
         by_name = {p["name"]: p for p in self.spec["params"]}
         self._param_widgets = {}
 
         for title, names in self.GROUPS:
-            frame = ttk.LabelFrame(outer, text=title, padding=6)
-            frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+            grid = QtWidgets.QGridLayout()
             for row, name in enumerate(names):
                 p = by_name[name]
-                label = ttk.Label(frame, text=p["label"] + ":")
-                label.grid(row=row, column=0, sticky=tk.W, padx=(0, 6),
-                           pady=1)
-                if p["type"] == "int":
-                    var = tk.IntVar(value=p["default"])
-                    widget = ttk.Spinbox(frame, from_=p.get("min", 0),
-                                         to=p.get("max", 100), width=8,
-                                         textvariable=var)
-                elif p["type"] == "float":
-                    var = tk.DoubleVar(value=p["default"])
-                    widget = ttk.Entry(frame, textvariable=var, width=10)
-                elif p["type"] == "choice":
-                    var = tk.StringVar(value=p["default"])
-                    widget = ttk.Combobox(frame, textvariable=var,
-                                          values=p["values"], state="readonly",
-                                          width=max(len(v) for v in p["values"]) + 2)
-                elif p["type"] == "bool":
-                    var = tk.BooleanVar(value=p["default"])
-                    widget = ttk.Checkbutton(frame, variable=var)
-                else:
-                    raise ValueError(f"Unknown param type: {p['type']}")
-                widget.grid(row=row, column=1, sticky=tk.W, pady=1)
-                var.trace_add("write", self._on_param_change)
+                label = QtWidgets.QLabel(p["label"] + ":")
+                var, widget = param_widget(p)
+                grid.addWidget(label, row, 0)
+                grid.addWidget(widget, row, 1)
+                var.trace_add(self._on_param_change)
                 self.vars[name] = var
                 self._param_widgets[name] = (label, widget)
+            grid.setColumnStretch(1, 1)
+            grid.setRowStretch(len(names), 1)
+            outer.addWidget(gq.group(title, grid), 1)
 
         self._update_param_visibility()
         self._build_display_controls(outer)
+        self._layout.addLayout(outer)
 
-        info = ttk.Frame(self, padding=(8, 0))
-        info.pack(side=tk.TOP, fill=tk.X)
-        self.info_var = tk.StringVar(
-            value=f"{self.fwd_title}  +  {self.bwd_title}")
-        ttk.Label(info, textvariable=self.info_var, font=("TkFixedFont", 9)).pack(
-            side=tk.LEFT)
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(info, textvariable=self.status_var, foreground="red").pack(
-            side=tk.RIGHT)
+        self.info_var = gq.StringVar(f"{self.fwd_title}  +  {self.bwd_title}")
+        info = gq.label(self.info_var.get(), fixed=True)
+        self.info_var.trace_add(lambda: info.setText(self.info_var.get()))
+        self.status_var = gq.StringVar("")
+        status = gq.label(colour="red")
+        self.status_var.trace_add(lambda: status.setText(self.status_var.get()))
+        self._layout.addLayout(gq.row(info, 1, status))
 
     def _build_display_controls(self, outer):
         """Display-only settings (they re-render the preview but are not part
         of the operation parameters and are not recorded in the pipeline)."""
-        frame = ttk.LabelFrame(outer, text="Display", padding=6)
-        frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=4)
+        grid = QtWidgets.QGridLayout()
 
-        self.overlay_style = tk.StringVar(value="blend")
-        self.overlay_alpha = tk.DoubleVar(value=0.5)
-        self.curve_view = tk.StringVar(value="mapping (0-1)")
+        self.overlay_style = gq.StringVar("blend")
+        self.overlay_alpha = gq.FloatVar(0.5)
+        self.curve_view = gq.StringVar("mapping (0-1)")
 
-        ttk.Label(frame, text="Overlay:").grid(row=0, column=0, sticky=tk.W,
-                                               padx=(0, 6), pady=1)
-        ttk.Combobox(frame, textvariable=self.overlay_style,
-                     values=["blend", "anaglyph", "corr map", "decision",
-                             "stripes"],
-                     state="readonly",
-                     width=12).grid(row=0, column=1, sticky=tk.W, pady=1)
-        ttk.Label(frame, text="Bwd opacity:").grid(row=1, column=0, sticky=tk.W,
-                                                   padx=(0, 6), pady=1)
-        ttk.Scale(frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL, length=110,
-                  variable=self.overlay_alpha).grid(row=1, column=1,
-                                                    sticky=tk.W, pady=1)
-        ttk.Label(frame, text="Curves:").grid(row=2, column=0, sticky=tk.W,
-                                              padx=(0, 6), pady=1)
-        ttk.Combobox(frame, textvariable=self.curve_view,
-                     values=["mapping (0-1)", "shift (px)"], state="readonly",
-                     width=12).grid(row=2, column=1, sticky=tk.W, pady=1)
-        self._build_level_controls(frame, 3)
-        self._details_btn = ttk.Button(frame, text="Correlation details...",
-                                       command=self.open_details_window)
-        self._details_btn.grid(row=6, column=0, columnspan=2, sticky=tk.EW,
-                               pady=1)
+        style = QtWidgets.QComboBox()
+        style.addItems(["blend", "anaglyph", "corr map", "decision",
+                        "stripes"])
+        gq.bind_combo(style, self.overlay_style)
+        grid.addWidget(QtWidgets.QLabel("Overlay:"), 0, 0)
+        grid.addWidget(style, 0, 1)
+
+        slider = gq.FloatSlider(0.0, 1.0, self.overlay_alpha)
+        slider.setFixedWidth(110)
+        grid.addWidget(QtWidgets.QLabel("Bwd opacity:"), 1, 0)
+        grid.addWidget(slider, 1, 1)
+
+        curves = QtWidgets.QComboBox()
+        curves.addItems(["mapping (0-1)", "shift (px)"])
+        gq.bind_combo(curves, self.curve_view)
+        grid.addWidget(QtWidgets.QLabel("Curves:"), 2, 0)
+        grid.addWidget(curves, 2, 1)
+
+        self._build_level_controls(grid, 3)
+        self._details_btn = gq.button("Correlation details...",
+                                      self.open_details_window)
+        grid.addWidget(self._details_btn, 6, 0, 1, 2)
         self._update_details_button()
         for var in (self.overlay_style, self.overlay_alpha, self.curve_view):
-            var.trace_add("write", self._on_display_change)
+            var.trace_add(self._on_display_change)
+        outer.addWidget(gq.group("Display", grid))
 
-    def _build_level_controls(self, frame, row0):
+    def _build_level_controls(self, grid, row0):
         """Display-only leveling widgets (plane + polynomial row alignment),
         shared by the merge and parachuting dialogs."""
-        self.display_plane = tk.BooleanVar(value=True)
-        self.display_rows = tk.BooleanVar(value=False)
-        self.display_rows_order = tk.IntVar(value=2)
+        self.display_plane = gq.BoolVar(True)
+        self.display_rows = gq.BoolVar(False)
+        self.display_rows_order = gq.IntVar(2)
 
-        ttk.Label(frame, text="Plane level:").grid(
-            row=row0, column=0, sticky=tk.W, padx=(0, 6), pady=1)
-        ttk.Checkbutton(frame, variable=self.display_plane).grid(
-            row=row0, column=1, sticky=tk.W, pady=1)
-        ttk.Label(frame, text="Row align (poly):").grid(
-            row=row0 + 1, column=0, sticky=tk.W, padx=(0, 6), pady=1)
-        inner = ttk.Frame(frame)
-        inner.grid(row=row0 + 1, column=1, sticky=tk.W, pady=1)
-        ttk.Checkbutton(inner, variable=self.display_rows).pack(side=tk.LEFT)
-        ttk.Spinbox(inner, from_=0, to=10, width=3,
-                    textvariable=self.display_rows_order).pack(
-            side=tk.LEFT, padx=(4, 0))
-        ttk.Button(frame, text="Zoom window...",
-                   command=self.open_zoom_window).grid(
-            row=row0 + 2, column=0, columnspan=2, sticky=tk.EW, pady=(4, 1))
+        grid.addWidget(QtWidgets.QLabel("Plane level:"), row0, 0)
+        grid.addWidget(gq.bind_check(QtWidgets.QCheckBox(),
+                                     self.display_plane), row0, 1)
+        grid.addWidget(QtWidgets.QLabel("Row align (poly):"), row0 + 1, 0)
+        order = QtWidgets.QSpinBox()
+        order.setRange(0, 10)
+        order.setFixedWidth(60)
+        gq.bind_spin(order, self.display_rows_order)
+        grid.addLayout(gq.row(gq.bind_check(QtWidgets.QCheckBox(),
+                                            self.display_rows), order,
+                              stretch_at_end=True), row0 + 1, 1)
+        grid.addWidget(gq.button("Zoom window...", self.open_zoom_window),
+                       row0 + 2, 0, 1, 2)
         for var in (self.display_plane, self.display_rows,
                     self.display_rows_order):
-            var.trace_add("write", self._on_display_change)
+            var.trace_add(self._on_display_change)
 
     def _on_display_change(self, *args):
         """Re-render with the cached result - no recomputation."""
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-        self._after_id = self.after(
-            150, lambda: (self._draw(self._last_params)
-                          if self.result is not None else None))
+        self._timer.start(150, lambda: (self._draw(self._last_params)
+                                        if self.result is not None else None))
 
     def _build_figure(self):
-        self.figure = Figure(figsize=(13, 6.6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        self.figure, self.canvas, self.toolbar = gq.figure_panel(
+            self, (13, 6.6))
+        self._layout.addWidget(self.canvas, 1)
+        self._layout.addWidget(self.toolbar)
 
     def _build_buttons(self):
-        frame = ttk.Frame(self, padding=8)
-        frame.pack(side=tk.BOTTOM, fill=tk.X)
-
-        ttk.Label(
-            frame,
-            text=("'New channel' keeps the originals and switches editing to "
-                  "the merged image; 'Replace current image' overwrites the "
-                  "channel you are editing."),
-            foreground="gray", wraplength=600,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-
-        ttk.Button(frame, text="Cancel", command=self.destroy).pack(
-            side=tk.RIGHT, padx=4)
-        ttk.Button(frame, text="Replace current image",
-                   command=self.apply).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(frame, text="Merge to new channel",
-                   command=self.apply_as_channel).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(frame, text="Update preview", command=self.update_preview).pack(
-            side=tk.RIGHT, padx=4)
+        self._layout.addLayout(gq.row(
+            gq.label("'New channel' keeps the originals and switches editing "
+                     "to the merged image; 'Replace current image' overwrites "
+                     "the channel you are editing.",
+                     wrap=True, colour=gq.muted_colour()),
+            1,
+            gq.button("Update preview", self.update_preview),
+            gq.button("Merge to new channel", self.apply_as_channel),
+            gq.button("Replace current image", self.apply),
+            gq.button("Cancel", self.close)))
 
     # ---- Parameters ----
 
@@ -2409,7 +2374,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         for p in self.spec["params"]:
             try:
                 params[p["name"]] = self.vars[p["name"]].get()
-            except tk.TclError:
+            except gq.VarError:
                 return None
         return params
 
@@ -2423,27 +2388,22 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         for name, var in self.vars.items():
             try:
                 current[name] = var.get()
-            except tk.TclError:
+            except gq.VarError:
                 pass    # mid-typing; keep this row's last visibility
         for name, (label, widget) in self._param_widgets.items():
-            if twoway_param_relevant(name, current):
-                label.grid()
-                widget.grid()
-            else:
-                label.grid_remove()
-                widget.grid_remove()
+            relevant = twoway_param_relevant(name, current)
+            label.setVisible(relevant)
+            widget.setVisible(relevant)
         self._update_details_button()
 
     def _on_param_change(self, *args):
         self._update_param_visibility()
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-        self._after_id = self.after(self.PREVIEW_DEBOUNCE_MS, self.update_preview)
+        self._timer.start(self.PREVIEW_DEBOUNCE_MS, self.update_preview)
 
     # ---- Preview ----
 
     def update_preview(self):
-        self._after_id = None
+        self._timer.cancel()
         if self._busy:
             return
         params = self.get_params()
@@ -2451,7 +2411,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
             return
         self._busy = True
         self.status_var.set("computing...")
-        self.update_idletasks()
+        gq.process_events()
         try:
             aux = None
             self._aux_names = []
@@ -2670,8 +2630,8 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         try:
             rows_on = self.display_rows.get()
             order = int(self.display_rows_order.get())
-        except tk.TclError:
-            rows_on, order = False, 2   # spinbox mid-typing
+        except gq.VarError:
+            rows_on, order = False, 2   # spin box mid-typing
         if self.display_plane.get():
             images = [img - gtw.fit_plane(img) for img in images]
             tags.append("plane")
@@ -2699,7 +2659,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
     def _current_combine(self):
         try:
             return self.vars["combine"].get()
-        except (KeyError, tk.TclError):
+        except (KeyError, gq.VarError):
             return ""
 
     def _update_details_button(self):
@@ -2711,13 +2671,13 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
             return
         combine = self._current_combine()
         if combine == "correlation":
-            btn.configure(text="Correlation details...")
-            btn.grid()
+            btn.setText("Correlation details...")
+            btn.setVisible(True)
         elif combine == "stripes":
-            btn.configure(text="Stripe details...")
-            btn.grid()
+            btn.setText("Stripe details...")
+            btn.setVisible(True)
         else:
-            btn.grid_remove()
+            btn.setVisible(False)
 
     def open_details_window(self):
         if self._current_combine() == "stripes":
@@ -2727,14 +2687,14 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
 
     def open_stripe_window(self):
         """Open (or raise) the stripe-merge diagnostics window."""
-        if self._stripe_win is None or not self._stripe_win.winfo_exists():
+        if not gq.is_open(self._stripe_win):
             self._stripe_win = StripeWindow(self)
         else:
-            self._stripe_win.lift()
+            self._stripe_win.raise_window()
         self._update_stripe_window()
 
     def _update_stripe_window(self):
-        if self._stripe_win is None or not self._stripe_win.winfo_exists():
+        if not gq.is_open(self._stripe_win):
             return
         res = self.result
         p = self._last_params or {}
@@ -2742,20 +2702,20 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         if res is not None and getattr(res, "stripe_mask_fwd", None) is not None:
             _, _, merged_d, tag = self._display_images()
             extent = self._extent_of(res.merged)
-        self._stripe_win.show(res, float(p.get("stripe_thresh", 3.0)),
-                              float(p.get("stripe_pref", 1.0)), extent,
-                              merged_d, tag, self.app.z_units)
+        self._stripe_win.show_details(res, float(p.get("stripe_thresh", 3.0)),
+                                      float(p.get("stripe_pref", 1.0)), extent,
+                                      merged_d, tag, self.app.z_units)
 
     def open_corr_window(self):
         """Open (or raise) the correlation-merge diagnostics window."""
-        if self._corr_win is None or not self._corr_win.winfo_exists():
+        if not gq.is_open(self._corr_win):
             self._corr_win = CorrelationWindow(self)
         else:
-            self._corr_win.lift()
+            self._corr_win.raise_window()
         self._update_corr_window()
 
     def _update_corr_window(self):
-        if self._corr_win is None or not self._corr_win.winfo_exists():
+        if not gq.is_open(self._corr_win):
             return
         res = self.result
         margin = float((self._last_params or {}).get("corr_margin", 0.7))
@@ -2763,8 +2723,8 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         if res is not None and getattr(res, "corr_map", None) is not None:
             _, _, merged_d, tag = self._display_images()
             extent = self._extent_of(res.corr_map)
-        self._corr_win.show(res, margin, self._aux_names, extent,
-                            merged_d, tag, self.app.z_units)
+        self._corr_win.show_details(res, margin, self._aux_names, extent,
+                                    merged_d, tag, self.app.z_units)
 
     @staticmethod
     def _link_panels(*axes):
@@ -2779,12 +2739,13 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
                 first.get_shared_x_axes().join(first, ax)
                 first.get_shared_y_axes().join(first, ax)
 
-    def destroy(self):
+    def closeEvent(self, event):
+        self._timer.cancel()
         for win in (getattr(self, "_corr_win", None),
                     getattr(self, "_stripe_win", None)):
-            if win is not None and win.winfo_exists():
-                win.destroy()
-        super().destroy()
+            if gq.is_open(win):
+                win.close()
+        super().closeEvent(event)
 
     def _set_info(self):
         a = self.result.alignment
@@ -2832,16 +2793,15 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
         params = self.get_params()
         if params is None:
             return
-        if self.app.pipeline and not messagebox.askyesno(
-            self.spec["label"],
+        if self.app.pipeline and not gq.ask_yes_no(
+            self, self.spec["label"],
             "This operation restarts from the raw forward/backward channels, "
             "so the steps already applied to this image will be discarded.\n\n"
             "Apply anyway?",
-            parent=self,
         ):
             return
         self.app.apply_operation(self.op_key, params)
-        self.destroy()
+        self.close()
 
     def apply_as_channel(self):
         """Add the merged image as a new channel and switch editing to it,
@@ -2861,7 +2821,7 @@ class TwoWayDialog(ZoomAreaMixin, tk.Toplevel):
             pipeline_step=(self.op_key, params),
         )
         self.app.status_var.set(f"Created channel '{title}'")
-        self.destroy()
+        self.close()
 
 
 class ParachuteDialog(TwoWayDialog):
@@ -2893,9 +2853,9 @@ class ParachuteDialog(TwoWayDialog):
 
     def _build_display_controls(self, outer):
         # no overlay/curves panel here - only the display leveling
-        frame = ttk.LabelFrame(outer, text="Display", padding=6)
-        frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=4)
-        self._build_level_controls(frame, 0)
+        grid = QtWidgets.QGridLayout()
+        self._build_level_controls(grid, 0)
+        outer.addWidget(gq.group("Display", grid))
 
     def _histogram_panel(self, ax, img, direction, slope, offset, max_delta,
                          tag):
@@ -2965,8 +2925,11 @@ DIALOG_CLASSES["two_way"] = TwoWayDialog
 DIALOG_CLASSES["parachute"] = ParachuteDialog
 
 
+# ---------------------------------------------------------------------------
+# Folder tabs
+# ---------------------------------------------------------------------------
 
-class QuickViewTab(ttk.Frame):
+class QuickViewTab(QtWidgets.QWidget):
     """Flip through a folder of .gwy files, minimally preprocessed.
 
     Every image gets the same two steps - a fitted plane subtracted, then
@@ -2982,8 +2945,8 @@ class QuickViewTab(ttk.Frame):
 
     CACHE_LIMIT = 32
 
-    def __init__(self, master, app):
-        super().__init__(master, padding=8)
+    def __init__(self, app):
+        super().__init__()
         self.app = app
         self.folder = None
         self.files = []          # full paths, natural order
@@ -2995,97 +2958,85 @@ class QuickViewTab(ttk.Frame):
     # ------------------------------------------------------------- layout --
 
     def _build(self):
-        bar = ttk.Frame(self)
-        bar.pack(fill=tk.X)
+        self.folder_label = QtWidgets.QLabel("No folder selected")
 
-        ttk.Button(bar, text="Select folder...",
-                   command=self.select_folder).pack(side=tk.LEFT)
-        self.folder_label = ttk.Label(bar, text="No folder selected")
-        self.folder_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.channel_var = gq.StringVar()
+        self.channel_combo = QtWidgets.QComboBox()
+        self.channel_combo.setMinimumWidth(190)
+        gq.bind_combo(self.channel_combo, self.channel_var)
+        self.channel_combo.textActivated.connect(
+            lambda *_a: self.show_index(self.index))
 
-        nav = ttk.Frame(bar)
-        nav.pack(side=tk.RIGHT)
-        ttk.Label(nav, text="Channel:").pack(side=tk.LEFT)
-        self.channel_var = tk.StringVar()
-        self.channel_combo = ttk.Combobox(
-            nav, textvariable=self.channel_var, state="readonly", width=22)
-        self.channel_combo.pack(side=tk.LEFT, padx=(4, 12))
-        self.channel_combo.bind("<<ComboboxSelected>>",
-                                lambda e: self.show(self.index))
-        self.prev_btn = ttk.Button(nav, text="< Back",
-                                   command=lambda: self.step(-1))
-        self.prev_btn.pack(side=tk.LEFT)
-        self.count_label = ttk.Label(nav, text="0 / 0", width=10,
-                                     anchor=tk.CENTER)
-        self.count_label.pack(side=tk.LEFT, padx=4)
-        self.next_btn = ttk.Button(nav, text="Next >",
-                                   command=lambda: self.step(1))
-        self.next_btn.pack(side=tk.LEFT)
+        self.prev_btn = gq.button("< Back", lambda: self.step(-1))
+        self.count_label = gq.label("0 / 0", align=QtCore.Qt.AlignCenter)
+        self.count_label.setFixedWidth(70)
+        self.next_btn = gq.button("Next >", lambda: self.step(1))
 
-        self.name_label = ttk.Label(self, text="", anchor=tk.CENTER,
-                                    font=("TkDefaultFont", 11, "bold"))
-        self.name_label.pack(fill=tk.X, pady=(6, 0))
+        bar = gq.row(gq.button("Select folder...", self.select_folder),
+                     self.folder_label, 1,
+                     QtWidgets.QLabel("Channel:"), self.channel_combo,
+                     self.prev_btn, self.count_label, self.next_btn)
 
-        self.figure = Figure(figsize=(7, 6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        self.name_label = gq.label("", bold=True, align=QtCore.Qt.AlignCenter)
 
-        self.status_var = tk.StringVar(
-            value="Select a folder of .gwy files. Each one is shown with a "
-                  "plane subtracted and rows aligned (polynomial, order 2).")
-        ttk.Label(self, textvariable=self.status_var,
-                  wraplength=900).pack(fill=tk.X, pady=(4, 0))
+        self.figure, self.canvas, toolbar = gq.figure_panel(self, (7, 6))
+        self.canvas.mpl_connect("key_press_event", self._on_key)
 
-        # Arrow keys step through the folder once the image has the focus,
-        # which a click on it gives. They are bound to the canvas and not to
-        # the application, so they never fight with an entry field elsewhere.
-        plot = self.canvas.get_tk_widget()
-        plot.bind("<Button-1>", lambda e: plot.focus_set())
-        for key, delta in (("<Left>", -1), ("<Right>", 1),
-                           ("<Prior>", -1), ("<Next>", 1)):
-            plot.bind(key, lambda e, d=delta: self.step(d))
+        self.status_var = gq.StringVar(
+            "Select a folder of .gwy files. Each one is shown with a "
+            "plane subtracted and rows aligned (polynomial, order 2).")
+
+        self.setLayout(gq.column(bar, self.name_label, self.canvas, toolbar,
+                                 gq.bound_label(self.status_var, wrap=True),
+                                 margins=(8, 8, 8, 8)))
+        self.layout().setStretch(2, 1)
         self._update_nav()
+
+    def _on_key(self, event):
+        """Arrow and page keys step through the folder once the image has the
+        focus, which a click on it gives."""
+        delta = {"left": -1, "right": 1,
+                 "pageup": -1, "pagedown": 1}.get(event.key)
+        if delta:
+            self.step(delta)
 
     # -------------------------------------------------------------- files --
 
     def select_folder(self):
-        folder = filedialog.askdirectory(
-            title="Select a folder of .gwy files",
-            initialdir=os.path.dirname(self.app.filename or "") or ".")
+        folder = gq.ask_directory(
+            self, "Select a folder of .gwy files",
+            os.path.dirname(self.app.filename or "") or ".")
         if not folder:
             return
         names = sorted((f for f in os.listdir(folder)
                         if f.lower().endswith(".gwy")), key=_natural_key)
         if not names:
-            messagebox.showinfo(
-                "No files", "No .gwy files found in the selected folder.")
+            gq.show_info(self, "No files",
+                         "No .gwy files found in the selected folder.")
             return
         self.folder = folder
         self.files = [os.path.join(folder, n) for n in names]
         self._cache.clear()
         self._cache_order.clear()
-        self.folder_label.config(
-            text=f"{os.path.basename(folder)}  ({len(self.files)} files)")
+        self.folder_label.setText(
+            f"{os.path.basename(folder)}  ({len(self.files)} files)")
         self.index = -1
-        self.show(0)
+        self.show_index(0)
 
     def step(self, delta):
         if not self.files:
             return
-        self.show(min(max(self.index + delta, 0), len(self.files) - 1))
+        self.show_index(min(max(self.index + delta, 0), len(self.files) - 1))
 
     def _update_nav(self):
         n = len(self.files)
-        self.count_label.config(
-            text=f"{self.index + 1} / {n}" if n else "0 / 0")
-        for btn, ok in ((self.prev_btn, self.index > 0),
-                        (self.next_btn, 0 <= self.index < n - 1)):
-            btn.state(["!disabled"] if ok else ["disabled"])
+        self.count_label.setText(f"{self.index + 1} / {n}" if n else "0 / 0")
+        self.prev_btn.setEnabled(self.index > 0)
+        self.next_btn.setEnabled(0 <= self.index < n - 1)
 
     # ------------------------------------------------------------ display --
 
-    def show(self, index):
+    def show_index(self, index):
         """Load, preprocess and draw the file at `index`."""
         if not self.files or not 0 <= index < len(self.files):
             return
@@ -3093,7 +3044,7 @@ class QuickViewTab(ttk.Frame):
         name = os.path.basename(path)
         self.index = index
         self._update_nav()
-        self.name_label.config(text=f"{index + 1}/{len(self.files)}  -  {name}")
+        self.name_label.setText(f"{index + 1}/{len(self.files)}  -  {name}")
 
         try:
             channels = gwy_loader.load_gwy(path)
@@ -3106,7 +3057,7 @@ class QuickViewTab(ttk.Frame):
             return
 
         names = list(channels)
-        self.channel_combo["values"] = names
+        gq.set_items(self.channel_combo, names)
         channel = pick_channel(names, self.channel_var.get())
         self.channel_var.set(channel)
 
@@ -3162,11 +3113,11 @@ class QuickViewTab(ttk.Frame):
         self.canvas.draw()
 
 
-class ExportChoiceDialog(tk.Toplevel):
+class ExportChoiceDialog(QtWidgets.QDialog):
     """Ask what to write when a whole folder is exported.
 
-    `result` is a dict of the three flags once OK is pressed, and None if the
-    dialog was cancelled or closed.
+    `ask` puts the question and returns a dict of the three flags, or None if
+    the dialog was cancelled or closed.
     """
 
     CHOICES = (
@@ -3176,49 +3127,45 @@ class ExportChoiceDialog(tk.Toplevel):
         ("gwy", "Gwyddion .gwy file - the balanced channel", False),
     )
 
-    def __init__(self, master, warning=None):
-        super().__init__(master)
-        self.title("Export the balanced folder")
-        self.resizable(False, False)
-        self.result = None
+    @classmethod
+    def ask(cls, parent, warning=None):
+        dialog = cls(parent, warning)
+        return dialog.choice if dialog.exec() else None
 
-        frame = ttk.Frame(self, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="For every image in the folder, write:").pack(
-            anchor=tk.W, pady=(0, 6))
-        self.vars = {}
+    def __init__(self, parent, warning=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export the balanced folder")
+        self.choice = None
+
+        items = [QtWidgets.QLabel("For every image in the folder, write:")]
+        self.boxes = {}
         for key, text, default in self.CHOICES:
-            self.vars[key] = tk.BooleanVar(value=default)
-            ttk.Checkbutton(frame, text=text,
-                            variable=self.vars[key]).pack(anchor=tk.W, pady=1)
-        ttk.Label(frame, wraplength=430, foreground="#606060",
-                  text="All of them are drawn with the folder's shared range, "
-                       "so they can be compared side by side. Balancing only "
-                       "ever shifts an image, never rescales it, so the .gwy "
-                       "holds the measured heights - and the full data, since "
-                       "only the display is clipped to the "
-                       "range.").pack(anchor=tk.W, pady=(8, 0))
+            box = QtWidgets.QCheckBox(text)
+            box.setChecked(default)
+            self.boxes[key] = box
+            items.append(box)
+        items.append(gq.label(
+            "All of them are drawn with the folder's shared range, so they "
+            "can be compared side by side. Balancing only ever shifts an "
+            "image, never rescales it, so the .gwy holds the measured "
+            "heights - and the full data, since only the display is clipped "
+            "to the range.", wrap=True, colour=gq.muted_colour()))
         if warning:
-            ttk.Label(frame, text=warning, wraplength=430,
-                      foreground="#a04000").pack(anchor=tk.W, pady=(8, 0))
+            items.append(gq.label(warning, wrap=True,
+                                  colour=gq.WARNING_COLOUR))
+        items.append(gq.row(1, gq.button("Choose folder...", self._accept),
+                            gq.button("Cancel", self.reject)))
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill=tk.X, pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(
-            side=tk.RIGHT)
-        ttk.Button(buttons, text="Choose folder...",
-                   command=self._accept).pack(side=tk.RIGHT, padx=(0, 6))
-
-        self.transient(master)
-        self.grab_set()
-        self.wait_window(self)
+        self.setLayout(gq.column(*items, spacing=6,
+                                 margins=(12, 12, 12, 12)))
+        self.setFixedWidth(470)
 
     def _accept(self):
-        self.result = {k: bool(v.get()) for k, v in self.vars.items()}
-        self.destroy()
+        self.choice = {k: bool(b.isChecked()) for k, b in self.boxes.items()}
+        self.accept()
 
 
-class BalancedViewTab(ttk.Frame):
+class BalancedViewTab(QtWidgets.QWidget):
     """Show a whole folder on one colour scale.
 
     Pick a folder and a channel; every file is levelled the same way the
@@ -3238,8 +3185,8 @@ class BalancedViewTab(ttk.Frame):
     THUMB = 320              # longest side of a contact-sheet thumbnail
     VIEWS = ("Single image", "Contact sheet", "Diagnostics")
 
-    def __init__(self, master, app):
-        super().__init__(master, padding=8)
+    def __init__(self, app):
+        super().__init__()
         self.app = app
         self.folder = None
         self.files = []          # full paths, natural order
@@ -3258,124 +3205,117 @@ class BalancedViewTab(ttk.Frame):
     # ------------------------------------------------------------- layout --
 
     def _build(self):
-        files = ttk.Frame(self)
-        files.pack(fill=tk.X)
-        ttk.Button(files, text="Select folder...",
-                   command=self.select_folder).pack(side=tk.LEFT)
-        self.folder_label = ttk.Label(files, text="No folder selected")
-        self.folder_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.folder_label = QtWidgets.QLabel("No folder selected")
 
-        nav = ttk.Frame(files)
-        nav.pack(side=tk.RIGHT)
-        ttk.Label(nav, text="Channel:").pack(side=tk.LEFT)
-        self.channel_var = tk.StringVar()
-        self.channel_combo = ttk.Combobox(
-            nav, textvariable=self.channel_var, state="readonly", width=22)
-        self.channel_combo.pack(side=tk.LEFT, padx=(4, 12))
-        self.channel_combo.bind("<<ComboboxSelected>>",
-                                lambda e: self.analyse())
-        self.prev_btn = ttk.Button(nav, text="< Back",
-                                   command=lambda: self.step(-1))
-        self.prev_btn.pack(side=tk.LEFT)
-        self.count_label = ttk.Label(nav, text="0 / 0", width=10,
-                                     anchor=tk.CENTER)
-        self.count_label.pack(side=tk.LEFT, padx=4)
-        self.next_btn = ttk.Button(nav, text="Next >",
-                                   command=lambda: self.step(1))
-        self.next_btn.pack(side=tk.LEFT)
+        self.channel_var = gq.StringVar()
+        self.channel_combo = QtWidgets.QComboBox()
+        self.channel_combo.setMinimumWidth(190)
+        gq.bind_combo(self.channel_combo, self.channel_var)
+        self.channel_combo.textActivated.connect(lambda *_a: self.analyse())
+
+        self.prev_btn = gq.button("< Back", lambda: self.step(-1))
+        self.count_label = gq.label("0 / 0", align=QtCore.Qt.AlignCenter)
+        self.count_label.setFixedWidth(70)
+        self.next_btn = gq.button("Next >", lambda: self.step(1))
+
+        files = gq.row(gq.button("Select folder...", self.select_folder),
+                       self.folder_label, 1,
+                       QtWidgets.QLabel("Channel:"), self.channel_combo,
+                       self.prev_btn, self.count_label, self.next_btn)
 
         # ---- how the range is found ----
-        box = ttk.LabelFrame(self, text="Balance", padding=6)
-        box.pack(fill=tk.X, pady=(6, 0))
-        row = ttk.Frame(box)
-        row.pack(fill=tk.X)
+        self.mode_var = gq.StringVar(gb.MODES[gb.DEFAULT_MODE])
+        mode = QtWidgets.QComboBox()
+        mode.addItems(list(gb.MODES.values()))
+        mode.setMinimumWidth(210)
+        gq.bind_combo(mode, self.mode_var)
+        mode.textActivated.connect(lambda *_a: self.rebalance())
 
-        ttk.Label(row, text="Mode:").pack(side=tk.LEFT)
-        self.mode_var = tk.StringVar(value=gb.MODES[gb.DEFAULT_MODE])
-        mode = ttk.Combobox(row, textvariable=self.mode_var, state="readonly",
-                            values=list(gb.MODES.values()), width=26)
-        mode.pack(side=tk.LEFT, padx=(4, 12))
-        mode.bind("<<ComboboxSelected>>", lambda e: self.rebalance())
+        self.cell_var = gq.FloatVar(100 * gb.CELL_FRACTION)
+        self.plo_var = gq.FloatVar(gb.P_LO)
+        self.phi_var = gq.FloatVar(gb.P_HI)
+        cell = self._spin(self.cell_var, 0.2, 20.0, 0.5)
+        plo = self._spin(self.plo_var, 0.0, 49.0, 0.5)
+        phi = self._spin(self.phi_var, 51.0, 100.0, 0.5)
 
-        ttk.Label(row, text="Cell size (% of frame):").pack(side=tk.LEFT)
-        self.cell_var = tk.StringVar(value=f"{100 * gb.CELL_FRACTION:g}")
-        ttk.Spinbox(row, textvariable=self.cell_var, width=5, from_=0.2,
-                    to=20.0, increment=0.5).pack(side=tk.LEFT, padx=(4, 12))
+        self.level_var = gq.BoolVar(True)
+        level = gq.bind_check(QtWidgets.QCheckBox("Level first"),
+                              self.level_var)
+        level.toggled.connect(lambda *_a: self.analyse())
+        self.zero_var = gq.BoolVar(True)
+        zero = gq.bind_check(QtWidgets.QCheckBox("Baseline to zero"),
+                             self.zero_var)
+        zero.toggled.connect(lambda *_a: self.rebalance())
 
-        ttk.Label(row, text="Cell percentiles:").pack(side=tk.LEFT)
-        self.plo_var = tk.StringVar(value=f"{gb.P_LO:g}")
-        self.phi_var = tk.StringVar(value=f"{gb.P_HI:g}")
-        ttk.Spinbox(row, textvariable=self.plo_var, width=5, from_=0.0,
-                    to=49.0, increment=0.5).pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Label(row, text="to").pack(side=tk.LEFT)
-        ttk.Spinbox(row, textvariable=self.phi_var, width=5, from_=51.0,
-                    to=100.0, increment=0.5).pack(side=tk.LEFT, padx=(2, 12))
-
-        self.level_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="Level first", variable=self.level_var,
-                        command=self.analyse).pack(side=tk.LEFT, padx=(0, 12))
-        self.zero_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="Baseline to zero", variable=self.zero_var,
-                        command=self.rebalance).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(row, text="Recompute",
-                   command=self.analyse).pack(side=tk.LEFT)
+        row = gq.row(QtWidgets.QLabel("Mode:"), mode, 0,
+                     QtWidgets.QLabel("Cell size (% of frame):"), cell, 0,
+                     QtWidgets.QLabel("Cell percentiles:"), plo,
+                     QtWidgets.QLabel("to"), phi, 0,
+                     level, zero, gq.button("Recompute", self.analyse),
+                     stretch_at_end=True)
 
         # ---- the range itself, and how to look at it ----
-        row2 = ttk.Frame(box)
-        row2.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(row2, text="Range:").pack(side=tk.LEFT)
-        self.vmin_var = tk.StringVar()
-        self.vmax_var = tk.StringVar()
-        self.vmin_entry = ttk.Entry(row2, textvariable=self.vmin_var, width=10)
-        self.vmin_entry.pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Label(row2, text="to").pack(side=tk.LEFT)
-        self.vmax_entry = ttk.Entry(row2, textvariable=self.vmax_var, width=10)
-        self.vmax_entry.pack(side=tk.LEFT, padx=(2, 4))
-        self.units_label = ttk.Label(row2, text="")
-        self.units_label.pack(side=tk.LEFT)
+        self.vmin_var = gq.StringVar()
+        self.vmax_var = gq.StringVar()
+        self.vmin_entry = gq.bind_edit(QtWidgets.QLineEdit(), self.vmin_var)
+        self.vmax_entry = gq.bind_edit(QtWidgets.QLineEdit(), self.vmax_var)
         for entry in (self.vmin_entry, self.vmax_entry):
-            entry.bind("<Return>", lambda e: self.apply_range())
-        ttk.Button(row2, text="Apply", command=self.apply_range).pack(
-            side=tk.LEFT, padx=(8, 2))
-        ttk.Button(row2, text="Auto", command=self.auto_range).pack(
-            side=tk.LEFT)
+            entry.setFixedWidth(110)
+            entry.returnPressed.connect(self.apply_range)
+        self.units_label = QtWidgets.QLabel("")
 
-        ttk.Button(row2, text="Export all...", command=self.export).pack(
-            side=tk.RIGHT)
-        self.view_var = tk.StringVar(value=self.VIEWS[0])
-        view = ttk.Combobox(row2, textvariable=self.view_var,
-                            state="readonly", values=self.VIEWS, width=14)
-        view.pack(side=tk.RIGHT, padx=(4, 12))
-        view.bind("<<ComboboxSelected>>", lambda e: self.redraw())
-        ttk.Label(row2, text="View:").pack(side=tk.RIGHT)
+        self.view_var = gq.StringVar(self.VIEWS[0])
+        view = QtWidgets.QComboBox()
+        view.addItems(list(self.VIEWS))
+        gq.bind_combo(view, self.view_var)
+        view.textActivated.connect(lambda *_a: self.redraw())
 
-        self.name_label = ttk.Label(self, text="", anchor=tk.CENTER,
-                                    font=("TkDefaultFont", 11, "bold"))
-        self.name_label.pack(fill=tk.X, pady=(6, 0))
+        row2 = gq.row(QtWidgets.QLabel("Range:"), self.vmin_entry,
+                      QtWidgets.QLabel("to"), self.vmax_entry,
+                      self.units_label,
+                      gq.button("Apply", self.apply_range),
+                      gq.button("Auto", self.auto_range),
+                      1,
+                      QtWidgets.QLabel("View:"), view,
+                      gq.button("Export all...", self.export))
 
-        self.figure = Figure(figsize=(7, 6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, self).update()
+        self.name_label = gq.label("", bold=True, align=QtCore.Qt.AlignCenter)
 
-        bottom = ttk.Frame(self)
-        bottom.pack(fill=tk.X, pady=(4, 0))
-        self.progress = ttk.Progressbar(bottom, mode="determinate",
-                                        length=140)
-        self.progress.pack(side=tk.RIGHT, padx=(8, 0))
-        self.status_var = tk.StringVar(
-            value="Select a folder of .gwy files. Every image is measured "
-                  "where the cells are and where the substrate is, and the "
-                  "whole folder is then drawn on one colour scale.")
-        ttk.Label(bottom, textvariable=self.status_var,
-                  wraplength=900).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.figure, self.canvas, toolbar = gq.figure_panel(self, (7, 6))
+        self.canvas.mpl_connect("key_press_event", self._on_key)
 
-        plot = self.canvas.get_tk_widget()
-        plot.bind("<Button-1>", lambda e: plot.focus_set())
-        for key, delta in (("<Left>", -1), ("<Right>", 1),
-                           ("<Prior>", -1), ("<Next>", 1)):
-            plot.bind(key, lambda e, d=delta: self.step(d))
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setFixedWidth(140)
+        self.status_var = gq.StringVar(
+            "Select a folder of .gwy files. Every image is measured "
+            "where the cells are and where the substrate is, and the "
+            "whole folder is then drawn on one colour scale.")
+        status = gq.bound_label(self.status_var, wrap=True)
+        status.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                             QtWidgets.QSizePolicy.Preferred)
+        bottom = gq.row(status, self.progress)
+
+        self.setLayout(gq.column(
+            files, gq.group("Balance", gq.column(row, row2)),
+            self.name_label, self.canvas, toolbar, bottom,
+            margins=(8, 8, 8, 8)))
+        self.layout().setStretch(3, 1)
         self._update_nav()
+
+    @staticmethod
+    def _spin(var, low, high, step):
+        widget = QtWidgets.QDoubleSpinBox()
+        widget.setRange(low, high)
+        widget.setSingleStep(step)
+        widget.setDecimals(2)
+        widget.setFixedWidth(80)
+        return gq.bind_spin(widget, var)
+
+    def _on_key(self, event):
+        delta = {"left": -1, "right": 1,
+                 "pageup": -1, "pagedown": 1}.get(event.key)
+        if delta:
+            self.step(delta)
 
     # ----------------------------------------------------------- settings --
 
@@ -3386,14 +3326,13 @@ class BalancedViewTab(ttk.Frame):
                     gb.DEFAULT_MODE)
 
     def _number(self, var, default, low, high):
-        """A spin box's value, or `default` if it has been typed into and
-        no longer makes sense."""
+        """A spin box's value, or `default` if it no longer makes sense."""
         try:
             value = float(var.get())
-        except ValueError:
+        except (gq.VarError, TypeError, ValueError):
             value = default
         value = min(max(value, low), high)
-        var.set(f"{value:g}")
+        var.set(value)
         return value
 
     def settings(self):
@@ -3411,31 +3350,31 @@ class BalancedViewTab(ttk.Frame):
     # -------------------------------------------------------------- files --
 
     def select_folder(self):
-        folder = filedialog.askdirectory(
-            title="Select a folder of .gwy files",
-            initialdir=os.path.dirname(self.app.filename or "") or ".")
+        folder = gq.ask_directory(
+            self, "Select a folder of .gwy files",
+            os.path.dirname(self.app.filename or "") or ".")
         if not folder:
             return
         names = sorted((f for f in os.listdir(folder)
                         if f.lower().endswith(".gwy")), key=_natural_key)
         if not names:
-            messagebox.showinfo(
-                "No files", "No .gwy files found in the selected folder.")
+            gq.show_info(self, "No files",
+                         "No .gwy files found in the selected folder.")
             return
         self.folder = folder
         self.files = [os.path.join(folder, n) for n in names]
         self._cache.clear()
         self._cache_order.clear()
-        self.folder_label.config(
-            text=f"{os.path.basename(folder)}  ({len(self.files)} files)")
+        self.folder_label.setText(
+            f"{os.path.basename(folder)}  ({len(self.files)} files)")
         self.index = 0
         try:
             channels = list(gwy_loader.load_gwy(self.files[0]))
         except Exception as e:
-            messagebox.showerror("Could not read file",
-                                 f"{os.path.basename(self.files[0])}:\n{e}")
+            gq.show_error(self, "Could not read file",
+                          f"{os.path.basename(self.files[0])}:\n{e}")
             return
-        self.channel_combo["values"] = channels
+        gq.set_items(self.channel_combo, channels)
         self.channel_var.set(pick_channel(channels, self.channel_var.get()))
         self.analyse()
 
@@ -3448,11 +3387,9 @@ class BalancedViewTab(ttk.Frame):
 
     def _update_nav(self):
         n = len(self.files)
-        self.count_label.config(
-            text=f"{self.index + 1} / {n}" if n else "0 / 0")
-        for btn, ok in ((self.prev_btn, self.index > 0),
-                        (self.next_btn, 0 <= self.index < n - 1)):
-            btn.state(["!disabled"] if ok else ["disabled"])
+        self.count_label.setText(f"{self.index + 1} / {n}" if n else "0 / 0")
+        self.prev_btn.setEnabled(self.index > 0)
+        self.next_btn.setEnabled(0 <= self.index < n - 1)
 
     def _prepared(self, path, channel):
         """The levelled image of one file, from the cache when possible."""
@@ -3493,13 +3430,14 @@ class BalancedViewTab(ttk.Frame):
             channel = self.channel_var.get()
             params = self.settings()
             kept, measures, metas, thumbs, skipped = [], [], [], [], []
-            self.progress.config(maximum=len(self.files), value=0)
+            self.progress.setMaximum(len(self.files))
+            self.progress.setValue(0)
             for i, path in enumerate(self.files):
                 name = os.path.basename(path)
                 self.status_var.set(
                     f"Measuring {i + 1}/{len(self.files)}: {name}")
-                self.progress.config(value=i)
-                self.update()
+                self.progress.setValue(i)
+                gq.process_events()
                 try:
                     view = self._prepared(path, channel)
                     measures.append(gb.measure(view["data"], **params))
@@ -3509,7 +3447,7 @@ class BalancedViewTab(ttk.Frame):
                 metas.append({k: v for k, v in view.items() if k != "data"})
                 thumbs.append(self._thumbnail(view["data"]))
                 kept.append(path)
-            self.progress.config(value=0)
+            self.progress.setValue(0)
             if not kept:
                 self._draw_message("None of the files in this folder could "
                                    "be read.\n\n" + "\n".join(skipped[:10]))
@@ -3555,9 +3493,9 @@ class BalancedViewTab(ttk.Frame):
                 (self.vmin_entry, self.vmin_var, low_ok, vmin),
                 (self.vmax_entry, self.vmax_var, high_ok, vmax)):
             var.set(f"{value:.4g}" if ok else "")
-            entry.config(state="normal" if ok else "disabled")
-        self.units_label.config(text=self.metas[0]["z_units"]
-                                if self.metas else "")
+            entry.setEnabled(bool(ok))
+        self.units_label.setText(self.metas[0]["z_units"]
+                                 if self.metas else "")
 
     def _range_for(self, index):
         low, high = self.result["ranges"][index]
@@ -3678,8 +3616,7 @@ class BalancedViewTab(ttk.Frame):
         data, view = self._balanced(index)
         name = os.path.basename(self.files[index])
         vmin, vmax = self._range_for(index)
-        self.name_label.config(
-            text=f"{index + 1}/{len(self.files)}  -  {name}")
+        self.name_label.setText(f"{index + 1}/{len(self.files)}  -  {name}")
 
         self.figure.clf()
         ax = self.figure.add_subplot(111)
@@ -3705,7 +3642,7 @@ class BalancedViewTab(ttk.Frame):
             how = ", shared bottom, each image's own top"
         else:
             how = ", each on its own range"
-        self.name_label.config(text=f"{n} images, {self.channel}{how}")
+        self.name_label.setText(f"{n} images, {self.channel}{how}")
         self.figure.clf()
         axes = np.atleast_1d(self.figure.subplots(rows, cols)).ravel()
         for i, data in enumerate(self._shifted_thumbs()):
@@ -3732,9 +3669,9 @@ class BalancedViewTab(ttk.Frame):
         measure = self.measures[index]
         vmin, vmax = self._range_for(index)
         offset = self.result["offsets"][index]
-        self.name_label.config(
-            text=f"{index + 1}/{len(self.files)}  -  "
-                 f"{os.path.basename(self.files[index])}")
+        self.name_label.setText(
+            f"{index + 1}/{len(self.files)}  -  "
+            f"{os.path.basename(self.files[index])}")
 
         self.figure.clf()
         axes = self.figure.subplots(2, 2)
@@ -3757,8 +3694,8 @@ class BalancedViewTab(ttk.Frame):
                    (measure["high"], "cell high", "tab:red")]
         lo, hi = np.percentile(data, [0.2, 99.8])
         ax.hist(data.ravel(), bins=300, range=(lo, hi), color="0.7")
-        for value, label, colour in anchors:
-            ax.axvline(value + offset, color=colour, lw=1.2, label=label)
+        for value, name, colour in anchors:
+            ax.axvline(value + offset, color=colour, lw=1.2, label=name)
         ax.axvspan(vmin, vmax, color="tab:orange", alpha=0.15,
                    label="shown range")
         ax.set_title("where this image sits", fontsize=9)
@@ -3768,13 +3705,13 @@ class BalancedViewTab(ttk.Frame):
 
         ax = axes[1, 0]
         x = np.arange(len(self.measures))
-        for key, label, colour in (("background", "substrate", "tab:blue"),
-                                   ("low", "cell low", "tab:green"),
-                                   ("median", "cell median", "tab:olive"),
-                                   ("high", "cell high", "tab:red")):
+        for key, name, colour in (("background", "substrate", "tab:blue"),
+                                  ("low", "cell low", "tab:green"),
+                                  ("median", "cell median", "tab:olive"),
+                                  ("high", "cell high", "tab:red")):
             y = [m[key] + o for m, o
                  in zip(self.measures, self.result["offsets"])]
-            ax.plot(x, y, ".-", color=colour, lw=1, ms=4, label=label)
+            ax.plot(x, y, ".-", color=colour, lw=1, ms=4, label=name)
         ax.axhspan(vmin, vmax, color="tab:orange", alpha=0.15)
         ax.axvline(index, color="0.4", lw=1, ls=":")
         ax.set_title("the folder on the balanced scale", fontsize=9)
@@ -3834,26 +3771,24 @@ class BalancedViewTab(ttk.Frame):
     def export(self):
         """Write the whole folder out, all of it on the shared range."""
         if not self.result:
-            messagebox.showinfo("Nothing to export", "Select a folder first.")
+            gq.show_info(self, "Nothing to export", "Select a folder first.")
             return
-        dialog = ExportChoiceDialog(self.winfo_toplevel())
-        choice = dialog.result
+        choice = ExportChoiceDialog.ask(self.window())
         if not choice:
             return
         if not any(choice.values()):
             self.status_var.set("Nothing selected to export.")
             return
 
-        folder = filedialog.askdirectory(
-            title="Save the balanced folder to...",
-            initialdir=self.folder or ".")
+        folder = gq.ask_directory(self, "Save the balanced folder to...",
+                                  self.folder or ".")
         if not folder:
             return
         targets = self._targets(folder, choice)
         clashes = [p for t in targets for p in t.values()
                    if os.path.exists(p)]
-        if clashes and not messagebox.askyesno(
-                "Overwrite?",
+        if clashes and not gq.ask_yes_no(
+                self, "Overwrite?",
                 f"{len(clashes)} file(s) will be overwritten, starting with "
                 f"{os.path.basename(clashes[0])}.\n\nGo ahead?"):
             return
@@ -3863,22 +3798,23 @@ class BalancedViewTab(ttk.Frame):
         self._busy = True
         written = 0
         try:
-            self.progress.config(maximum=len(self.files), value=0)
+            self.progress.setMaximum(len(self.files))
+            self.progress.setValue(0)
             for i, target in enumerate(targets):
                 name = os.path.basename(self.files[i])
                 self.status_var.set(
                     f"Writing {i + 1}/{len(self.files)}: {name}")
-                self.progress.config(value=i)
-                self.update()
+                self.progress.setValue(i)
+                gq.process_events()
                 written += self._export_one(i, target)
-            self.progress.config(value=0)
+            self.progress.setValue(0)
             kinds = ", ".join(k for k in ("annotated", "pure", "gwy")
                               if choice[k])
             self.status_var.set(f"Wrote {written} file(s) ({kinds}) for "
                                 f"{len(self.files)} images to {folder}.")
         except Exception as e:
             self.status_var.set(f"Export stopped after {written} file(s): {e}")
-            messagebox.showerror("Export error", str(e))
+            gq.show_error(self, "Export error", str(e))
         finally:
             self._busy = False
 
@@ -3913,11 +3849,22 @@ class BalancedViewTab(ttk.Frame):
         return len(target)
 
 
-class GwyProcessorGUI(tk.Tk):
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class GwyProcessorGUI(QtWidgets.QMainWindow):
+
+    # The batch run happens on a worker thread, and a widget may only be
+    # touched from the thread that made it. These carry the worker's progress
+    # back across; a queued signal is Qt's version of Tk's `after(0, ...)`.
+    batch_status = QtCore.Signal(str)
+    batch_log = QtCore.Signal(str)
+
     def __init__(self):
         super().__init__()
-        self.title("GWY Processor")
-        self.geometry("1250x880")
+        self.setWindowTitle(APP_NAME)
+        self.resize(1250, 880)
 
         # --- State ---
         self.filename = None
@@ -3934,139 +3881,103 @@ class GwyProcessorGUI(tk.Tk):
         self.spatial_units = "px"
         self.z_units = "a.u."
 
+        self.batch_status.connect(self._on_batch_status)
+        self.batch_log.connect(self._log)
+
         self._build_layout()
         self._draw_placeholder()
 
     # ------------------------------------------------------------------ UI --
 
     def _build_layout(self):
-        # Two tabs: the processing workbench and the folder quick view.
-        self.tabs = ttk.Notebook(self)
-        self.tabs.pack(fill=tk.BOTH, expand=True)
-        main_tab = ttk.Frame(self.tabs)
-        self.tabs.add(main_tab, text="Processing")
+        # Three tabs: the processing workbench and the two folder views.
+        self.tabs = QtWidgets.QTabWidget()
+        self.setCentralWidget(self.tabs)
 
-        # Left: controls, Right: plot
-        left = ttk.Frame(main_tab, padding=8)
-        left.pack(side=tk.LEFT, fill=tk.Y)
-
-        right = ttk.Frame(main_tab)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        main_tab = QtWidgets.QWidget()
+        left = QtWidgets.QWidget()
+        left.setFixedWidth(300)
+        left_column = QtWidgets.QVBoxLayout(left)
+        left_column.setContentsMargins(8, 8, 8, 8)
 
         # ---- File / channel section ----
-        file_frame = ttk.LabelFrame(left, text="File", padding=6)
-        file_frame.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Button(file_frame, text="Open .gwy file...", command=self.open_file).pack(
-            fill=tk.X
-        )
-        self.file_label = ttk.Label(file_frame, text="No file loaded", wraplength=260)
-        self.file_label.pack(fill=tk.X, pady=(4, 2))
-
-        ttk.Label(file_frame, text="Channel:").pack(anchor=tk.W)
-        self.channel_var = tk.StringVar()
-        self.channel_combo = ttk.Combobox(
-            file_frame, textvariable=self.channel_var, state="readonly"
-        )
-        self.channel_combo.pack(fill=tk.X)
-        self.channel_combo.bind("<<ComboboxSelected>>", lambda e: self.select_channel())
+        self.file_label = gq.label("No file loaded", wrap=True)
+        self.channel_var = gq.StringVar()
+        self.channel_combo = QtWidgets.QComboBox()
+        gq.bind_combo(self.channel_combo, self.channel_var)
+        self.channel_combo.textActivated.connect(
+            lambda *_a: self.select_channel())
+        left_column.addWidget(gq.group("File", gq.column(
+            gq.button("Open .gwy file...", self.open_file),
+            self.file_label,
+            QtWidgets.QLabel("Channel:"), self.channel_combo)))
 
         # ---- Display section: false-colour gradient ----
-        disp = ttk.LabelFrame(left, text="Display", padding=6)
-        disp.pack(fill=tk.X, pady=(0, 6))
-        row = ttk.Frame(disp)
-        row.pack(fill=tk.X)
-        ttk.Label(row, text="Colour map:").pack(side=tk.LEFT)
-        self.cmap_var = tk.StringVar(value=gcm.current_name())
-        self.cmap_combo = ttk.Combobox(
-            row, textvariable=self.cmap_var, state="readonly",
-            values=gcm.names(), height=20,
-        )
-        self.cmap_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-        self.cmap_combo.bind("<<ComboboxSelected>>", lambda e: self.select_cmap())
-        self.cmap_strip = tk.Canvas(disp, height=16, highlightthickness=1,
-                                    highlightbackground="#909090")
-        self.cmap_strip.pack(fill=tk.X, pady=(4, 0))
-        self.cmap_strip.bind("<Configure>", lambda e: self._draw_cmap_strip())
+        self.cmap_var = gq.StringVar(gcm.current_name())
+        self.cmap_combo = QtWidgets.QComboBox()
+        self.cmap_combo.addItems(list(gcm.names()))
+        self.cmap_combo.setMaxVisibleItems(20)
+        gq.bind_combo(self.cmap_combo, self.cmap_var)
+        self.cmap_combo.textActivated.connect(lambda *_a: self.select_cmap())
+        self.cmap_strip = gq.ColourStrip()
+        self.cmap_strip.set_cmap(gcm.current())
+        left_column.addWidget(gq.group("Display", gq.column(
+            gq.row(QtWidgets.QLabel("Colour map:"), self.cmap_combo),
+            self.cmap_strip)))
 
         # ---- Operations section: one button per dialog ----
-        proc = ttk.LabelFrame(left, text="Operations", padding=6)
-        proc.pack(fill=tk.X, pady=(0, 6))
-
-        for row in OPERATION_ROWS:
-            line = ttk.Frame(proc)
-            line.pack(fill=tk.X, pady=1)
-            for i, key in enumerate(row):
+        ops = QtWidgets.QVBoxLayout()
+        for keys in OPERATION_ROWS:
+            line = QtWidgets.QHBoxLayout()
+            for key in keys:
                 if key == "@fft_spectrum":
-                    btn = ttk.Button(line, text="View FFT spectrum",
-                                     command=self.show_fft)
+                    btn = gq.button("View FFT spectrum", self.show_fft)
                 else:
                     suffix = "" if OPERATIONS[key].get("instant") else "..."
-                    btn = ttk.Button(
-                        line,
-                        text=OPERATIONS[key]["label"] + suffix,
-                        command=lambda k=key: self.open_operation(k),
-                    )
-                btn.pack(side=tk.LEFT, fill=tk.X, expand=True,
-                         padx=(0, 2) if i < len(row) - 1 else 0)
+                    btn = gq.button(
+                        OPERATIONS[key]["label"] + suffix,
+                        lambda k=key: self.open_operation(k))
+                line.addWidget(btn, 1)
+            ops.addLayout(line)
+        left_column.addWidget(gq.group("Operations", ops))
 
         # ---- Undo / reset ----
-        hist = ttk.Frame(left)
-        hist.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(hist, text="Undo", command=self.undo).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2)
-        )
-        ttk.Button(hist, text="Redo", command=self.redo).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2)
-        )
-        ttk.Button(hist, text="Reset to original", command=self.reset).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-
-        # The status line and the output buttons are anchored to the bottom
-        # and claimed before the log, so a short window shrinks the log
-        # instead of pushing the buttons off the screen.
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(left, textvariable=self.status_var, wraplength=260).pack(
-            side=tk.BOTTOM, fill=tk.X, pady=(6, 0)
-        )
-
-        # ---- Save / batch ----
-        out = ttk.LabelFrame(left, text="Output", padding=6)
-        out.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(out, text="Save processed image...", command=self.save_image).pack(
-            fill=tk.X, pady=1
-        )
-        ttk.Button(out, text="Save channel to .gwy...", command=self.save_to_gwy).pack(
-            fill=tk.X, pady=1
-        )
-        ttk.Button(out, text="Batch process folder...", command=self.batch_dialog).pack(
-            fill=tk.X, pady=1
-        )
+        left_column.addLayout(gq.row(
+            gq.button("Undo", self.undo),
+            gq.button("Redo", self.redo),
+            gq.button("Reset to original", self.reset)))
 
         # ---- Log section ----
-        log_frame = ttk.LabelFrame(left, text="Processing log", padding=6)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        self.log_list = QtWidgets.QListWidget()
+        self.log_list.setMinimumHeight(110)
+        left_column.addWidget(gq.group("Processing log", gq.column(
+            self.log_list, gq.button("Save log...", self.save_log))), 1)
 
-        self.log_list = tk.Listbox(log_frame, height=6)
-        self.log_list.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(log_frame, text="Save log...", command=self.save_log).pack(
-            fill=tk.X, pady=(4, 0)
-        )
+        # ---- Save / batch ----
+        left_column.addWidget(gq.group("Output", gq.column(
+            gq.button("Save processed image...", self.save_image),
+            gq.button("Save channel to .gwy...", self.save_to_gwy),
+            gq.button("Batch process folder...", self.batch_dialog))))
+
+        self.status_var = gq.StringVar("Ready")
+        left_column.addWidget(gq.bound_label(self.status_var, wrap=True))
 
         # ---- Plot area ----
-        self.figure = Figure(figsize=(7, 6), dpi=100)
+        right = QtWidgets.QWidget()
+        self.figure, self.canvas, toolbar = gq.figure_panel(right, (7, 6))
         self.ax = self.figure.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=right)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        toolbar = NavigationToolbar2Tk(self.canvas, right)
-        toolbar.update()
+        right.setLayout(gq.column(self.canvas, toolbar))
+        right.layout().setStretch(0, 1)
+
+        main_tab.setLayout(gq.row(left, right, spacing=0))
+        main_tab.layout().setStretch(1, 1)
+        self.tabs.addTab(main_tab, "Processing")
 
         # ---- Folder tabs ----
-        self.quick = QuickViewTab(self.tabs, self)
-        self.tabs.add(self.quick, text="Quick view")
-        self.balanced = BalancedViewTab(self.tabs, self)
-        self.tabs.add(self.balanced, text="Balanced view")
+        self.quick = QuickViewTab(self)
+        self.tabs.addTab(self.quick, "Quick view")
+        self.balanced = BalancedViewTab(self)
+        self.tabs.addTab(self.balanced, "Balanced view")
 
     # ------------------------------------------------------------- Colour --
 
@@ -4074,52 +3985,34 @@ class GwyProcessorGUI(tk.Tk):
         """Switch the false-colour gradient used for topography everywhere."""
         name = gcm.set_current(self.cmap_var.get())
         self.cmap_var.set(name)
-        self._draw_cmap_strip()
+        self.cmap_strip.set_cmap(gcm.current())
         if self.data is not None:
             self.redraw()
         self.quick.refresh_display()
         self.balanced.refresh_display()
         self.status_var.set(f"Colour map: {name}")
 
-    def _draw_cmap_strip(self):
-        """Paint the selected gradient as a strip under the combo box."""
-        canvas = self.cmap_strip
-        canvas.delete("all")
-        width = canvas.winfo_width()
-        height = canvas.winfo_height()
-        if width < 2:
-            return
-        cmap = gcm.current()
-        for x in range(width):
-            r, g, b, _ = cmap(x / max(width - 1, 1))
-            canvas.create_line(
-                x, 0, x, height,
-                fill=f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}",
-            )
-
     # ------------------------------------------------------------- Loading --
 
     def open_file(self):
-        path = filedialog.askopenfilename(
-            title="Open Gwyddion file",
-            filetypes=[("Gwyddion files", "*.gwy"), ("All files", "*.*")],
-        )
+        path = gq.ask_open_filename(self, "Open Gwyddion file", GWY_FILTER)
         if not path:
             return
         try:
             channels = gwy_loader.load_gwy(path)
         except Exception as e:
-            messagebox.showerror("Load error", f"Could not read file:\n{e}")
+            gq.show_error(self, "Load error", f"Could not read file:\n{e}")
             return
         if not channels:
-            messagebox.showerror("Load error", "No data channels found in file.")
+            gq.show_error(self, "Load error",
+                          "No data channels found in file.")
             return
 
         self.filename = path
         self.channels = channels
-        self.file_label.config(text=os.path.basename(path))
+        self.file_label.setText(os.path.basename(path))
         names = list(channels.keys())
-        self.channel_combo["values"] = names
+        gq.set_items(self.channel_combo, names, keep=False)
 
         # Prefer a Height channel if present
         default = next((n for n in names if "Height" in n), names[0])
@@ -4131,9 +4024,10 @@ class GwyProcessorGUI(tk.Tk):
         if name not in self.channels:
             return
         if self.pipeline:
-            if not messagebox.askyesno(
-                "Change channel",
-                "Changing the channel discards the current processing history.\nContinue?",
+            if not gq.ask_yes_no(
+                self, "Change channel",
+                "Changing the channel discards the current processing "
+                "history.\nContinue?",
             ):
                 return
 
@@ -4160,8 +4054,9 @@ class GwyProcessorGUI(tk.Tk):
         self.redo_stack = []
         self.pipeline = []
         self.log_entries = []
-        self.log_list.delete(0, tk.END)
-        self._log(f"Loaded channel '{name}' from {os.path.basename(self.filename)}")
+        self.log_list.clear()
+        self._log(f"Loaded channel '{name}' from "
+                  f"{os.path.basename(self.filename)}")
         self.status_var.set(f"Channel '{name}' loaded ({nx}x{ny})")
         self.redraw()
 
@@ -4169,7 +4064,8 @@ class GwyProcessorGUI(tk.Tk):
 
     def _require_data(self):
         if self.data is None:
-            messagebox.showinfo("No data", "Open a .gwy file and select a channel first.")
+            gq.show_info(self, "No data",
+                         "Open a .gwy file and select a channel first.")
             return False
         return True
 
@@ -4182,7 +4078,9 @@ class GwyProcessorGUI(tk.Tk):
             self.apply_operation(op_key, {})
             return
         dialog_cls = DIALOG_CLASSES.get(op_key, OperationDialog)
-        dialog_cls(self, op_key)
+        dialog = dialog_cls(self, op_key)
+        if getattr(dialog, "aborted", False):
+            dialog.deleteLater()
 
     def add_channel(self, title, data, template=None, pipeline_step=None,
                     select=True):
@@ -4216,7 +4114,7 @@ class GwyProcessorGUI(tk.Tk):
             si_unit_z=_unit_of(template, "si_unit_z") or None,
         )
         self.channels[unique] = field
-        self.channel_combo["values"] = list(self.channels)
+        gq.set_items(self.channel_combo, list(self.channels))
 
         if select:
             # select_channel() resets the history, so suppress its prompt by
@@ -4236,7 +4134,8 @@ class GwyProcessorGUI(tk.Tk):
         image (the two-way merge needs the forward/backward pair)."""
         if not self.channels:
             return None
-        fwd_title, bwd_title = gtw.find_pair(self.channels, self.channel_var.get())
+        fwd_title, bwd_title = gtw.find_pair(self.channels,
+                                             self.channel_var.get())
         z = getattr(self, "z_factor", 1.0)
         context = {"fwd_title": fwd_title, "bwd_title": bwd_title,
                    "fwd": None, "bwd": None, "channels": self.channels}
@@ -4258,9 +4157,8 @@ class GwyProcessorGUI(tk.Tk):
             else:
                 new_data = func(self.data, params, self.dx, self.dy)
         except Exception as e:
-            messagebox.showerror(
-                "Processing error", f"{describe_step(op_key, params)} failed:\n{e}"
-            )
+            gq.show_error(self, "Processing error",
+                          f"{describe_step(op_key, params)} failed:\n{e}")
             return
         self._push_undo()
         self.data = new_data
@@ -4292,20 +4190,20 @@ class GwyProcessorGUI(tk.Tk):
         """Open a window showing the current FFT magnitude spectrum."""
         if not self._require_data():
             return
-        mag, extent = gp.get_2d_fft_magnitude(self.data, dx=self.dx, dy=self.dy)
-        win = tk.Toplevel(self)
-        win.title("2D FFT magnitude")
-        fig = Figure(figsize=(6, 5), dpi=100)
-        ax = fig.add_subplot(111)
-        im = ax.imshow(mag, extent=extent, cmap="viridis", origin="upper", aspect="equal")
+        mag, extent = gp.get_2d_fft_magnitude(self.data, dx=self.dx,
+                                              dy=self.dy)
+        win = gq.ToolWindow(self, "2D FFT magnitude", (700, 620))
+        figure, canvas, toolbar = gq.figure_panel(win, (6, 5))
+        win.setLayout(gq.column(canvas, toolbar))
+        ax = figure.add_subplot(111)
+        im = ax.imshow(mag, extent=extent, cmap="viridis", origin="upper",
+                       aspect="equal")
         ax.set_xlabel(f"Frequency X (1/{self.spatial_units})")
         ax.set_ylabel(f"Frequency Y (1/{self.spatial_units})")
         ax.set_title("2D FFT magnitude (dB)")
-        fig.colorbar(im, ax=ax, fraction=0.046)
-        canvas = FigureCanvasTkAgg(fig, master=win)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(canvas, win).update()
+        figure.colorbar(im, ax=ax, fraction=0.046)
         canvas.draw()
+        win.show()
 
     # ------------------------------------------------ Undo / redo / logging --
 
@@ -4364,18 +4262,16 @@ class GwyProcessorGUI(tk.Tk):
         stamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{stamp}] {message}"
         self.log_entries.append(entry)
-        self.log_list.insert(tk.END, entry)
-        self.log_list.see(tk.END)
+        self.log_list.addItem(entry)
+        self.log_list.scrollToBottom()
 
     def save_log(self):
         if not self.log_entries:
-            messagebox.showinfo("Empty log", "There is nothing to save yet.")
+            gq.show_info(self, "Empty log", "There is nothing to save yet.")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt")],
-            initialfile="processing_log.txt",
-        )
+        path = gq.ask_save_filename(
+            self, "Save the processing log", "Text files (*.txt)",
+            initialfile="processing_log.txt")
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
@@ -4420,12 +4316,12 @@ class GwyProcessorGUI(tk.Tk):
     def save_image(self):
         if not self._require_data():
             return
-        base = os.path.splitext(os.path.basename(self.filename or "processed"))[0]
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png"), ("NumPy data", "*.npy")],
-            initialfile=f"{base}_processed.png",
-        )
+        base = os.path.splitext(
+            os.path.basename(self.filename or "processed"))[0]
+        path = gq.ask_save_filename(
+            self, "Save the processed image",
+            "PNG image (*.png);;NumPy data (*.npy)",
+            initialfile=f"{base}_processed.png")
         if not path:
             return
         if path.lower().endswith(".npy"):
@@ -4448,7 +4344,8 @@ class GwyProcessorGUI(tk.Tk):
         pure_path = os.path.join(pure_dir, os.path.basename(path))
         save_pure_image(self.data, pure_path, self.x_real, self.y_real)
 
-        self._log(f"Saved {os.path.basename(path)} (+ pure/{os.path.basename(path)})")
+        self._log(f"Saved {os.path.basename(path)} "
+                  f"(+ pure/{os.path.basename(path)})")
         self.status_var.set(f"Saved {os.path.basename(path)} and pure copy")
 
     def save_to_gwy(self):
@@ -4462,13 +4359,12 @@ class GwyProcessorGUI(tk.Tk):
         if not self._require_data():
             return
         base = os.path.splitext(os.path.basename(self.filename or "image"))[0]
-        path = filedialog.asksaveasfilename(
-            defaultextension=".gwy",
-            filetypes=[("Gwyddion files", "*.gwy")],
+        path = gq.ask_save_filename(
+            self, "Save the channel to a .gwy file", GWY_FILTER,
             initialfile=f"{base}_processed.gwy",
             initialdir=os.path.dirname(self.filename or "") or ".",
-            confirmoverwrite=False,  # existing files are appended to, not replaced
-        )
+            # existing files are appended to, not replaced
+            confirm_overwrite=False)
         if not path:
             return
         title = f"{base} - {self.channel_var.get()} (processed)"
@@ -4486,7 +4382,8 @@ class GwyProcessorGUI(tk.Tk):
                 extra_channels=list(self.channels.items()),
             )
         except Exception as e:
-            messagebox.showerror("Save error", f"Could not write .gwy file:\n{e}")
+            gq.show_error(self, "Save error",
+                          f"Could not write .gwy file:\n{e}")
             return
         extra_txt = f" (+ {len(extras)} original channels)" if extras else ""
         self._log(f"Saved channel {n} '{title}'{extra_txt} to "
@@ -4499,24 +4396,25 @@ class GwyProcessorGUI(tk.Tk):
     def batch_dialog(self):
         """Ask for input/output folders and replay the current pipeline."""
         if not self.pipeline:
-            messagebox.showinfo(
-                "No pipeline",
-                "Apply at least one processing step to the current image first.\n"
-                "The batch run replays those same steps on every file.",
+            gq.show_info(
+                self, "No pipeline",
+                "Apply at least one processing step to the current image "
+                "first.\nThe batch run replays those same steps on every file.",
             )
             return
         channel = self.channel_var.get()
-        steps = "\n".join(f"  {i+1}. {describe_step(*s)}" for i, s in enumerate(self.pipeline))
-        if not messagebox.askokcancel(
-            "Batch process",
-            f"Channel: {channel}\nPipeline to apply to every .gwy file:\n{steps}\n\n"
-            "Choose the input folder next.",
+        steps = "\n".join(f"  {i+1}. {describe_step(*s)}"
+                          for i, s in enumerate(self.pipeline))
+        if not gq.ask_ok_cancel(
+            self, "Batch process",
+            f"Channel: {channel}\nPipeline to apply to every .gwy file:\n"
+            f"{steps}\n\nChoose the input folder next.",
         ):
             return
-        in_dir = filedialog.askdirectory(title="Select folder with .gwy files")
+        in_dir = gq.ask_directory(self, "Select folder with .gwy files")
         if not in_dir:
             return
-        out_dir = filedialog.askdirectory(title="Select output folder")
+        out_dir = gq.ask_directory(self, "Select output folder")
         if not out_dir:
             return
 
@@ -4524,7 +4422,8 @@ class GwyProcessorGUI(tk.Tk):
             f for f in os.listdir(in_dir) if f.lower().endswith(".gwy")
         )
         if not files:
-            messagebox.showinfo("No files", "No .gwy files found in the selected folder.")
+            gq.show_info(self, "No files",
+                         "No .gwy files found in the selected folder.")
             return
 
         # Run in a background thread so the UI stays responsive.
@@ -4647,14 +4546,23 @@ class GwyProcessorGUI(tk.Tk):
         self._set_status_async(
             f"Batch done: {ok}/{len(files)} processed. Log: {log_path}"
         )
-        self.after(0, lambda: self._log(
-            f"Batch processed {ok}/{len(files)} files from {in_dir}"
-        ))
+        self.batch_log.emit(
+            f"Batch processed {ok}/{len(files)} files from {in_dir}")
 
     def _set_status_async(self, text):
-        self.after(0, lambda: self.status_var.set(text))
+        self.batch_status.emit(text)
+
+    def _on_batch_status(self, text):
+        self.status_var.set(text)
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    window = GwyProcessorGUI()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = GwyProcessorGUI()
-    app.mainloop()
+    main()

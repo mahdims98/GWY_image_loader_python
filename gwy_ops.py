@@ -21,8 +21,9 @@ identically or the same file looks like two different files.
 
 Nothing here draws anything or knows what is drawing it. No GUI toolkit is
 imported and no window is ever mentioned, so a script that only wants to
-replay a pipeline can import this on its own, and a front end written in
-something other than Tkinter has nothing here to rewrite.
+replay a pipeline can import this on its own. That is also what made the
+front end replaceable: it was rewritten from Tkinter to Qt without a line of
+this file changing.
 """
 
 import re
