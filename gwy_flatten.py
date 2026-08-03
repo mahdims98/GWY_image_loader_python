@@ -86,8 +86,8 @@ Three things to know before choosing it.
     to hear, and the difference matters. Its job is to enclose the whole
     sample; a fit's need is for whatever is left over to be enough to fit
     through. Over 30 of the scans here it marked more than 85 % of the
-    frame on 20 and left at least one scan line with no background at all
-    on 23, against 10 and 11 for Otsu and none for the adaptive threshold -
+    frame on 16 and left at least one scan line with no background at all
+    on 24, against 10 and 11 for Otsu and none for the adaptive threshold -
     not because it was wrong, but because on these samples the cells really
     do cover the frame. That is why it is offered rather than assumed:
     `otsu` is still the default.
@@ -574,11 +574,23 @@ def segment_foreground(data, detect=DEFAULTS["detect"],
         if detect in ("concave", "both"):
             parts.append(below)
 
+    # Holes are filled for a threshold and not for the outlines, and the two
+    # cases are opposite. What a threshold encloses and leaves out is a dip
+    # in the middle of a feature - still feature, and a piece of the sample
+    # handed to the fit if it is left open. What the outlines enclose and
+    # leave out is the ground *between* features: the rims they rejected and
+    # the patches too small to keep, which is background, and filling it is
+    # how a frame of packed cells becomes a mask over the whole frame with
+    # nothing left to fit. Measured over 30 scans, filling took the median
+    # coverage from 82 % to 96 % and covered 10 of them entirely.
+    fill = threshold != "shape"
     mask = np.zeros(data.shape, dtype=bool)
     for part in parts:
-        part = _drop_small(ndimage.binary_fill_holes(part), min_area)
-        part = ndimage.binary_fill_holes(expand_contour(data, part, expand,
-                                                        edge))
+        if fill:
+            part = ndimage.binary_fill_holes(part)
+        part = expand_contour(data, _drop_small(part, min_area), expand, edge)
+        if fill:
+            part = ndimage.binary_fill_holes(part)
         mask |= part
     if grow > 0 and mask.any():
         mask = ndimage.binary_dilation(mask, iterations=int(grow))

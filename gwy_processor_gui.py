@@ -1034,11 +1034,21 @@ class SmartLevelDialog(OperationDialog):
         ("1. Find the features",
          ("detect", "threshold", "detail", "edge_level", "smoothness",
           "feature_size", "neighbourhood", "sensitivity")),
-        ("2. Take the outline out to the foot of each one",
+        ("2. Cover the whole of each one, sides included",
          ("min_area", "expand", "edge", "grow")),
         ("3. Fit the background to what is left",
          ("fit", "order", "window", "passes")),
     )
+    #: A sentence at the top of a group, for the step whose purpose is not
+    #: obvious from its controls.
+    NOTES = {
+        "2. Cover the whole of each one, sides included":
+            "Whatever found the features marks their tops and stops "
+            "somewhere on their sides. The sides are the steepest part of "
+            "the error, so they are pushed outwards until the surface goes "
+            "flat again - that is where the feature really ends and the "
+            "background really starts.",
+    }
     #: Which of the first group belong to which route. Everything named here
     #: is greyed out when another route is chosen, so the window always shows
     #: what is actually being used - the settings of a route that is not
@@ -1071,7 +1081,16 @@ class SmartLevelDialog(OperationDialog):
             layout = gq.FlowLayout()
             for name in names:
                 layouts[name] = layout
-            self._layout.addWidget(gq.group(title, layout))
+            note = self.NOTES.get(title)
+            if note:
+                # a line of its own above the controls, not one more item
+                # wrapping among them
+                stack = QtWidgets.QVBoxLayout()
+                stack.addWidget(gq.label(note, wrap=True))
+                stack.addLayout(layout)
+                self._layout.addWidget(gq.group(title, stack))
+            else:
+                self._layout.addWidget(gq.group(title, layout))
 
         for p in self.spec["params"]:
             self._make_param(layouts[p["name"]], p)
@@ -1211,8 +1230,16 @@ class SmartLevelDialog(OperationDialog):
                  f"{'s' if len(self.excluded) > 1 else ''} excluded by hand")
         warn = ""
         if res["coverage"] > 0.85:
-            warn = ("  -- almost nothing is left to fit; loosen the "
-                    "threshold or check the mask.")
+            # Name the control that acts on it: "loosen the threshold" is no
+            # help when the route in use has no threshold in it.
+            hint = {
+                "shape": "lower the smoothness, so that fewer patches count "
+                         "as sample",
+                "adaptive": "raise the threshold offset",
+                "otsu": "raise the feature size",
+            }.get(self.vars["threshold"].get(), "loosen the threshold")
+            warn = f"  -- almost nothing is left to fit; {hint}, or check " \
+                   f"the mask."
         elif res["coverage"] < 0.005:
             warn = ("  -- nothing was masked, so this is the ordinary "
                     "background subtraction.")
