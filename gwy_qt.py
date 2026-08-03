@@ -21,9 +21,18 @@ question-and-answer boxes behind names that say what they ask; a plain window
 that says whether it is still open, because a diagnostics window is opened,
 closed and re-opened while the dialog that owns it keeps a handle on it; and
 a matplotlib canvas with its toolbar, made the same way every time.
+
+Three of them are here because the windows have to survive being resized. Qt's
+box layouts do not wrap, so a bar of controls sets the smallest width the
+window can ever have: `FlowLayout` wraps it onto a second line instead. A long
+file path does the same thing to a label, so `ElidedLabel` shortens the text
+rather than the window's freedom. And a matplotlib figure keeps the margins it
+was laid out with, which stop fitting the moment the canvas changes shape, so
+`figure_panel` re-runs `tight_layout` once a resize has settled.
 """
 
 import os
+import warnings
 
 # qtpy takes the first Qt binding it can import and PyQt5 usually wins that
 # race. Say so explicitly when PySide6 is installed - the binding the 3D
@@ -429,14 +438,66 @@ def is_open(window):
     return window is not None and window.is_open()
 
 
-def figure_panel(parent, figsize, dpi=100):
-    """A matplotlib figure with its canvas and navigation toolbar."""
+def figure_panel(parent, figsize, dpi=100, responsive=True):
+    """A matplotlib figure with its canvas and navigation toolbar.
+
+    `figsize` is the shape the panel would like to be, not the shape it keeps:
+    the canvas grows and shrinks with the window, and `responsive` re-fits the
+    figure's margins whenever it does (see `_keep_tight`).
+    """
     figure = Figure(figsize=figsize, dpi=dpi)
     canvas = FigureCanvasQTAgg(figure)
     canvas.setParent(parent)
     canvas.setFocusPolicy(QtCore.Qt.ClickFocus)
+    canvas.setMinimumSize(120, 100)
     toolbar = NavigationToolbar2QT(canvas, parent)
+    if responsive:
+        _keep_tight(figure, canvas)
     return figure, canvas, toolbar
+
+
+def _keep_tight(figure, canvas):
+    """Re-fit the figure's margins after the canvas has been resized.
+
+    Every panel here ends its drawing with `tight_layout`, which measures the
+    labels and the colour bars once and writes the margins it needs as
+    fractions of the canvas. Those fractions stop being right as soon as the
+    canvas changes shape - the axes keep their share of a canvas half the
+    height, and the tick labels grow into the title. Re-running the fit puts
+    that back. It waits for the drag to stop first, because a resize arrives
+    once per pixel and a re-fit is not free.
+    """
+    timer = Timer(canvas)
+
+    def margins():
+        p = figure.subplotpars
+        return (p.left, p.right, p.bottom, p.top)
+
+    def settled():
+        if not figure.axes:
+            return
+        try:
+            # A panel with a hand-placed axes says so as a warning and fits it
+            # badly; that is a reason to leave this figure's margins alone, so
+            # the warning is read as the refusal it is.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)
+                # One pass measures the labels where the *previous* size left
+                # them, and on an image with a fixed aspect ratio it lands
+                # short - far enough short, on a small window, to put the y
+                # axis label off the edge of the canvas. A second pass measures
+                # the answer the first one gave and settles.
+                for _ in range(3):
+                    before = margins()
+                    figure.tight_layout()
+                    if margins() == before:
+                        break
+        except Exception:
+            return
+        canvas.draw_idle()
+
+    canvas._tight_timer = timer     # the canvas owns it, so it stays alive
+    canvas.mpl_connect("resize_event", lambda _e: timer.start(120, settled))
 
 
 class ColourStrip(QtWidgets.QWidget):
@@ -471,6 +532,12 @@ def label(text="", wrap=False, colour=None, bold=False, fixed=False,
     widget = QtWidgets.QLabel(text)
     if wrap:
         widget.setWordWrap(True)
+        # A wrapped label is taller the narrower it is, and a layout only asks
+        # about that if the size policy says to. Without this the last line is
+        # cut off whenever the text wraps to more lines than it started with.
+        policy = widget.sizePolicy()
+        policy.setHeightForWidth(True)
+        widget.setSizePolicy(policy)
     if colour is not None:
         widget.setStyleSheet(f"color: {colour};")
     if bold or fixed:
@@ -504,6 +571,48 @@ def bound_label(var, **kwargs):
     return widget
 
 
+class ElidedLabel(QtWidgets.QLabel):
+    """A label that shortens its text instead of insisting on room for it all.
+
+    This is what the file and folder names are shown in. A path is as long as
+    it happens to be, and an ordinary label would take that length as a demand:
+    the window could then never be made narrower than someone's directory
+    layout. This one shows as much as fits, puts the rest under the pointer as
+    a tooltip, and asks for nothing.
+    """
+
+    def __init__(self, text="", parent=None, minimum=60):
+        super().__init__(text, parent)
+        self._full = text
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                           QtWidgets.QSizePolicy.Preferred)
+        self.setMinimumWidth(minimum)
+
+    def setText(self, text):
+        self._full = str(text)
+        self.setToolTip(self._full)
+        self._elide()
+
+    def text(self):
+        """The whole text, not the shortened one that is on screen."""
+        return self._full
+
+    def sizeHint(self):
+        """A width it would like, not the width the whole text would need."""
+        hint = super().sizeHint()
+        hint.setWidth(min(hint.width(), 260))
+        return hint
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self):
+        metrics = QtGui.QFontMetrics(self.font())
+        super().setText(metrics.elidedText(
+            self._full, QtCore.Qt.ElideMiddle, max(self.width() - 2, 20)))
+
+
 def group(title, layout):
     """A titled box around a layout."""
     box = QtWidgets.QGroupBox(title)
@@ -511,36 +620,42 @@ def group(title, layout):
     return box
 
 
-def row(*widgets, spacing=4, margins=(0, 0, 0, 0), stretch_at_end=False):
-    """A horizontal layout of widgets; an integer stands for a stretch."""
-    layout = QtWidgets.QHBoxLayout()
-    layout.setContentsMargins(*margins)
-    layout.setSpacing(spacing)
+def _fill(layout, widgets):
+    """An integer stands for a stretch, a (widget, n) pair for one that takes
+    n shares of whatever room is spare."""
     for item in widgets:
         if isinstance(item, int):
             layout.addStretch(item)
+        elif isinstance(item, tuple):
+            thing, share = item
+            if isinstance(thing, QtWidgets.QLayout):
+                layout.addLayout(thing, share)
+            else:
+                layout.addWidget(thing, share)
         elif isinstance(item, QtWidgets.QLayout):
             layout.addLayout(item)
         else:
             layout.addWidget(item)
+    return layout
+
+
+def row(*widgets, spacing=4, margins=(0, 0, 0, 0), stretch_at_end=False):
+    """A horizontal layout of widgets."""
+    layout = QtWidgets.QHBoxLayout()
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(spacing)
+    _fill(layout, widgets)
     if stretch_at_end:
         layout.addStretch(1)
     return layout
 
 
 def column(*widgets, spacing=4, margins=(0, 0, 0, 0)):
-    """A vertical layout of widgets; an integer stands for a stretch."""
+    """A vertical layout of widgets."""
     layout = QtWidgets.QVBoxLayout()
     layout.setContentsMargins(*margins)
     layout.setSpacing(spacing)
-    for item in widgets:
-        if isinstance(item, int):
-            layout.addStretch(item)
-        elif isinstance(item, QtWidgets.QLayout):
-            layout.addLayout(item)
-        else:
-            layout.addWidget(item)
-    return layout
+    return _fill(layout, widgets)
 
 
 def button(text, callback, width=None):
@@ -549,3 +664,151 @@ def button(text, callback, width=None):
     if width is not None:
         widget.setFixedWidth(width)
     return widget
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """A horizontal layout that wraps onto the next line when it runs out.
+
+    Qt's box layouts do not wrap. A bar of a dozen controls laid out in a row
+    therefore sets the smallest width its window can ever have, and the tabs
+    here have bars like that. This lays the same controls out left to right and
+    starts a new line when the next one would not fit, so the window can be
+    made as narrow as the widest single control and the bar simply gets taller.
+
+    Hidden widgets are skipped rather than left as holes, which is what the
+    operation dialogs need: they hide the parameters that the chosen method
+    does not have.
+    """
+
+    def __init__(self, parent=None, spacing=6, margins=(0, 0, 0, 0)):
+        super().__init__(parent)
+        self._items = []
+        self._space = spacing
+        self.setContentsMargins(*margins)
+
+    # ---- the five QLayout has no default for ----
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return QtCore.Qt.Orientations(QtCore.Qt.Orientation(0))
+
+    # ---- height depends on width; that is the whole point ----
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._lay_out(QtCore.QRect(0, 0, width, 0), place=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._lay_out(rect, place=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QtCore.QSize()
+        for item in self._shown():
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QtCore.QSize(margins.left() + margins.right(),
+                                   margins.top() + margins.bottom())
+
+    def _shown(self):
+        for item in self._items:
+            widget = item.widget()
+            if widget is None or not widget.isHidden():
+                yield item
+
+    def _lay_out(self, rect, place):
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(),
+                             -margins.right(), -margins.bottom())
+        x, y, line_height = area.x(), area.y(), 0
+        for item in self._shown():
+            hint = item.sizeHint()
+            if x + hint.width() > area.right() + 1 and line_height > 0:
+                x = area.x()
+                y += line_height + self._space
+                line_height = 0
+            if place:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x += hint.width() + self._space
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
+
+
+def flow(*widgets, spacing=6, margins=(0, 0, 0, 0)):
+    """A `FlowLayout` of widgets; a layout is wrapped in a widget of its own."""
+    layout = FlowLayout(spacing=spacing, margins=margins)
+    for item in widgets:
+        if isinstance(item, QtWidgets.QLayout):
+            holder = QtWidgets.QWidget()
+            holder.setLayout(item)
+            layout.addWidget(holder)
+        else:
+            layout.addWidget(item)
+    return layout
+
+
+def cluster(*widgets, spacing=4):
+    """Widgets that belong together, as one widget for a `FlowLayout`.
+
+    A label and the box it names have to wrap as one thing, or a narrow window
+    leaves "Cell size (% of frame):" at the end of one line and its value at
+    the start of the next.
+    """
+    holder = QtWidgets.QWidget()
+    holder.setLayout(row(*widgets, spacing=spacing))
+    return holder
+
+
+def scroll(widget):
+    """`widget` in a scroll area, so a short window can still reach all of it."""
+    area = QtWidgets.QScrollArea()
+    area.setWidget(widget)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QtWidgets.QFrame.NoFrame)
+    return area
+
+
+def splitter(orientation, *widgets, sizes=None, stretch=None):
+    """A draggable divider between widgets, with the starting split given."""
+    split = QtWidgets.QSplitter(orientation)
+    for widget in widgets:
+        split.addWidget(widget)
+    split.setChildrenCollapsible(False)
+    for index, factor in enumerate(stretch or ()):
+        split.setStretchFactor(index, factor)
+    if sizes is not None:
+        split.setSizes(list(sizes))
+    return split
+
+
+def action(parent, text, callback, shortcut=None, tip=None):
+    """A QAction, for the things that live on the ribbon."""
+    act = QtGui.QAction(text, parent)
+    act.triggered.connect(lambda *_a: callback())
+    if shortcut is not None:
+        act.setShortcut(QtGui.QKeySequence(shortcut))
+        tip = f"{tip or text}  ({act.shortcut().toString()})"
+    if tip is not None:
+        act.setToolTip(tip)
+        act.setStatusTip(tip)
+    return act

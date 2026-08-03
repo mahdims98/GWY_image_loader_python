@@ -71,6 +71,13 @@ dialogs want - an observable value that tolerates being typed into, a
 restartable debounce timer, a window that says whether it is still open -
 is in gwy_qt.
 
+Every window here can be resized to whatever room there is for it. The main
+window puts the session-wide actions on a ribbon along the top and the image
+next to a panel of operations that the divider between them can be dragged;
+the bars of controls in the tabs and the dialogs wrap onto a second line
+rather than hold the window open; and the figures re-fit their margins each
+time they change shape, so the axis labels stay on the canvas at any size.
+
 Run with:  python gwy_processor_gui.py
 """
 
@@ -762,9 +769,13 @@ class OperationDialog(gq.ToolWindow):
     # ---- UI construction ----
 
     def _build_params(self):
-        self.params_layout = QtWidgets.QHBoxLayout()
+        # A flow layout: the parameters of an operation are a bar of boxes,
+        # and there are dialogs with a dozen of them. Wrapping onto a second
+        # line is what lets the window be made narrower than the bar.
+        self.params_layout = gq.FlowLayout()
         self.param_widgets = {}
         self.param_labels = {}
+        self.param_holders = {}
 
         if not self.spec["params"]:
             self.params_layout.addWidget(
@@ -772,7 +783,6 @@ class OperationDialog(gq.ToolWindow):
 
         for p in self.spec["params"]:
             self._make_param(self.params_layout, p)
-        self.params_layout.addStretch(1)
         self._layout.addLayout(self.params_layout)
 
         self.status_var = gq.StringVar("")
@@ -784,17 +794,20 @@ class OperationDialog(gq.ToolWindow):
     def _make_param(self, layout, p):
         """Build the label and the widget for one parameter inside `layout`.
 
+        The two go into one small widget of their own, so that a bar which
+        wraps breaks between parameters and never between a name and its box.
         Kept separate from `_build_params` so a dialog with more parameters
         than fit on one line can put them in several boxes; `_show_params`
         works either way, because a hidden widget takes no room in a Qt
         layout and reappears where it was built."""
         label = QtWidgets.QLabel(p["label"] + ":")
         var, widget = param_widget(p)
-        layout.addWidget(label)
-        layout.addWidget(widget)
+        holder = gq.cluster(label, widget)
+        layout.addWidget(holder)
 
         var.trace_add(self._on_param_change)
         self.param_labels[p["name"]] = label
+        self.param_holders[p["name"]] = holder
         self.vars[p["name"]] = var
         self.param_widgets[p["name"]] = widget
         return widget
@@ -802,10 +815,8 @@ class OperationDialog(gq.ToolWindow):
     def _show_params(self, names):
         """Show only these parameter widgets. Used by dialogs whose
         parameters depend on a selected method."""
-        for name, label in self.param_labels.items():
-            visible = name in names
-            label.setVisible(visible)
-            self.param_widgets[name].setVisible(visible)
+        for name, holder in self.param_holders.items():
+            holder.setVisible(name in names)
 
     def _build_figure(self):
         self.figure, self.canvas, self.toolbar = gq.figure_panel(
@@ -936,8 +947,7 @@ class PolynomialDialog(OperationDialog):
         self.sync_var = gq.BoolVar(False)
         check = gq.bind_check(QtWidgets.QCheckBox("Sync x/y"), self.sync_var)
         check.toggled.connect(lambda *_a: self._on_sync_toggle())
-        # before the trailing stretch, so it sits next to the two orders
-        self.params_layout.insertWidget(self.params_layout.count() - 1, check)
+        self.params_layout.addWidget(check)   # next to the two orders
         self.vars["x_order"].trace_add(self._on_x_change)
 
     def _on_sync_toggle(self):
@@ -1009,19 +1019,17 @@ class SmartLevelDialog(OperationDialog):
     def _build_params(self):
         self.param_widgets = {}
         self.param_labels = {}
+        self.param_holders = {}
 
-        layouts, rows = {}, []
+        layouts = {}
         for title, names in self.GROUPS:
-            layout = QtWidgets.QHBoxLayout()
-            rows.append(layout)
+            layout = gq.FlowLayout()
             for name in names:
                 layouts[name] = layout
             self._layout.addWidget(gq.group(title, layout))
 
         for p in self.spec["params"]:
             self._make_param(layouts[p["name"]], p)
-        for layout in rows:
-            layout.addStretch(1)
 
         self.excluded_var = gq.StringVar("none")
         excluded = gq.label("none")
@@ -2253,7 +2261,7 @@ class TwoWayDialog(ZoomAreaMixin, gq.ToolWindow):
     # ---- UI construction ----
 
     def _build_params(self):
-        outer = QtWidgets.QHBoxLayout()
+        outer = gq.FlowLayout()      # the five boxes wrap in a narrow window
         by_name = {p["name"]: p for p in self.spec["params"]}
         self._param_widgets = {}
 
@@ -2270,17 +2278,19 @@ class TwoWayDialog(ZoomAreaMixin, gq.ToolWindow):
                 self._param_widgets[name] = (label, widget)
             grid.setColumnStretch(1, 1)
             grid.setRowStretch(len(names), 1)
-            outer.addWidget(gq.group(title, grid), 1)
+            outer.addWidget(gq.group(title, grid))
 
         self._update_param_visibility()
         self._build_display_controls(outer)
         self._layout.addLayout(outer)
 
+        # Both wrap: this line is as long as the numbers in it happen to be,
+        # and a line that cannot wrap would set the dialog's smallest width.
         self.info_var = gq.StringVar(f"{self.fwd_title}  +  {self.bwd_title}")
-        info = gq.label(self.info_var.get(), fixed=True)
+        info = gq.label(self.info_var.get(), fixed=True, wrap=True)
         self.info_var.trace_add(lambda: info.setText(self.info_var.get()))
         self.status_var = gq.StringVar("")
-        status = gq.label(colour="red")
+        status = gq.label(colour="red", wrap=True)
         self.status_var.trace_add(lambda: status.setText(self.status_var.get()))
         self._layout.addLayout(gq.row(info, 1, status))
 
@@ -2958,11 +2968,11 @@ class QuickViewTab(QtWidgets.QWidget):
     # ------------------------------------------------------------- layout --
 
     def _build(self):
-        self.folder_label = QtWidgets.QLabel("No folder selected")
+        self.folder_label = gq.ElidedLabel("No folder selected")
 
         self.channel_var = gq.StringVar()
         self.channel_combo = QtWidgets.QComboBox()
-        self.channel_combo.setMinimumWidth(190)
+        self.channel_combo.setMinimumWidth(150)
         gq.bind_combo(self.channel_combo, self.channel_var)
         self.channel_combo.textActivated.connect(
             lambda *_a: self.show_index(self.index))
@@ -2972,8 +2982,10 @@ class QuickViewTab(QtWidgets.QWidget):
         self.count_label.setFixedWidth(70)
         self.next_btn = gq.button("Next >", lambda: self.step(1))
 
+        # No stretch: the elided folder name takes the slack itself, so it
+        # shows as much of the path as the window happens to allow.
         bar = gq.row(gq.button("Select folder...", self.select_folder),
-                     self.folder_label, 1,
+                     (self.folder_label, 1),
                      QtWidgets.QLabel("Channel:"), self.channel_combo,
                      self.prev_btn, self.count_label, self.next_btn)
 
@@ -3205,11 +3217,11 @@ class BalancedViewTab(QtWidgets.QWidget):
     # ------------------------------------------------------------- layout --
 
     def _build(self):
-        self.folder_label = QtWidgets.QLabel("No folder selected")
+        self.folder_label = gq.ElidedLabel("No folder selected")
 
         self.channel_var = gq.StringVar()
         self.channel_combo = QtWidgets.QComboBox()
-        self.channel_combo.setMinimumWidth(190)
+        self.channel_combo.setMinimumWidth(150)
         gq.bind_combo(self.channel_combo, self.channel_var)
         self.channel_combo.textActivated.connect(lambda *_a: self.analyse())
 
@@ -3219,7 +3231,7 @@ class BalancedViewTab(QtWidgets.QWidget):
         self.next_btn = gq.button("Next >", lambda: self.step(1))
 
         files = gq.row(gq.button("Select folder...", self.select_folder),
-                       self.folder_label, 1,
+                       (self.folder_label, 1),
                        QtWidgets.QLabel("Channel:"), self.channel_combo,
                        self.prev_btn, self.count_label, self.next_btn)
 
@@ -3247,12 +3259,15 @@ class BalancedViewTab(QtWidgets.QWidget):
                              self.zero_var)
         zero.toggled.connect(lambda *_a: self.rebalance())
 
-        row = gq.row(QtWidgets.QLabel("Mode:"), mode, 0,
-                     QtWidgets.QLabel("Cell size (% of frame):"), cell, 0,
-                     QtWidgets.QLabel("Cell percentiles:"), plo,
-                     QtWidgets.QLabel("to"), phi, 0,
-                     level, zero, gq.button("Recompute", self.analyse),
-                     stretch_at_end=True)
+        # A flow layout, so a narrow window wraps this bar onto a second line
+        # instead of refusing to be narrow. Each label stays with its box.
+        row = gq.flow(
+            gq.cluster(QtWidgets.QLabel("Mode:"), mode),
+            gq.cluster(QtWidgets.QLabel("Cell size (% of frame):"), cell),
+            gq.cluster(QtWidgets.QLabel("Cell percentiles:"), plo,
+                       QtWidgets.QLabel("to"), phi),
+            gq.cluster(level, zero),
+            gq.button("Recompute", self.analyse))
 
         # ---- the range itself, and how to look at it ----
         self.vmin_var = gq.StringVar()
@@ -3270,14 +3285,14 @@ class BalancedViewTab(QtWidgets.QWidget):
         gq.bind_combo(view, self.view_var)
         view.textActivated.connect(lambda *_a: self.redraw())
 
-        row2 = gq.row(QtWidgets.QLabel("Range:"), self.vmin_entry,
-                      QtWidgets.QLabel("to"), self.vmax_entry,
-                      self.units_label,
-                      gq.button("Apply", self.apply_range),
-                      gq.button("Auto", self.auto_range),
-                      1,
-                      QtWidgets.QLabel("View:"), view,
-                      gq.button("Export all...", self.export))
+        row2 = gq.flow(
+            gq.cluster(QtWidgets.QLabel("Range:"), self.vmin_entry,
+                       QtWidgets.QLabel("to"), self.vmax_entry,
+                       self.units_label),
+            gq.cluster(gq.button("Apply", self.apply_range),
+                       gq.button("Auto", self.auto_range)),
+            gq.cluster(QtWidgets.QLabel("View:"), view),
+            gq.button("Export all...", self.export))
 
         self.name_label = gq.label("", bold=True, align=QtCore.Qt.AlignCenter)
 
@@ -3291,8 +3306,9 @@ class BalancedViewTab(QtWidgets.QWidget):
             "where the cells are and where the substrate is, and the "
             "whole folder is then drawn on one colour scale.")
         status = gq.bound_label(self.status_var, wrap=True)
-        status.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
-                             QtWidgets.QSizePolicy.Preferred)
+        policy = status.sizePolicy()      # keep what wrapping asked for
+        policy.setHorizontalPolicy(QtWidgets.QSizePolicy.Expanding)
+        status.setSizePolicy(policy)
         bottom = gq.row(status, self.progress)
 
         self.setLayout(gq.column(
@@ -3890,40 +3906,29 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------ UI --
 
     def _build_layout(self):
+        self.status_var = gq.StringVar("Ready")
+
         # Three tabs: the processing workbench and the two folder views.
         self.tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        main_tab = QtWidgets.QWidget()
+        self._build_ribbon()
+
         left = QtWidgets.QWidget()
-        left.setFixedWidth(300)
+        left.setMaximumWidth(460)
         left_column = QtWidgets.QVBoxLayout(left)
         left_column.setContentsMargins(8, 8, 8, 8)
 
         # ---- File / channel section ----
-        self.file_label = gq.label("No file loaded", wrap=True)
+        self.file_label = gq.ElidedLabel("No file loaded")
         self.channel_var = gq.StringVar()
         self.channel_combo = QtWidgets.QComboBox()
         gq.bind_combo(self.channel_combo, self.channel_var)
         self.channel_combo.textActivated.connect(
             lambda *_a: self.select_channel())
         left_column.addWidget(gq.group("File", gq.column(
-            gq.button("Open .gwy file...", self.open_file),
             self.file_label,
             QtWidgets.QLabel("Channel:"), self.channel_combo)))
-
-        # ---- Display section: false-colour gradient ----
-        self.cmap_var = gq.StringVar(gcm.current_name())
-        self.cmap_combo = QtWidgets.QComboBox()
-        self.cmap_combo.addItems(list(gcm.names()))
-        self.cmap_combo.setMaxVisibleItems(20)
-        gq.bind_combo(self.cmap_combo, self.cmap_var)
-        self.cmap_combo.textActivated.connect(lambda *_a: self.select_cmap())
-        self.cmap_strip = gq.ColourStrip()
-        self.cmap_strip.set_cmap(gcm.current())
-        left_column.addWidget(gq.group("Display", gq.column(
-            gq.row(QtWidgets.QLabel("Colour map:"), self.cmap_combo),
-            self.cmap_strip)))
 
         # ---- Operations section: one button per dialog ----
         ops = QtWidgets.QVBoxLayout()
@@ -3941,26 +3946,11 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
             ops.addLayout(line)
         left_column.addWidget(gq.group("Operations", ops))
 
-        # ---- Undo / reset ----
-        left_column.addLayout(gq.row(
-            gq.button("Undo", self.undo),
-            gq.button("Redo", self.redo),
-            gq.button("Reset to original", self.reset)))
-
         # ---- Log section ----
         self.log_list = QtWidgets.QListWidget()
         self.log_list.setMinimumHeight(110)
         left_column.addWidget(gq.group("Processing log", gq.column(
             self.log_list, gq.button("Save log...", self.save_log))), 1)
-
-        # ---- Save / batch ----
-        left_column.addWidget(gq.group("Output", gq.column(
-            gq.button("Save processed image...", self.save_image),
-            gq.button("Save channel to .gwy...", self.save_to_gwy),
-            gq.button("Batch process folder...", self.batch_dialog))))
-
-        self.status_var = gq.StringVar("Ready")
-        left_column.addWidget(gq.bound_label(self.status_var, wrap=True))
 
         # ---- Plot area ----
         right = QtWidgets.QWidget()
@@ -3969,8 +3959,13 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
         right.setLayout(gq.column(self.canvas, toolbar))
         right.layout().setStretch(0, 1)
 
-        main_tab.setLayout(gq.row(left, right, spacing=0))
-        main_tab.layout().setStretch(1, 1)
+        # The divider is draggable and the panel scrolls: the controls keep
+        # their width when the window grows, the image takes the rest, and a
+        # window too short for the whole panel can still be worked in.
+        main_tab = QtWidgets.QWidget()
+        main_tab.setLayout(gq.column(gq.splitter(
+            QtCore.Qt.Horizontal, gq.scroll(left), right,
+            sizes=(300, 950), stretch=(0, 1)), margins=(0, 0, 0, 0)))
         self.tabs.addTab(main_tab, "Processing")
 
         # ---- Folder tabs ----
@@ -3978,6 +3973,85 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
         self.tabs.addTab(self.quick, "Quick view")
         self.balanced = BalancedViewTab(self)
         self.tabs.addTab(self.balanced, "Balanced view")
+
+        # ---- Status bar ----
+        self.statusBar().addWidget(gq.bound_label(self.status_var), 1)
+        self._update_actions()
+
+    def _build_ribbon(self):
+        """The bar across the top.
+
+        What belongs on it is what acts on the session rather than on the
+        image: opening a file, undoing, saving, choosing the colour map -
+        every one of them reachable from wherever you are, and each with the
+        keyboard shortcut its name implies. The operations stay in the panel
+        on the left, because they are the work itself and there are a dozen of
+        them; a ribbon is for the handful of things done between them.
+        """
+        bar = QtWidgets.QToolBar("Main", self)
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        bar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self.addToolBar(bar)
+        self.ribbon = bar
+
+        bar.addWidget(self._ribbon_title("File"))
+        bar.addAction(gq.action(self, "Open .gwy...", self.open_file,
+                                "Ctrl+O", "Open a Gwyddion file"))
+        self.act_save_image = gq.action(
+            self, "Save image...", self.save_image, "Ctrl+S",
+            "Save the processed image as PNG or .npy")
+        self.act_save_gwy = gq.action(
+            self, "Save channel...", self.save_to_gwy, "Ctrl+Shift+S",
+            "Write the processed channel back into a .gwy file")
+        self.act_batch = gq.action(
+            self, "Batch folder...", self.batch_dialog, "Ctrl+B",
+            "Replay this pipeline over every .gwy file in a folder")
+        for act in (self.act_save_image, self.act_save_gwy, self.act_batch):
+            bar.addAction(act)
+
+        bar.addSeparator()
+        bar.addWidget(self._ribbon_title("Edit"))
+        self.act_undo = gq.action(self, "Undo", self.undo, "Ctrl+Z",
+                                  "Step back one operation")
+        self.act_redo = gq.action(self, "Redo", self.redo, "Ctrl+Y",
+                                  "Step forward again")
+        self.act_reset = gq.action(self, "Reset", self.reset, None,
+                                   "Back to the data as it was loaded")
+        for act in (self.act_undo, self.act_redo, self.act_reset):
+            bar.addAction(act)
+
+        bar.addSeparator()
+        bar.addWidget(self._ribbon_title("Colour map"))
+        self.cmap_var = gq.StringVar(gcm.current_name())
+        self.cmap_combo = QtWidgets.QComboBox()
+        self.cmap_combo.addItems(list(gcm.names()))
+        self.cmap_combo.setMaxVisibleItems(20)
+        gq.bind_combo(self.cmap_combo, self.cmap_var)
+        self.cmap_combo.textActivated.connect(lambda *_a: self.select_cmap())
+        self.cmap_strip = gq.ColourStrip()
+        self.cmap_strip.set_cmap(gcm.current())
+        self.cmap_strip.setFixedWidth(120)
+        bar.addWidget(self.cmap_combo)
+        bar.addWidget(self.cmap_strip)
+
+    @staticmethod
+    def _ribbon_title(text):
+        """The name of a group of ribbon buttons, set quietly to its left."""
+        widget = gq.label(text, bold=True, colour=gq.muted_colour())
+        widget.setContentsMargins(10, 0, 6, 0)
+        return widget
+
+    def _update_actions(self):
+        """Grey out what cannot be done yet - there is nothing to undo before
+        anything has been done, and nothing to save before a file is open."""
+        loaded = self.data is not None
+        for act in (self.act_save_image, self.act_save_gwy, self.act_batch):
+            act.setEnabled(loaded)
+        self.act_undo.setEnabled(bool(self.undo_stack))
+        self.act_redo.setEnabled(bool(self.redo_stack))
+        self.act_reset.setEnabled(
+            loaded and bool(self.pipeline or self.undo_stack))
 
     # ------------------------------------------------------------- Colour --
 
@@ -4310,6 +4384,7 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
         cbar.set_label(self.z_units)
         self.figure.tight_layout()
         self.canvas.draw()
+        self._update_actions()
 
     # -------------------------------------------------------------- Saving --
 
