@@ -7,13 +7,22 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 ## Files Included
 
 * **`gwy_loader.py`**: A pure Python module for parsing and reading `.gwy` files. It extracts data fields, metadata, physical dimensions, and SI units.
+* **`gwy_meta.py`**: What the microscope wrote down, in a form a person can read — the metadata block tidied (a decimal comma is a decimal point, twelve zeros are not a measurement), reduced to the handful worth seeing at a glance (mode, setpoint, frame, scan speed, the operator's comments) or grouped in full with nothing left out. It also builds the paragraph of processing history that gets appended to a channel's comments when it is saved, so a processed image carries its own record of what was done to it.
 * **`gwy_processing.py`**: A toolkit for common AFM image processing tasks (such as plane leveling and scar removal) and plotting, utilizing `numpy` and `matplotlib`.
-* **`gwy_flatten.py`**: Background subtraction that leaves the sample out of the fit — the cells, bubbles or pits are segmented and excluded first, so the polynomial cannot bend itself around them and leave trenches and uneven surfaces behind. After Wang et al. (2018), with the paper's sliding-window fit in closed form; the fitting direction can be measured from the scan and areas can be excluded by hand, after Zhang et al. (2026).
+* **`gwy_flatten.py`**: Background subtraction that leaves the sample out of the fit — the cells, bubbles or pits are segmented and excluded first, so the polynomial cannot bend itself around them and leave trenches and uneven surfaces behind. After Wang et al. (2018), with the paper's sliding-window fit in closed form; the fitting direction can be measured from the scan and areas can be excluded by hand, after Zhang et al. (2026). The features can be found by either of two height thresholds or by `gwy_segment`, which never looks at a height.
 * **`gwy_twoway.py`**: Forward/backward (two-way) scan processing — scanner lag and hysteresis alignment, parachuting-artifact detection, and soft-min merging of the two scan directions.
 * **`gwy_destripe.py`**: Stripe removal — the contourlet-domain Fourier method of Liang et al. (2016), the variational method of Rottmayer et al. (2025) and the spectrum-denoising method of Chen & Pellequer (2011).
 * **`gwy_colormaps.py`**: Gwyddion's false-colour gradients (`Gray`, `Sky`, `Body`, `Rainbow2`, `Viridis`, ... 60 in all) as matplotlib colormaps, plus the application-wide selection used by the GUI.
 * **`gwy_balance.py`**: A colour range a whole folder can share — segments each image into cells and substrate, measures both, and anchors the range on those two places instead of on the image as a whole, so the substrate reads the same colour in every image without flattening real height differences between them. Offsets only; the z scale is never touched.
-* **`gwy_processor_gui.py`**: An interactive Tkinter front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, a folder quick view, a balanced folder view, and batch folder processing.
+* **`gwy_ops.py`**: What the processing steps are. Every step is declared once here — the function that does it, the parameters it takes and their ranges, the checks that run before the call, and the sentence that goes into the log afterwards. The dialogs build their widgets from those declarations and the batch runner replays them, so an operation is added by writing an entry rather than a window. No GUI toolkit is imported, so a script that only wants to replay a pipeline can use it on its own.
+* **`gwy_export.py`**: Getting an image back out — the annotated figure with axes, colourbar and scale bar; the bare image resampled to square pixels so a non-square scan is not shown stretched; and writing a channel back into a `.gwy` container, appended so repeated saves collect in one file.
+* **`gwy_processor_gui.py`**: An interactive Qt front-end that exposes every processing step in its own dialog with live previews, undo/redo, a processing log, a folder quick view, a balanced folder view, and batch folder processing. A ribbon along the top carries the session-wide actions — open, save, undo, colour map — with their keyboard shortcuts, and every window can be resized to whatever room there is for it.
+* **`gwy_qt.py`**: The Qt joinery the front end is built out of, and nothing about AFM — an observable value that tolerates being half-typed (so a live preview knows to leave the last good picture alone while a number is still being entered), a restartable debounce timer, a window that says whether it is still open, and a matplotlib canvas with its toolbar made the same way every time. The resizing lives here too: a layout that wraps a bar of controls onto a second line instead of holding the window open, a label that shortens a long path rather than demanding room for it, and a figure that re-fits its margins once a resize has settled.
+* **`gwy_surface.py`**: One channel as a height map plus the physical size of its frame, and the mesh built from it. Shared by the 3D viewer and the Blender exporter so that what is on screen and what is rendered are the same surface.
+* **`gwy_3d_viewer.py`**: A separate GPU 3D window (Qt + PyVista/VTK) that draws a channel as a surface, with an explicit Z exaggeration, the Gwyddion gradients over a range dragged on the histogram, physically based materials, ambient occlusion, eye-dome lighting, a three-point light rig aimed by two angles with shadows, and a height-independent segmentation that can fade or flatten away everything that is not an object. See the [3D view guide](3D_VIEW_GUIDE.md).
+* **`gwy_blender_export.py`** / **`gwy_blender_render.py`**: Hand the same surface to Blender for a path-traced still. The first writes the scene and runs Blender as a subprocess; the second runs inside Blender's own Python and builds the mesh, material, lights and camera.
+* **`gwy_segment.py`**: Split a height map into the things on it, and flatten everything else onto the background it sits on or fade it out. Regions come out untyped, from three ways of looking that can be mixed: outlines (found on where the surface *changes*, so an object whose parts sit at different heights still comes out whole), long narrow crests, and whatever stands above its own surroundings. Searchable inside one rectangle, with the thresholds measured there. Pure numpy/scipy, no GUI; `scikit-image` optional and recommended.
+* **`gwy_segment_view.py`**: The flat window where that segmentation is checked and corrected: click a region to keep or drop it, drag a box to keep, drop, erase or *search inside*, brush in what the detector missed. Feeds the 3D viewer.
 
 ## Requirements
 
@@ -22,6 +31,16 @@ These tools allow you to work with Gwyddion files directly in Python without nee
 * `scipy`
 * `matplotlib`
 * `six`
+* `qtpy` and a Qt binding (`PySide6`) — for the GUI only
+
+The GUI needs `qtpy` and one Qt binding under it: `pip install qtpy PySide6`.
+`PySide6` is what it is written against and what it asks qtpy for when both
+bindings are installed. The 3D viewer (`gwy_3d_viewer.py`) additionally needs
+`pyvista` and `pyvistaqt` — `pip install pyvista pyvistaqt`. None of the
+processing modules import any of this, so a script that only loads a file and
+replays a pipeline runs without a Qt install at all. Blender
+is optional and is found on disk rather than installed into Python; set
+`GWY_BLENDER` to point at the executable if it is somewhere unusual.
 
 `gwy_twoway.py` also needs `hysteresis_compensation.py` (the power-law hysteresis
 fit) when the `model` or `model_scaled` shift models are used. It is located
@@ -66,16 +85,45 @@ in two steps: segment the features and exclude them, then fit what is left.
 
 **1. Find the features** (`segment_foreground`). A threshold gives a first
 outline, which is always too small — a threshold necessarily cuts a bump partway
-up its flank. Two thresholds are offered and they are for different samples:
+up its flank. Three routes are offered and they are for different samples:
 
 | `threshold` | How it splits | Use it when |
 | --- | --- | --- |
 | `otsu` | one threshold for the whole image, on a heavily smoothed copy | features are **large** — cells, anything a good fraction of the frame across. This is the default, and it is what the `Data to test` folders need. |
 | `adaptive` | each pixel against the median of a `neighbourhood` around it | features are **small and many** — the paper's nanobubbles and nanopits. The neighbourhood must be wider than any one feature, or the window sees the middle of a cell as its own background. |
+| `shape` | not by height at all: the frame is walled off along its own edges and the patches that are large and smooth are the features (`gwy_segment`, the 3D viewer's segmentation) | features **sit at different levels** and no single cut can catch them all. Two discs on a textured field, one 3 nm up and one 90 nm, both come back entire; Otsu keeps the tall one and loses every pixel of the short one, and so does `adaptive`. |
 
 `detect` chooses convex features (bumps, cells), concave ones (pits, holes — the
 paper complements the image; so does this) or both. `both` is refused with
-`otsu`, which splits the image in two and would therefore mask all of it.
+`otsu`, which splits the image in two and would therefore mask all of it, and
+ignored by `shape`, which finds a pit by the same rim that finds a bump.
+
+`shape` adds three settings and nothing else: `detail`, the scale the edges are
+measured at; `edge_level`, how far above the frame's own edge strength a rim has
+to be; and `smoothness`, how much smoother than the frame a patch has to be to
+count as sample. That last one is the one to watch, because it is the one that
+carries an assumption about the specimen — that the sample is the smooth thing
+lying on a textured field. On a substrate rougher than what lies on it the
+assumption is inverted, and raising the setting past 1 swaps the two over. The
+other ten settings `gwy_segment` offers its editor are fixed at its defaults:
+they are either about telling one object from another, which a fit never asks,
+or they belong to the ridge and speck detectors, which are not run.
+
+`shape` encloses the *whole* sample, which is what a segmentation should do and
+not always what a fit can live with. Over 30 of the scans in `Data to test` it
+marked more than 85 % of the frame on 16 of them and left at least one scan line
+with no background at all on 24, against 10 and 11 for `otsu` and none for
+`adaptive` — not because it was wrong, but because on those samples the cells
+really do cover the frame. Watch the coverage the dialog reports; it says so.
+
+Holes are *not* filled for this route, and that is the one place its mask is
+built differently. What a threshold encloses and leaves out is a dip in the
+middle of a feature — still feature. What the outlines enclose and leave out is
+the ground *between* features, which is background, and filling it is how a
+frame of packed cells becomes a mask over the whole frame with nothing left to
+fit at all. Measured over 30 scans, filling took the median coverage from 82 %
+to 96 % and covered 10 of them entirely; those 10 came back unlevelled, because
+a fit with no pixels to fit returns a flat zero.
 
 `feature_size` is the one knob that decides what `otsu` can see. A single
 threshold has to be taken on a smoothed copy, or the texture of the sample
@@ -836,6 +884,14 @@ Both windows offer two ways to commit the result:
   `_processed` suffix, in the source folder. Saving into an existing file
   appends: the originals already in it are not written twice, and a repeated
   save of the same channel gets a numbered title (`... (processed) 2`).
+* Every channel written keeps the metadata block it was loaded with, and the
+  processed one gets its history appended to the **comments**: the tool, the
+  time, the source file and channel, and the numbered list of steps the pixels
+  actually went through. It is appended, never substituted — what the operator
+  typed at the microscope stays at the top of the field. The same happens to
+  the channels of a batch run's combined `.gwy` and to the balanced view's
+  exported `.gwy` files, which record the levelling, the offset applied and the
+  shared range they were drawn on.
 
 ### Quick view (folder browser)
 
@@ -849,6 +905,12 @@ and **Balanced view** puts a whole folder on one colour scale.
   subtracted, then rows aligned with a **second-order polynomial** — which is
   what makes a raw scan readable. Nothing is written, and nothing carries over
   to the processing tab.
+* **Plane level** and **Align rows** switch those two steps off and on. Both
+  are on to start with; a scan whose tilt *is* the measurement, or whose row
+  offsets are, is misread rather than helped by having them taken out, and
+  with both off the data is shown exactly as it was recorded. The status line
+  under the image says which steps are in force. Each combination is cached
+  separately, so switching one off and on again is instant.
 * **Next** / **Back** step through the folder, with the position (`7 / 17`) and
   the file name above the image. Click the image once and the left/right arrow
   keys do the same.
@@ -857,6 +919,16 @@ and **Balanced view** puts a whole folder on one colour scale.
   whose name starts the same way, then to a Height channel.
 * Results are cached per file and channel, so stepping back is instant. The
   cache holds the last 32 images and then drops the oldest.
+* A **Metadata** panel beside the image shows what the microscope recorded
+  about the scan, at two depths. **Compact** is the imaging mode, the setpoint,
+  the frame (`7 × 7 µm (512 × 256 px)`) and the scan speed (`0.3 Hz (3.33 s/line)`),
+  and then the comments — which is where the sample, the cantilever and the
+  stage temperature actually get written down. **Advanced** is the whole block,
+  all 55 entries of it on an AFSEM file, grouped by what part of the microscope
+  they describe and with anything unrecognised kept in an *Other* group rather
+  than dropped. Values are tidied on the way through (`540,000000000000 mV`
+  reads as `540 mV`), the text is selectable, and the divider between the panel
+  and the image can be dragged.
 
 ### Balanced view (one colour range for a folder)
 
@@ -1114,3 +1186,72 @@ detection off if it does not.
 ```
 python gwy_processor_gui.py
 ```
+
+### Running the 3D view
+
+A separate program, on purpose: a 3D view is a different task from a
+processing pipeline, and it is useful to have both on screen at once.
+
+```
+python gwy_3d_viewer.py
+python gwy_3d_viewer.py scan.gwy --channel "Height [Fwd]"
+```
+
+The Z exaggeration is an explicit factor with `1x` meaning true physical
+proportion, and it is written on the Z axis of the render. The colour range is
+dragged on the histogram, as in the main GUI's clip dialog. `File -> Render with
+Blender` sends the same surface to Cycles for a path-traced still; `Open in
+Blender` builds the scene in Blender's own window instead, which is the quickest
+way to see what the script did. See the [3D view guide](3D_VIEW_GUIDE.md).
+
+### Keeping only the objects (segmentation)
+
+`Segment -> Find objects...` in the 3D window opens a flat view of the same
+channel. What comes out is one list of regions with no types attached to them:
+what a region *is* is a fact about the specimen, and the program has not seen
+the specimen. There are three *ways of looking*, any mixture of which can run.
+
+**Outlines** is the one to reach for first, because height is a bad way to find
+an object. Threshold the heights and anything whose parts sit at different
+levels loses a bite out of itself - an object tilted in the scan, an object
+with a dip in the middle, two of the same kind on an uneven field. So this
+detector never looks at a height, only at where the height *changes*: the
+gradient is large along a rim and small on anything merely smooth, whatever
+level that smooth surface sits at, and thresholding it divides the frame into
+walled-off patches. Size and *smoothness* - a patch's own texture against the
+frame's, which is what tells an object from the textured field around it - say
+which patches are objects, and a watershed then hands each object back the half
+of the shared rim that faces it. On a scan with the top half of one object
+shifted upwards by four times the object's own height range, this kept 94-98 %
+of it every time, where an Otsu threshold on the blurred heights kept 49 % - it
+lost exactly the half that had moved.
+
+**Ridges** finds long narrow crests, which have no interior for the outline
+detector to work on and are often no taller than the texture around them. They
+are found on curvature - a crest is curved sharply across itself and not along
+itself, a grain is curved both ways - and then filtered by how far each mark
+actually runs. **Raised areas** finds whatever stands above its own immediate
+surroundings, a local comparison that survives a tilted or uneven field.
+
+Correcting the result is the other half of the job. **Pick** a region to keep or
+drop it; drag a **box** to keep, drop or erase everything inside it, or to
+**search inside the box alone** - every threshold is then measured within that
+rectangle, so an object the frame-wide settings drowned comes straight out once
+the box is drawn round it, and what was in the box before is replaced rather
+than added to. **Brush** and **erase** paint corrections on top, and they
+survive a re-detect. Dropping and erasing are deliberately different: a dropped
+region stays on the map greyed out and one more click brings it back, an erased
+one is gone.
+
+Back in the 3D window the choice is either **faded** (the discarded part gets an
+opacity, and 0 leaves the objects floating on their own) or **flattened** (the
+discarded part is replaced by the background surface estimated from itself, so
+the field keeps its large-scale shape and loses its texture). The kept pixels
+are never altered by either. `gwy_segment.segment()` and `gwy_segment.flatten()`
+do the same thing from a script.
+
+`scikit-image` is optional but recommended: it is used to separate objects that
+have grown together, and `scipy`'s fallback is noticeably worse at it. On the
+scan this was developed against, scikit-image separated eleven objects and the
+fallback left the largest six fused into one. The editor says so in its status
+line when it is running without it.
