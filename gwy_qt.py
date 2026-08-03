@@ -581,26 +581,44 @@ class ElidedLabel(QtWidgets.QLabel):
     a tooltip, and asks for nothing.
     """
 
-    def __init__(self, text="", parent=None, minimum=60):
+    def __init__(self, text="", parent=None, minimum=60, preferred=260):
         super().__init__(text, parent)
         self._full = text
-        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+        self._minimum = minimum
+        self._preferred = preferred
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
                            QtWidgets.QSizePolicy.Preferred)
-        self.setMinimumWidth(minimum)
 
     def setText(self, text):
         self._full = str(text)
         self.setToolTip(self._full)
+        self.updateGeometry()       # a new name may want a new width
         self._elide()
 
     def text(self):
         """The whole text, not the shortened one that is on screen."""
         return self._full
 
+    def _wanted(self):
+        """How wide the whole text would be.
+
+        Measured from the text that was set, not from the shortened text on
+        screen - asking QLabel would ask about the ellipsis, and a width taken
+        from that would shorten the text again next time round until nothing
+        was left of it."""
+        return QtGui.QFontMetrics(self.font()).horizontalAdvance(self._full)
+
     def sizeHint(self):
         """A width it would like, not the width the whole text would need."""
         hint = super().sizeHint()
-        hint.setWidth(min(hint.width(), 260))
+        hint.setWidth(min(self._wanted() + 2, self._preferred))
+        return hint
+
+    def minimumSizeHint(self):
+        """And a width it can be cut down to, which is the whole point: a
+        label that insisted on its text is what this exists not to be."""
+        hint = super().minimumSizeHint()
+        hint.setWidth(min(self._minimum, self._wanted() + 2))
         return hint
 
     def resizeEvent(self, event):

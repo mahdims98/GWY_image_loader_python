@@ -42,7 +42,9 @@ Provides an interactive Qt application to:
     saved image
   - Flip through a whole folder in the 'Quick view' tab: each .gwy file
     is shown with a plane subtracted and rows aligned (polynomial,
-    order 2), one Next/Back step at a time, beside what the microscope
+    order 2) - either step switchable, so a scan whose tilt or whose row
+    offsets are the measurement can be seen as recorded - one Next/Back
+    step at a time, beside what the microscope
     recorded about it (gwy_meta) - compact, which is the mode, the
     setpoint, the frame, the scan speed and the operator's comments, or
     the whole block grouped
@@ -3049,13 +3051,15 @@ class QuickViewTab(QtWidgets.QWidget):
 
     Every image gets the same two steps - a fitted plane subtracted, then
     rows aligned with a second-order polynomial - which is what makes a raw
-    scan readable without deciding anything about it. Nothing here is
-    applied to the processing tab; this is for looking, to find the scans
-    worth working on.
+    scan readable without deciding anything about it. Either can be switched
+    off: a scan whose tilt is the measurement, or one where the row offsets
+    are, is misread rather than helped by having them taken out, and with both
+    off this shows the data as it was recorded. Nothing here is applied to the
+    processing tab; this is for looking, to find the scans worth working on.
 
-    Results are cached per (file, channel) so stepping back is instant; the
-    cache is bounded because a folder can hold more images than fit in
-    memory.
+    Results are cached per (file, channel, and the two switches) so stepping
+    back - or turning a switch off and on again - is instant; the cache is
+    bounded because a folder can hold more images than fit in memory.
     """
 
     CACHE_LIMIT = 32
@@ -3066,8 +3070,10 @@ class QuickViewTab(QtWidgets.QWidget):
         self.folder = None
         self.files = []          # full paths, natural order
         self.index = -1
-        self._cache = {}         # (path, channel) -> processed view dict
+        self._cache = {}         # (path, channel, plane, rows) -> view dict
         self._cache_order = []   # keys, oldest first
+        self._info = {}          # path -> (channel names, metadata blocks)
+        self._fields = (None, {})   # the one file whose arrays are in hand
         self._build()
 
     # ------------------------------------------------------------- layout --
@@ -3082,17 +3088,29 @@ class QuickViewTab(QtWidgets.QWidget):
         self.channel_combo.textActivated.connect(
             lambda *_a: self.show_index(self.index))
 
+        # The two preprocessing steps, each switchable. Both on is what this
+        # tab has always done and stays the default.
+        self.plane_var = gq.BoolVar(True)
+        self.rows_var = gq.BoolVar(True)
+        plane = gq.bind_check(QtWidgets.QCheckBox("Plane level"),
+                              self.plane_var)
+        rows = gq.bind_check(QtWidgets.QCheckBox("Align rows"), self.rows_var)
+        for box in (plane, rows):
+            box.toggled.connect(lambda *_a: self.show_index(self.index))
+
         self.prev_btn = gq.button("< Back", lambda: self.step(-1))
         self.count_label = gq.label("0 / 0", align=QtCore.Qt.AlignCenter)
         self.count_label.setFixedWidth(70)
         self.next_btn = gq.button("Next >", lambda: self.step(1))
 
-        # No stretch: the elided folder name takes the slack itself, so it
-        # shows as much of the path as the window happens to allow.
-        bar = gq.row(gq.button("Select folder...", self.select_folder),
-                     (self.folder_label, 1),
-                     QtWidgets.QLabel("Channel:"), self.channel_combo,
-                     self.prev_btn, self.count_label, self.next_btn)
+        # Eight controls is more than a narrow window can hold on one line, so
+        # this bar wraps; the groups stay together when it does.
+        bar = gq.flow(
+            gq.cluster(gq.button("Select folder...", self.select_folder),
+                       self.folder_label),
+            gq.cluster(plane, rows),
+            gq.cluster(QtWidgets.QLabel("Channel:"), self.channel_combo),
+            gq.cluster(self.prev_btn, self.count_label, self.next_btn))
 
         self.name_label = gq.label("", bold=True, align=QtCore.Qt.AlignCenter)
 
@@ -3100,8 +3118,9 @@ class QuickViewTab(QtWidgets.QWidget):
         self.canvas.mpl_connect("key_press_event", self._on_key)
 
         self.status_var = gq.StringVar(
-            "Select a folder of .gwy files. Each one is shown with a "
-            "plane subtracted and rows aligned (polynomial, order 2).")
+            "Select a folder of .gwy files. Each one is shown with a plane "
+            "subtracted and rows aligned (polynomial, order 2); either step "
+            "can be switched off above.")
 
         # The image and what was recorded about it, side by side behind a
         # divider - the panel is worth a third of the width while reading the
@@ -3146,6 +3165,8 @@ class QuickViewTab(QtWidgets.QWidget):
         self.files = [os.path.join(folder, n) for n in names]
         self._cache.clear()
         self._cache_order.clear()
+        self._info.clear()
+        self._fields = (None, {})
         self.folder_label.setText(
             f"{os.path.basename(folder)}  ({len(self.files)} files)")
         self.index = -1
@@ -3175,18 +3196,17 @@ class QuickViewTab(QtWidgets.QWidget):
         self.name_label.setText(f"{index + 1}/{len(self.files)}  -  {name}")
 
         try:
-            channels, meta = gwy_loader.load_gwy_with_meta(path)
+            names, meta = self._file_info(path)
         except Exception as e:
             self._draw_message(f"Could not read {name}:\n{e}")
             self.status_var.set(f"{name}: {e}")
             self.meta_panel.set_meta({})
             return
-        if not channels:
+        if not names:
             self._draw_message(f"{name} has no data channels.")
             self.meta_panel.set_meta({})
             return
 
-        names = list(channels)
         gq.set_items(self.channel_combo, names)
         channel = pick_channel(names, self.channel_var.get())
         self.channel_var.set(channel)
@@ -3197,19 +3217,64 @@ class QuickViewTab(QtWidgets.QWidget):
         block = meta.get(channel) or next((m for m in meta.values() if m), {})
         self.meta_panel.set_meta(block, f"{name}  -  {channel}")
 
-        view = self._processed(path, channel, channels[channel])
+        try:
+            view = self._processed(path, channel)
+        except Exception as e:
+            self._draw_message(f"Could not read {name}:\n{e}")
+            self.status_var.set(f"{name}: {e}")
+            return
         self._draw(view, name, channel)
-        self.status_var.set(
-            f"{name} - {channel}: plane subtracted, rows aligned "
-            f"(polynomial, order 2)")
+        self.status_var.set(f"{name} - {channel}: {self._steps_text()}")
 
-    def _processed(self, path, channel, field):
-        key = (path, channel)
+    def _file_info(self, path):
+        """The channel names and metadata blocks of one file.
+
+        Kept per file, because they are what the channel box and the metadata
+        panel need before anything can be drawn, and re-reading a scan to ask
+        it its own channel names is the one thing stepping back should not do.
+        """
+        if path not in self._info:
+            channels, meta = gwy_loader.load_gwy_with_meta(path)
+            self._info[path] = (list(channels), meta)
+            self._fields = (path, channels)
+            # Text, not images, so this holds far more files than the view
+            # cache does - but a long enough session should not grow forever.
+            while len(self._info) > 4 * self.CACHE_LIMIT:
+                self._info.pop(next(iter(self._info)))
+        return self._info[path]
+
+    def _field(self, path, channel):
+        """One channel's data field. Only the last file's arrays are held on
+        to - a processed view is what the cache keeps, and re-reading is what
+        pays for that."""
+        if self._fields[0] != path:
+            self._fields = (path, gwy_loader.load_gwy_with_meta(path)[0])
+        return self._fields[1][channel]
+
+    def _steps(self):
+        """The two switches, as the cache sees them."""
+        return bool(self.plane_var.get()), bool(self.rows_var.get())
+
+    def _steps_text(self):
+        plane, rows = self._steps()
+        done = []
+        if plane:
+            done.append("plane subtracted")
+        if rows:
+            done.append("rows aligned (polynomial, order 2)")
+        return ", ".join(done) if done else "as recorded, no preprocessing"
+
+    def _processed(self, path, channel):
+        plane, rows = self._steps()
+        key = (path, channel, plane, rows)
         if key in self._cache:
             return self._cache[key]
-        view = channel_view(field)
-        data = gp.level_by_plane_fit(view["data"])
-        view["data"] = gp.align_rows(data, method="polynomial", order=2)
+        view = channel_view(self._field(path, channel))
+        if plane:
+            view["data"] = gp.level_by_plane_fit(view["data"])
+        if rows:
+            view["data"] = gp.align_rows(view["data"], method="polynomial",
+                                         order=2)
         self._cache[key] = view
         self._cache_order.append(key)
         while len(self._cache_order) > self.CACHE_LIMIT:
@@ -3220,7 +3285,7 @@ class QuickViewTab(QtWidgets.QWidget):
         """Redraw with the current colour map (nothing is recomputed)."""
         if 0 <= self.index < len(self.files):
             path = self.files[self.index]
-            key = (path, self.channel_var.get())
+            key = (path, self.channel_var.get()) + self._steps()
             if key in self._cache:
                 self._draw(self._cache[key], os.path.basename(path), key[1])
 
