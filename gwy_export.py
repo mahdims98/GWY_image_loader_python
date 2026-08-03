@@ -10,7 +10,9 @@ stretched; that is what goes into further analysis or a figure assembled
 elsewhere. `save_channel_to_gwy` writes back into a Gwyddion container,
 appending rather than overwriting, so repeated saves collect the processed
 channels of one measurement in one file, next to the untouched channels they
-came from.
+came from - and next to the metadata blocks they came with, since a channel
+that has lost the setpoint and the scan rate it was taken at is a picture
+rather than a measurement.
 
 All of it colours through gwy_colormaps, so the two image routes and every
 preview on screen agree about what a height means.
@@ -141,8 +143,25 @@ def _gwy_channel_titles(container):
     return titles
 
 
+def meta_container(mapping):
+    """A metadata block as the container Gwyddion stores it in.
+
+    Everything goes in as a string, including the values that look like
+    numbers: that is what the instrument wrote and what Gwyddion's metadata
+    browser expects to read back. The typecode is forced rather than guessed,
+    because a one-character value would otherwise be written as a char.
+    """
+    container = gwy_loader.GwyContainer()
+    for key, value in mapping.items():
+        text = str(value)
+        container[key] = text
+        container.typecodes[key] = 's'
+    return container
+
+
 def save_channel_to_gwy(path, title, data, xreal=None, yreal=None,
-                        unit_xy="", unit_z="", extra_channels=()):
+                        unit_xy="", unit_z="", extra_channels=(),
+                        meta=None, extra_meta=None):
     """
     Save `data` (in SI units) as a channel of a Gwyddion .gwy file.
 
@@ -154,6 +173,13 @@ def save_channel_to_gwy(path, title, data, xreal=None, yreal=None,
     it - typically the untouched channels of the source measurement, so the
     saved file stands on its own. A channel whose title is already in the
     file is skipped, so saving repeatedly never duplicates them.
+
+    `meta` is the metadata block for the processed channel and `extra_meta` a
+    {title: block} for the others. What the microscope recorded about a scan
+    is worth as much as the pixels - the setpoint, the scan rate, what the
+    operator typed about the sample - and a processed channel saved without it
+    is a picture of an experiment nobody can identify afterwards. See gwy_meta
+    for putting the processing history into that block on the way through.
 
     Returns (channel number of `data`, its title - numbered if that title
     was taken -, titles of the extra channels written).
@@ -186,8 +212,11 @@ def save_channel_to_gwy(path, title, data, xreal=None, yreal=None,
         k += 1
     container[f"/{n}/data"] = field
     container[f"/{n}/data/title"] = unique
+    if meta:
+        container[f"/{n}/meta"] = meta_container(meta)
     have.add(unique)
 
+    extra_meta = extra_meta or {}
     written = []
     for extra_title, extra_field in extra_channels:
         if extra_title in have:
@@ -195,6 +224,8 @@ def save_channel_to_gwy(path, title, data, xreal=None, yreal=None,
         n += 1
         container[f"/{n}/data"] = extra_field
         container[f"/{n}/data/title"] = extra_title
+        if extra_meta.get(extra_title):
+            container[f"/{n}/meta"] = meta_container(extra_meta[extra_title])
         have.add(extra_title)
         written.append(extra_title)
 

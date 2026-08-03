@@ -42,7 +42,10 @@ Provides an interactive Qt application to:
     saved image
   - Flip through a whole folder in the 'Quick view' tab: each .gwy file
     is shown with a plane subtracted and rows aligned (polynomial,
-    order 2), one Next/Back step at a time
+    order 2), one Next/Back step at a time, beside what the microscope
+    recorded about it (gwy_meta) - compact, which is the mode, the
+    setpoint, the frame, the scan speed and the operator's comments, or
+    the whole block grouped
   - Put a whole folder on one colour scale in the 'Balanced view' tab
     (gwy_balance): every image is segmented into cells and substrate and
     measured at both, and the folder is reduced to a single range - so
@@ -54,7 +57,9 @@ Provides an interactive Qt application to:
   - Batch-process every .gwy file in a folder by replaying the
     current processing pipeline on the selected channel
   - Save the result as an image or back into a .gwy file, next to
-    every other channel of the measurement
+    every other channel of the measurement and with each channel's
+    metadata - the processed one carrying the list of steps that made
+    it, appended to the comments the operator typed at the microscope
 
 What is in this file is the front end only: windows, widgets, previews and
 the state they are edited through. What the steps *are* - the operations,
@@ -87,6 +92,7 @@ import sys
 import threading
 import traceback
 from datetime import datetime
+from html import escape
 
 import numpy as np
 
@@ -98,6 +104,7 @@ from matplotlib.patches import Circle, Rectangle
 from matplotlib.widgets import RectangleSelector, SpanSelector
 
 import gwy_loader
+import gwy_meta as gmeta
 import gwy_processing as gp
 import gwy_balance as gb
 import gwy_colormaps as gcm
@@ -112,7 +119,8 @@ from gwy_ops import (
     _smart_flatten, _unit_of,
 )
 from gwy_export import (
-    render_annotated_figure, save_channel_to_gwy, save_pure_image,
+    meta_container, render_annotated_figure, save_channel_to_gwy,
+    save_pure_image,
 )
 
 APP_NAME = "GWY Processor"
@@ -2939,6 +2947,103 @@ DIALOG_CLASSES["parachute"] = ParachuteDialog
 # Folder tabs
 # ---------------------------------------------------------------------------
 
+class MetadataPanel(QtWidgets.QWidget):
+    """What the microscope recorded about a scan, beside the scan.
+
+    The block is 55 entries long and most of them answer a question nobody is
+    asking while flipping through a folder, so it has two depths. Compact is
+    the four settings that decide whether a scan is the one being looked for -
+    mode, setpoint, frame, scan speed - and then the comments, which are where
+    the sample, the cantilever and the stage temperature actually get written
+    down. Advanced is all of it, grouped, with nothing left out.
+
+    The text is selectable, because the next thing anyone does with a setpoint
+    is paste it somewhere.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._meta = {}
+        self._title = ""
+
+        self.compact_btn = QtWidgets.QRadioButton("Compact")
+        self.compact_btn.setChecked(True)
+        self.advanced_btn = QtWidgets.QRadioButton("Advanced")
+        self.advanced_btn.toggled.connect(lambda *_a: self.render())
+
+        self.view = QtWidgets.QTextBrowser()
+        self.view.setMinimumWidth(200)
+
+        self.setLayout(gq.column(
+            gq.row(gq.label("Metadata", bold=True), 1,
+                   self.compact_btn, self.advanced_btn),
+            self.view))
+        self.render()
+
+    def set_meta(self, meta, title=""):
+        self._meta = dict(meta or {})
+        self._title = title
+        self.render()
+
+    def render(self):
+        muted = gq.muted_colour()
+        if not self._meta:
+            self.view.setHtml(
+                f"<p style='color:{muted}'>No metadata in this file.</p>")
+            return
+        if self.advanced_btn.isChecked():
+            # One table for all of it, so the values line up down the page
+            # instead of each group finding its own column width.
+            body = self._table([
+                part
+                for title, rows in gmeta.sections(self._meta)
+                for part in (self._heading(title), *rows)], muted)
+        else:
+            body = self._table(gmeta.compact(self._meta), muted)
+            body += self._comments(gmeta.comments(self._meta), muted)
+        head = (f"<p style='color:{muted}'>{escape(self._title)}</p>"
+                if self._title else "")
+        self.view.setHtml(head + body)
+        self.view.verticalScrollBar().setValue(0)
+
+    # ---- the pieces of the page ----
+
+    @staticmethod
+    def _text(value):
+        """Escaped, and with the line breaks kept - the comments field is
+        written as a list of lines and reads as one."""
+        return escape(str(value)).replace("\n", "<br>")
+
+    @staticmethod
+    def _heading(title):
+        """A group's name, marked so `_table` gives it the whole line."""
+        return (None, title)
+
+    @classmethod
+    def _table(cls, rows, muted):
+        cells = []
+        for key, value in rows:
+            if key is None:
+                cells.append(
+                    "<tr><td colspan='2' style='padding-top:12px;'>"
+                    f"<b>{cls._text(value)}</b></td></tr>")
+                continue
+            cells.append(
+                f"<tr><td style='color:{muted}; padding-right:12px; "
+                f"vertical-align:top;'>{cls._text(key)}</td>"
+                f"<td style='vertical-align:top;'>{cls._text(value)}</td></tr>")
+        return f"<table cellspacing='0' cellpadding='2'>{''.join(cells)}</table>"
+
+    @classmethod
+    def _comments(cls, text, muted):
+        """The operator's own words, kept as they were typed - the line breaks
+        in them are the difference between a paragraph and a list."""
+        if not text:
+            return ""
+        return (f"<p style='margin-top:12px; margin-bottom:2px; "
+                f"color:{muted}'>Comments</p><p>{cls._text(text)}</p>")
+
+
 class QuickViewTab(QtWidgets.QWidget):
     """Flip through a folder of .gwy files, minimally preprocessed.
 
@@ -2998,10 +3103,21 @@ class QuickViewTab(QtWidgets.QWidget):
             "Select a folder of .gwy files. Each one is shown with a "
             "plane subtracted and rows aligned (polynomial, order 2).")
 
-        self.setLayout(gq.column(bar, self.name_label, self.canvas, toolbar,
-                                 gq.bound_label(self.status_var, wrap=True),
-                                 margins=(8, 8, 8, 8)))
-        self.layout().setStretch(2, 1)
+        # The image and what was recorded about it, side by side behind a
+        # divider - the panel is worth a third of the width while reading the
+        # comments and nothing at all while looking at the scan.
+        image = QtWidgets.QWidget()
+        image.setLayout(gq.column(self.name_label, self.canvas, toolbar))
+        image.layout().setStretch(1, 1)
+        self.meta_panel = MetadataPanel()
+
+        self.setLayout(gq.column(
+            bar,
+            gq.splitter(QtCore.Qt.Horizontal, image, self.meta_panel,
+                        sizes=(820, 330), stretch=(1, 0)),
+            gq.bound_label(self.status_var, wrap=True),
+            margins=(8, 8, 8, 8)))
+        self.layout().setStretch(1, 1)
         self._update_nav()
 
     def _on_key(self, event):
@@ -3059,19 +3175,27 @@ class QuickViewTab(QtWidgets.QWidget):
         self.name_label.setText(f"{index + 1}/{len(self.files)}  -  {name}")
 
         try:
-            channels = gwy_loader.load_gwy(path)
+            channels, meta = gwy_loader.load_gwy_with_meta(path)
         except Exception as e:
             self._draw_message(f"Could not read {name}:\n{e}")
             self.status_var.set(f"{name}: {e}")
+            self.meta_panel.set_meta({})
             return
         if not channels:
             self._draw_message(f"{name} has no data channels.")
+            self.meta_panel.set_meta({})
             return
 
         names = list(channels)
         gq.set_items(self.channel_combo, names)
         channel = pick_channel(names, self.channel_var.get())
         self.channel_var.set(channel)
+
+        # Channels of one scan almost always share a metadata block; when the
+        # selected one has none of its own, any other channel's says the same
+        # thing about the same scan.
+        block = meta.get(channel) or next((m for m in meta.values() if m), {})
+        self.meta_panel.set_meta(block, f"{name}  -  {channel}")
 
         view = self._processed(path, channel, channels[channel])
         self._draw(view, name, channel)
@@ -3413,10 +3537,13 @@ class BalancedViewTab(QtWidgets.QWidget):
         key = (path, channel, levelled)
         if key in self._cache:
             return self._cache[key]
-        fields = gwy_loader.load_gwy(path)
+        fields, meta = gwy_loader.load_gwy_with_meta(path)
         if not fields:
             raise ValueError("no data channels")
-        view = channel_view(fields[pick_channel(list(fields), channel)])
+        picked = pick_channel(list(fields), channel)
+        view = channel_view(fields[picked])
+        view["meta"] = meta.get(picked) or next(
+            (m for m in meta.values() if m), {})
         if levelled:
             data = gp.level_by_plane_fit(view["data"])
             view["data"] = gp.align_rows(data, method="polynomial", order=2)
@@ -3861,8 +3988,29 @@ class BalancedViewTab(QtWidgets.QWidget):
                 xreal=view["x_real"] / view["xy_factor"],
                 yreal=view["y_real"] / view["xy_factor"],
                 unit_xy=view["unit_xy_str"], unit_z=view["unit_z_str"],
+                meta=gmeta.with_log(
+                    view.get("meta", {}),
+                    gmeta.log_block(self._history(index, vmin, vmax),
+                                    source=os.path.basename(self.files[index]),
+                                    channel=self.channel)),
             )
         return len(target)
+
+    def _history(self, index, vmin, vmax):
+        """What was done to the image that is being written out - the same
+        sentences the export report gives, in the order they happened."""
+        steps = []
+        if self.level_var.get():
+            steps.append("Plane level, then align rows (polynomial, order 2)")
+        if self.zero_var.get():
+            steps.append("Baseline of the substrate set to zero")
+        units = self.metas[index]["z_units"]
+        offset = self.result["offsets"][index]
+        steps.append(f"Balanced view, {self.mode_var.get()}: "
+                     f"offset {offset:+.6g} {units}")
+        steps.append(f"Drawn on the folder's shared range {vmin:.6g} to "
+                     f"{vmax:.6g} {units}")
+        return steps
 
 
 # ---------------------------------------------------------------------------
@@ -3885,6 +4033,7 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
         # --- State ---
         self.filename = None
         self.channels = {}          # {title: GwyDataField}
+        self.channel_meta = {}      # {title: metadata block, as loaded}
         self.field = None           # currently selected GwyDataField
         self.original_data = None   # data as loaded (display units)
         self.data = None            # current processed data (display units)
@@ -4073,7 +4222,7 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            channels = gwy_loader.load_gwy(path)
+            channels, meta = gwy_loader.load_gwy_with_meta(path)
         except Exception as e:
             gq.show_error(self, "Load error", f"Could not read file:\n{e}")
             return
@@ -4084,6 +4233,7 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
 
         self.filename = path
         self.channels = channels
+        self.channel_meta = meta
         self.file_label.setText(os.path.basename(path))
         names = list(channels.keys())
         gq.set_items(self.channel_combo, names, keep=False)
@@ -4188,6 +4338,12 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
             si_unit_z=_unit_of(template, "si_unit_z") or None,
         )
         self.channels[unique] = field
+        # A derived channel is the same scan, so it keeps the same record of
+        # how that scan was taken; what was done to it since is added to the
+        # comments when it is saved.
+        source = next((t for t, f in self.channels.items() if f is template),
+                      None)
+        self.channel_meta[unique] = dict(self.channel_meta.get(source, {}))
         gq.set_items(self.channel_combo, list(self.channels))
 
         if select:
@@ -4423,6 +4579,19 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
                   f"(+ pure/{os.path.basename(path)})")
         self.status_var.set(f"Saved {os.path.basename(path)} and pure copy")
 
+    def processed_meta(self, channel):
+        """The channel's metadata with what has been done to it appended.
+
+        The pipeline, not the log on screen: the log also holds the steps that
+        were undone again and the files that were saved, and what belongs in
+        the image's own comments is the list of edits the pixels actually
+        carry. Read back in Gwyddion - or here - it sits under whatever the
+        operator wrote at the microscope."""
+        block = gmeta.log_block(
+            [describe_step(*step) for step in self.pipeline],
+            source=os.path.basename(self.filename or ""), channel=channel)
+        return gmeta.with_log(self.channel_meta.get(channel, {}), block)
+
     def save_to_gwy(self):
         """Append the processed channel to a .gwy file (creating it if needed),
         so all processed channels can be collected in one Gwyddion file.
@@ -4430,7 +4599,12 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
         Every other channel of the loaded image is written along with it, so
         the saved file is a complete copy of the measurement plus the
         processed result. The name defaults to the source file with a
-        '_processed' suffix, next to the original."""
+        '_processed' suffix, next to the original.
+
+        Each channel keeps the metadata block it was loaded with, and the
+        processed one gets the list of steps that made it appended to its
+        comments - so the file says what was done to it without needing the
+        log that was on screen at the time."""
         if not self._require_data():
             return
         base = os.path.splitext(os.path.basename(self.filename or "image"))[0]
@@ -4442,7 +4616,8 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
             confirm_overwrite=False)
         if not path:
             return
-        title = f"{base} - {self.channel_var.get()} (processed)"
+        channel = self.channel_var.get()
+        title = f"{base} - {channel} (processed)"
         # The processed data may have been cropped, so its physical size is
         # the source size scaled by the shape ratio, not the source size.
         ny, nx = self.data.shape
@@ -4455,6 +4630,8 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
                 yreal=ny * float(self.field.yreal or t_ny) / t_ny,
                 unit_xy=self.unit_xy_str, unit_z=self.unit_z_str,
                 extra_channels=list(self.channels.items()),
+                meta=self.processed_meta(channel),
+                extra_meta=self.channel_meta,
             )
         except Exception as e:
             gq.show_error(self, "Save error",
@@ -4520,7 +4697,7 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
             self._set_status_async(f"Batch: {i}/{len(files)} - {fname}")
             path = os.path.join(in_dir, fname)
             try:
-                channels = gwy_loader.load_gwy(path)
+                channels, file_meta = gwy_loader.load_gwy_with_meta(path)
                 field = channels.get(channel)
                 if field is None:
                     # fall back to any channel containing the requested name
@@ -4587,6 +4764,15 @@ class GwyProcessorGUI(QtWidgets.QMainWindow):
                 )
                 gwy_out[f"/{gwy_count}/data"] = field_out
                 gwy_out[f"/{gwy_count}/data/title"] = f"{base} - {channel}"
+                # Each channel of the combined file keeps its own scan's
+                # metadata, with the steps that were replayed on it appended -
+                # otherwise a batch output is a stack of images with nothing
+                # to say which measurement each one came from.
+                gwy_out[f"/{gwy_count}/meta"] = meta_container(gmeta.with_log(
+                    file_meta.get(channel) or next(
+                        (m for m in file_meta.values() if m), {}),
+                    gmeta.log_block([describe_step(*s) for s in pipeline],
+                                    source=fname, channel=channel)))
                 gwy_count += 1
 
                 results.append(f"OK    {fname}")

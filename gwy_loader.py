@@ -392,19 +392,34 @@ def get_channels(file_or_filename):
         return [title for _, title in find_datafields(obj)]
 
 
-def get_metadata(file_or_filename):
-        """Return a dictionary of metadata for each channel in the Gwyddion file."""
-        obj = GwyObject.fromfile(file_or_filename)
-        channels = dict(find_datafields(obj))
-        
+def get_datafields_meta(obj):
+        """Return a dictionary of titles and their metadata blocks.
+
+        A channel without a '/N/meta' container gets an empty one, so every
+        title in get_datafields() is a key here too."""
         metadata = {}
-        for ch_num, title in channels.items():
+        for ch_num, title in find_datafields(obj):
                 meta_key = '/{}/meta'.format(ch_num)
                 if meta_key in obj:
                         metadata[title] = dict(obj[meta_key])
                 else:
                         metadata[title] = {}
         return metadata
+
+
+def get_metadata(file_or_filename):
+        """Return a dictionary of metadata for each channel in the Gwyddion file."""
+        return get_datafields_meta(GwyObject.fromfile(file_or_filename))
+
+
+def load_gwy_with_meta(file_or_filename):
+        """Load a Gwyddion file and return (data fields, metadata).
+
+        Both come out of one read of the file: the metadata sits in the same
+        container as the channels, and parsing a 10 MB scan twice to see it
+        would be a poor trade for a panel that only shows text."""
+        obj = GwyObject.fromfile(file_or_filename)
+        return get_datafields(obj), get_datafields_meta(obj)
 
 
 # Type lookup table
